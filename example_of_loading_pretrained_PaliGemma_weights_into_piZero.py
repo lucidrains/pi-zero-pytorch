@@ -3,7 +3,7 @@ import time
 from pi_zero_pytorch import PiZero
 from transformers import PaliGemmaForConditionalGeneration
 
-# Step 1: Load the Pretrained PaliGemma Model
+# Step 1: Load the Pretrained PaliGemma Model (requires pip install transformers huggingface_hub)
 # PaliGemma is a pretrained model designed for vision and language tasks.
 model_id = "google/paligemma-3b-pt-224"
 paligemma_model = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
