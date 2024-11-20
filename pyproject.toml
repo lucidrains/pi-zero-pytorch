@@ -34,7 +34,9 @@ dependencies = [
     'scipy',
     "torch>=2.5",
     'torchdiffeq',
-    "tqdm"
+    "tqdm",
+    "transformers",
+    "huggingface_hub"
 ]
 
 [project.urls]
