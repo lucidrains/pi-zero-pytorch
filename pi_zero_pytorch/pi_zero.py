@@ -810,7 +810,7 @@ class PiZero(Module):
                     images, inverse_pack_image_frames = pack_with_inverse([images], '* c h w')
 
                 with torch.no_grad():
-                    self.vit.eval()                    
+                    self.vit.eval()
                     visual_tokens = self.vit(images)
 
                 if is_multiple_images:
@@ -880,7 +880,6 @@ class PiZero(Module):
         else:
             state_length = state_tokens.shape[-2]
 
-        total_seq_length = action_with_registers_length + state_length
         mask = F.pad(language_mask, (state_length - command_length - 1, 1 + action_with_registers_length), value = True) # assume fixed number of images for now, but address variable length modality states later
 
         # rotary embeddings
@@ -911,7 +910,7 @@ class PiZero(Module):
             flex_attn_fn = partial(
                 flex_attention,
                 block_mask = block_mask,
-                score_mod = score_mod
+                score_mod = score_mod_fn
             )
 
         # state keys and values for caching during inference

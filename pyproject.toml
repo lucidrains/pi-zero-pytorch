@@ -1,6 +1,6 @@
 [project]
 name = "pi-zero-pytorch"
-version = "0.0.26"
+version = "0.0.27"
 description = "π0 in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -45,12 +45,26 @@ Repository = "https://github.com/lucidrains/pi-zero-pytorch"
 examples = []
 test = [
     "pytest",
+    "ruff>=0.4.2",
     "vit-pytorch>=1.8.7"
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
   "."
+]
+
+[tool.ruff]
+line-length = 1000
+
+lint.ignore = [
+    "F722", # for jaxtyping shape annotation
+    "F401",
+    "F821"
+]
+
+lint.extend-select = [
+    "W291"
 ]
 
 [build-system]
