@@ -3,7 +3,7 @@ import time
 from pi_zero_pytorch import PiZero
 from transformers import PaliGemmaForConditionalGeneration
 
-# Step 1: Load the Pretrained PaliGemma Model (requires pip install transformers huggingface_hub)
+# Step 1: Load the Pretrained PaliGemma Model
 # PaliGemma is a pretrained model designed for vision and language tasks.
 model_id = "google/paligemma-3b-pt-224"
 paligemma_model = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
@@ -18,19 +18,9 @@ model = PiZero(
     num_tokens=20_000    # Vocabulary size
 )
 
-# Step 3: Transfer Weights from PaliGemma to π₀ Model
-# Extract the state dictionaries from both models.
-paligemma_state_dict = paligemma_model.state_dict()
-pi_zero_state_dict = model.state_dict()
-
-# Map weights from PaliGemma to π₀ model. This example assumes a direct mapping
-# for simplicity. You may need to customize this based on layer compatibility.
-for name, param in paligemma_state_dict.items():
-    if name in pi_zero_state_dict:
-        pi_zero_state_dict[name].data.copy_(param.data)
-
-# Load the updated state dictionary into the π₀ model.
-model.load_state_dict(pi_zero_state_dict)
+# Step 3: Transfer Weights from PaliGemma to π₀ Model Using the Existing Method
+# Use the method from pi_zero.py to load pretrained weights.
+model.load_pretrained_vlm_weights_(paligemma_model.state_dict())
 
 # Step 4: Save the Updated π₀ Model
 # Save the model's state dictionary for future use.

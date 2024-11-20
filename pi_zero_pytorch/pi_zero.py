@@ -591,9 +591,23 @@ class PiZero(Module):
     @beartype
     def load_pretrained_vlm_weights_(
         self,
-        weights: dict[str, Tensor]
+        weights: dict[str, torch.Tensor]
     ):
-        raise NotImplementedError
+        """
+        Load pretrained weights from a Vision-Language Model (VLM) into PiZero.
+        
+        Args:
+            weights (dict[str, torch.Tensor]): The state dictionary of the VLM model.
+        """
+        pi_zero_state_dict = self.state_dict()
+
+        for name, param in weights.items():
+            if name in pi_zero_state_dict and param.size() == pi_zero_state_dict[name].size():
+                pi_zero_state_dict[name].data.copy_(param.data)
+            else:
+                print(f"Skipping {name}: Size mismatch or not in PiZero model.")
+
+        self.load_state_dict(pi_zero_state_dict)
 
     def create_ema(
         self,
