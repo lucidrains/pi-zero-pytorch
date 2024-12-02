@@ -73,6 +73,15 @@ That's it
 ```
 
 ```bibtex
+@inproceedings{Duvvuri2024LASERAW,
+    title   = {LASER: Attention with Exponential Transformation},
+    author  = {Sai Surya Duvvuri and Inderjit S. Dhillon},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:273849947}
+}
+```
+
+```bibtex
 @inproceedings{Darcet2023VisionTN,
     title   = {Vision Transformers Need Registers},
     author  = {Timoth'ee Darcet and Maxime Oquab and Julien Mairal and Piotr Bojanowski},
