@@ -976,9 +976,26 @@ class PiZero(Module):
         else:
             memory_tokens = actions.new_empty((batch, 0, self.dim))
 
-        # pack into [action registers] [actions] [memory tokens (write)]
+        # joint state + additional internal states
 
-        action_tokens, inverse_pack_action_registers = pack_with_inverse([action_register_tokens, action_tokens, memory_tokens], 'b * d')
+        joint_state_tokens = self.to_joint_state_tokens(joint_state)
+
+        # additional internal state tokens
+
+        if not exists(internal_state_tokens):
+            internal_state_tokens = joint_state_tokens.new_empty((batch, 0, self.dim_internal_state))
+
+        internal_state_tokens = self.to_internal_state_tokens(internal_state_tokens)
+
+        # pack into [action registers] [internal + joint states] [actions] [memory tokens (write)]
+
+        action_tokens, inverse_pack_action_registers = pack_with_inverse([
+            action_register_tokens,
+            joint_state_tokens,
+            internal_state_tokens,
+            action_tokens,
+            memory_tokens
+        ], 'b * d')
 
         action_with_registers_length = action_tokens.shape[-2]
 
@@ -1015,10 +1032,6 @@ class PiZero(Module):
 
             visual_tokens = self.maybe_to_image_tokens(visual_tokens)
 
-            # joint state
-
-            joint_state_tokens = self.to_joint_state_tokens(joint_state)
-
             # maybe reward tokens
 
             if not exists(reward_tokens):
@@ -1028,13 +1041,6 @@ class PiZero(Module):
 
             if self.training and random() < self.reward_tokens_dropout_prob:
                 reward_tokens = reward_tokens[:, 0:0]
-
-            # additional internal state tokens
-
-            if not exists(internal_state_tokens):
-                internal_state_tokens = joint_state_tokens.new_empty((batch, 0, self.dim_internal_state))
-
-            internal_state_tokens = self.to_internal_state_tokens(internal_state_tokens)
 
             # additional external states
 
@@ -1050,21 +1056,6 @@ class PiZero(Module):
             if not exists(past_recurrent_memory_tokens):
                 past_recurrent_memory_tokens = visual_tokens.new_empty((batch, 0, self.dim))
 
-            # allow joint and internal states to have bidirectional attention
-
-            internal_state_len = joint_state_tokens.shape[-2] + internal_state_tokens.shape[-2]
-
-            internal_state_offset = (
-                external_state_tokens.shape[-2] +
-                visual_tokens.shape[-2] +
-                language_tokens.shape[-2]
-            )
-
-            internal_state_offset_and_len = (
-                internal_state_offset,
-                internal_state_len
-            )
-
             # concat visual rep with language
 
             state_tokens, inverse_packed_states = pack_with_inverse([
@@ -1072,8 +1063,6 @@ class PiZero(Module):
                 external_state_tokens,
                 visual_tokens,
                 language_tokens,
-                joint_state_tokens,
-                internal_state_tokens,
                 reward_tokens
             ], 'b * d')
 
@@ -1094,7 +1083,7 @@ class PiZero(Module):
 
         # rotary embeddings
 
-        seq = torch.cumsum(mask.float(), dim = -1)
+        seq = mask.float().cumsum(dim = -1)
         rotary_emb = self.rotary_emb(seq)
 
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
@@ -1112,7 +1101,6 @@ class PiZero(Module):
                 create_pizero_attn_mask(
                     prefix_length,
                     mask = mask,
-                    internal_state_offset_and_len = internal_state_offset_and_len
                 ),
                 Q_LEN = seq_len,
                 KV_LEN = seq_len,
@@ -1147,7 +1135,7 @@ class PiZero(Module):
 
                 action_tokens = attn_ada_rmsnorm(action_tokens, time_cond)
 
-                (state_attn_out, actions_attn_out), (state_keys, state_values, action_keys, action_values) = attn(state_tokens, action_tokens, rotary_emb = rotary_emb, flex_attn_fn = flex_attn_fn, actions_value_residual = actions_value_residual, mask = mask, internal_state_offset_and_len = internal_state_offset_and_len, return_keys_values = True)
+                (state_attn_out, actions_attn_out), (state_keys, state_values, action_keys, action_values) = attn(state_tokens, action_tokens, rotary_emb = rotary_emb, flex_attn_fn = flex_attn_fn, actions_value_residual = actions_value_residual, mask = mask, return_keys_values = True)
 
                 state_cached_keys_values.append((state_keys, state_values))
 
@@ -1200,7 +1188,7 @@ class PiZero(Module):
 
             tokens = self.final_norm_softclamp(tokens)
 
-        action_register_tokens, action_tokens, written_memory_tokens = inverse_pack_action_registers(action_tokens)
+        *_, action_tokens, written_memory_tokens = inverse_pack_action_registers(action_tokens)
 
         action_tokens = self.final_norm_softclamp(action_tokens)
 
