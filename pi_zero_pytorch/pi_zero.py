@@ -1127,10 +1127,8 @@ class PiZero(Module):
 
                 actions_value_residual = default(actions_value_residual, action_values)
 
-                action_tokens = attn_ada_layerscale(action_tokens, time_cond)
-
                 state_tokens = state_tokens + state_attn_out
-                action_tokens = action_tokens + actions_attn_out
+                action_tokens = action_tokens + attn_ada_layerscale(actions_attn_out, time_cond)
 
                 state_tokens = state_ff(state_tokens) + state_tokens
 
@@ -1155,9 +1153,7 @@ class PiZero(Module):
 
                 actions_value_residual = default(actions_value_residual, action_values)
 
-                action_tokens = attn_ada_layerscale(action_tokens, time_cond)
-
-                action_tokens = action_tokens + actions_attn_out
+                action_tokens = action_tokens + attn_ada_layerscale(actions_attn_out, time_cond)
 
                 action_tokens = ff_ada_rmsnorm(action_tokens, time_cond)
 
