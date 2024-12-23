@@ -6,6 +6,7 @@ from beartype import beartype
 from beartype.typing import Callable
 
 from functools import partial, wraps
+from itertools import count
 
 import torch
 import torch.nn.functional as F
@@ -792,6 +793,7 @@ class PiZero(Module):
         residual_klass = Residual if not is_hyper_connection else HyperConnections
 
         residual_fns = []
+        counter = count()
 
         self.maybe_expand_residuals = identity
         self.maybe_reduce_residuals = identity
@@ -815,10 +817,12 @@ class PiZero(Module):
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
+            attn_layer_ind, ff_layer_ind = next(counter), next(counter)
+
             residual_fns.append(ModuleList([
-                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = i),
-                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = i + 1),
-                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = i + 1),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = attn_layer_ind),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = ff_layer_ind),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = ff_layer_ind),
             ]))
 
             cond_layers.append(ModuleList([
