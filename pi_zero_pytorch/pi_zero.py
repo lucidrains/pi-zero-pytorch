@@ -817,12 +817,9 @@ class PiZero(Module):
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
-            attn_layer_ind, ff_layer_ind = next(counter), next(counter)
-
             residual_fns.append(ModuleList([
-                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = attn_layer_ind),
-                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = ff_layer_ind),
-                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = ff_layer_ind),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = next(counter)),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = next(counter)),
             ]))
 
             cond_layers.append(ModuleList([
@@ -1326,13 +1323,7 @@ class PiZero(Module):
 
         # maybe expand residual streams
 
-        (
-            action_tokens,
-            state_tokens,
-        ) = map(self.maybe_expand_residuals, (
-            action_tokens,
-            state_tokens,
-        ))
+        action_tokens = self.maybe_expand_residuals(action_tokens)
 
         # transformer
 
@@ -1340,13 +1331,12 @@ class PiZero(Module):
             for (
                 (attn, state_ff, actions_ff, memories_ff),
                 (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
-                (attn_residual, state_ff_residual, actions_ff_residual),
+                (attn_residual, actions_ff_residual),
             ) in zip(self.layers, self.cond_layers, self.residual_layers):
 
                 # joint attention
 
                 action_tokens, add_action_residual = attn_residual.prepare_with_inverse(action_tokens)
-                state_tokens, add_state_residual = attn_residual.prepare_with_inverse(state_tokens)
 
                 action_tokens = attn_ada_rmsnorm(action_tokens, time_cond)
 
@@ -1367,7 +1357,7 @@ class PiZero(Module):
 
                 action_attn_out = attn_ada_layerscale(actions_attn_out, time_cond)
 
-                state_tokens = add_state_residual(state_attn_out)
+                state_tokens = state_tokens + state_attn_out
                 action_tokens = add_action_residual(action_attn_out)
 
                 if self.has_recurrent_memories:
@@ -1378,11 +1368,9 @@ class PiZero(Module):
 
                 # state feedforward
 
-                state_tokens, add_state_ff_residual = state_ff_residual.prepare_with_inverse(state_tokens)
-
                 state_tokens_out = state_ff(state_tokens)
 
-                state_tokens = add_state_ff_residual(state_tokens_out)
+                state_tokens = state_tokens + state_tokens_out
 
                 # action feedforward
 
@@ -1410,7 +1398,7 @@ class PiZero(Module):
             for (
                 (attn, state_ff, actions_ff, memories_ff),
                 (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
-                (attn_residual, state_ff_residual, actions_ff_residual),
+                (attn_residual, actions_ff_residual),
             ) in zip(self.layers, self.cond_layers, self.residual_layers):
 
                 # actions attention
@@ -1457,13 +1445,7 @@ class PiZero(Module):
 
         # maybe reduce residual streams
 
-        (
-            action_tokens,
-            state_tokens,
-        ) = map(self.maybe_reduce_residuals, (
-            action_tokens,
-            state_tokens
-        ))
+        action_tokens = self.maybe_reduce_residuals(action_tokens)
 
         if not inferencing:
             # unpack and unembed to predictions
