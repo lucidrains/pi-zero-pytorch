@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from random import random
+from random import random, randrange
 
 from beartype import beartype
 from beartype.typing import Callable
 
-from functools import partial
+from functools import partial, wraps
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +28,7 @@ from rotary_embedding_torch import (
 
 import einx
 from einops.layers.torch import Rearrange
-from einops import rearrange, repeat, einsum, pack, unpack
+from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
 from pi_zero_pytorch.tensor_typing import Float, Int, Bool
 
@@ -50,6 +50,7 @@ import tqdm
 # h - image height
 # w - image width
 # f - image frames
+# s - residual streams (hyper connections paper)
 
 # token layout for transformer
 # vision and language tokens are autoregressive causal mask, actions, interal states + joint bidirectional amongst own tokens, but still autoregressive with respect to other tokens
@@ -111,6 +112,19 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def identity(t):
+    return t
+
+def maybe(fn):
+    @wraps(fn)
+    def inner(t, *args, **kwargs):
+        if not exists(t):
+            return None
+
+        return fn(t, *args, **kwargs)
+
+    return inner
 
 # tensor helpers
 
@@ -202,6 +216,97 @@ def noise_assignment(data, noise):
     dist = torch.cdist(data, noise)
     _, assign = linear_sum_assignment(dist.cpu())
     return torch.from_numpy(assign).to(device)
+
+# hyper connections - multiple residual streams
+
+class Residual(Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    def prepare_with_inverse(self, residuals):
+        branch_input, residuals, residual_kwargs = self.prepare(residuals)
+
+        def inverse(branch_out):
+            return self(branch_out, residuals, **residual_kwargs)
+
+        return branch_input, inverse
+
+    def prepare(self, residuals):
+        return residuals, residuals, dict()
+
+    def forward(self, branch_out, residuals, **kwargs):
+        return branch_out + residuals
+
+class HyperConnections(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        num_residual_streams,
+        layer_index = None,
+        tanh = True,
+        **kwargs
+    ):
+        """
+        https://arxiv.org/abs/2409.19606
+        Appendix J - Algorithm 2, Dynamic only
+        """
+        super().__init__()
+
+        self.act = nn.Tanh() if tanh else nn.Identity()
+
+        self.norm = nn.RMSNorm(dim)
+
+        self.num_residual_streams = num_residual_streams
+        layer_index = default(layer_index, randrange(num_residual_streams)) # just choose one random residual stream if layer index not given
+
+        self.static_beta = nn.Parameter(torch.ones(num_residual_streams))
+
+        init_alpha0 = torch.zeros((num_residual_streams, 1))
+        init_alpha0[layer_index % num_residual_streams, 0] = 1.
+
+        self.static_alpha = nn.Parameter(torch.cat([init_alpha0, torch.eye(num_residual_streams)], dim = 1))
+
+        self.dynamic_alpha_fn = nn.Parameter(torch.zeros(dim, num_residual_streams + 1))
+        self.dynamic_alpha_scale = nn.Parameter(torch.ones(()) * 1e-2)
+        self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim))
+        self.dynamic_beta_scale = nn.Parameter(torch.ones(()) * 1e-2)
+
+    def prepare_with_inverse(self, residuals):
+        branch_input, residuals, residual_kwargs = self.prepare(residuals)
+
+        def inverse(branch_out):
+            return self(branch_out, residuals, **residual_kwargs)
+
+        return branch_input, inverse
+
+    def prepare(self, residuals):
+
+        residuals = rearrange(residuals, '(b s) n d -> b n s d', s = self.num_residual_streams)
+
+        normed = self.norm(residuals)
+
+        wc_weight = self.act(normed @ self.dynamic_alpha_fn)
+        dynamic_alpha = wc_weight * self.dynamic_alpha_scale
+        alpha = dynamic_alpha + self.static_alpha
+
+        dc_weight = self.act(normed @ self.dynamic_beta_fn)
+        dynamic_beta = dc_weight * self.dynamic_beta_scale
+        beta = dynamic_beta + self.static_beta
+
+        # width connection
+
+        mix_h = einsum(alpha, residuals, '... s t, ... s d -> ... t d')
+
+        branch_input, residuals = mix_h[..., 0, :], mix_h[..., 1:, :]
+
+        return branch_input, residuals, dict(beta = beta)
+
+    def forward(self, branch_output, residuals, *, beta):
+        # 'depth' connection
+
+        residuals = einsum(branch_output, beta, 'b n d, b n s -> b n s d') + residuals
+        return rearrange(residuals, 'b n s d -> (b s) n d')
 
 # attention
 
@@ -610,6 +715,7 @@ class PiZero(Module):
         sample_times_fn = default_sample_times,
         reward_tokens_dropout_prob = 0.,
         num_recurrent_memory_tokens = 0,
+        num_residual_streams = 1,
         odeint_kwargs: dict = dict(
             atol = 1e-5,
             rtol = 1e-5,
@@ -679,6 +785,21 @@ class PiZero(Module):
 
         self.final_norm_write_memories = nn.RMSNorm(dim) if self.has_recurrent_memories else None
 
+        # residual functions, with maybe hyper connections
+
+        assert num_residual_streams >= 1
+        is_hyper_connection = num_residual_streams > 1
+        residual_klass = Residual if not is_hyper_connection else HyperConnections
+
+        residual_fns = []
+
+        self.maybe_expand_residuals = identity
+        self.maybe_reduce_residuals = identity
+
+        if is_hyper_connection:
+            self.maybe_expand_residuals = maybe(partial(repeat, pattern = 'b n d -> (b s) n d', s = num_residual_streams))
+            self.maybe_reduce_residuals = maybe(partial(reduce, reduction = 'sum', pattern = '(b s) n d -> b n d', s = num_residual_streams))
+
         # attention and feedforward
 
         layers = []
@@ -694,6 +815,12 @@ class PiZero(Module):
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
+            residual_fns.append(ModuleList([
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = i),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = i + 1),
+                residual_klass(dim = dim, num_residual_streams = num_residual_streams, layer_index = i + 1),
+            ]))
+
             cond_layers.append(ModuleList([
                 AdaptiveRMSNorm(dim, dim_time_cond),
                 AdaptiveLayerscale(dim, dim_time_cond),
@@ -703,6 +830,8 @@ class PiZero(Module):
 
         self.layers = ModuleList(layers)
         self.cond_layers = ModuleList(cond_layers)
+
+        self.residual_layers = ModuleList(residual_fns)
 
         self.final_norm_softclamp = partial(softclamp, value = final_norm_softclamp_value)
 
@@ -1067,6 +1196,8 @@ class PiZero(Module):
 
         action_with_registers_length = action_tokens.shape[-2]
 
+        state_tokens = None
+
         if not inferencing:
             # language
 
@@ -1189,13 +1320,29 @@ class PiZero(Module):
 
         actions_value_residual = None
 
+        # maybe expand residual streams
+
+        (
+            action_tokens,
+            state_tokens,
+        ) = map(self.maybe_expand_residuals, (
+            action_tokens,
+            state_tokens,
+        ))
+
         # transformer
 
         if not inferencing:
             for (
                 (attn, state_ff, actions_ff, memories_ff),
-                (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale)
-            ) in zip(self.layers, self.cond_layers):
+                (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
+                (attn_residual, state_ff_residual, actions_ff_residual),
+            ) in zip(self.layers, self.cond_layers, self.residual_layers):
+
+                # joint attention
+
+                action_tokens, add_action_residual = attn_residual.prepare_with_inverse(action_tokens)
+                state_tokens, add_state_residual = attn_residual.prepare_with_inverse(state_tokens)
 
                 action_tokens = attn_ada_rmsnorm(action_tokens, time_cond)
 
@@ -1214,8 +1361,10 @@ class PiZero(Module):
 
                 actions_value_residual = default(actions_value_residual, action_values)
 
-                state_tokens = state_tokens + state_attn_out
-                action_tokens = action_tokens + attn_ada_layerscale(actions_attn_out, time_cond)
+                action_attn_out = attn_ada_layerscale(actions_attn_out, time_cond)
+
+                state_tokens = add_state_residual(state_attn_out)
+                action_tokens = add_action_residual(action_attn_out)
 
                 if self.has_recurrent_memories:
                     (read_mem_attn_out, write_mem_attn_out), = maybe_mem_out
@@ -1223,13 +1372,27 @@ class PiZero(Module):
 
                     memory_tokens = (read_mem + read_mem_attn_out, write_mem + write_mem_attn_out)
 
-                state_tokens = state_ff(state_tokens) + state_tokens
+                # state feedforward
+
+                state_tokens, add_state_ff_residual = state_ff_residual.prepare_with_inverse(state_tokens)
+
+                state_tokens_out = state_ff(state_tokens)
+
+                state_tokens = add_state_ff_residual(state_tokens_out)
+
+                # action feedforward
+
+                action_tokens, add_action_ff_residual = actions_ff_residual.prepare_with_inverse(action_tokens)
 
                 action_tokens = ff_ada_rmsnorm(action_tokens, time_cond)
 
-                action_tokens = actions_ff(action_tokens) + action_tokens
+                action_tokens_out = actions_ff(action_tokens)
 
-                action_tokens = ff_ada_layerscale(action_tokens, time_cond)
+                action_tokens_out = ff_ada_layerscale(action_tokens_out, time_cond)
+
+                action_tokens = add_action_ff_residual(action_tokens_out)
+
+                # maybe memory feedforward
 
                 if self.has_recurrent_memories:
                     memory_tokens, unpack_memory = pack_with_inverse(memory_tokens, 'b * d')
@@ -1242,8 +1405,13 @@ class PiZero(Module):
 
             for (
                 (attn, state_ff, actions_ff, memories_ff),
-                (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale)
-            ) in zip(self.layers, self.cond_layers):
+                (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
+                (attn_residual, state_ff_residual, actions_ff_residual),
+            ) in zip(self.layers, self.cond_layers, self.residual_layers):
+
+                # actions attention
+
+                action_tokens, add_action_residual = attn_residual.prepare_with_inverse(action_tokens)
 
                 action_tokens = attn_ada_rmsnorm(action_tokens, time_cond)
 
@@ -1259,13 +1427,22 @@ class PiZero(Module):
 
                 actions_value_residual = default(actions_value_residual, action_values)
 
-                action_tokens = action_tokens + attn_ada_layerscale(actions_attn_out, time_cond)
+                actions_attn_out = attn_ada_layerscale(actions_attn_out, time_cond)
+                action_tokens = add_action_residual(actions_attn_out)
+
+                # actions feed forward
+
+                action_tokens, add_action_ff_residual = actions_ff_residual.prepare_with_inverse(action_tokens)
 
                 action_tokens = ff_ada_rmsnorm(action_tokens, time_cond)
 
-                action_tokens = actions_ff(action_tokens) + action_tokens
+                action_out = actions_ff(action_tokens)
 
-                action_tokens = ff_ada_layerscale(action_tokens, time_cond)
+                action_out = ff_ada_layerscale(action_out, time_cond)
+
+                action_tokens = add_action_residual(action_out)
+
+                # maybe memory feed forward
 
                 if self.has_recurrent_memories:
                     memory_tokens, unpack_memory = pack_with_inverse(memory_tokens, 'b * d')
@@ -1273,6 +1450,16 @@ class PiZero(Module):
                     memory_tokens = memories_ff(memory_tokens) + memory_tokens
 
                     memory_tokens = unpack_memory(memory_tokens)
+
+        # maybe reduce residual streams
+
+        (
+            action_tokens,
+            state_tokens,
+        ) = map(self.maybe_reduce_residuals, (
+            action_tokens,
+            state_tokens
+        ))
 
         if not inferencing:
             # unpack and unembed to predictions
