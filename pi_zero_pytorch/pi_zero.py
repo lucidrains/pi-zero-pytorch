@@ -1218,8 +1218,6 @@ class PiZero(Module):
 
         cached_state_key_values_iter = iter(default(cached_state_keys_values, []))
 
-        state_cached_keys_values = []
-
         # value residual learning
 
         actions_value_residual = None
@@ -1231,6 +1229,9 @@ class PiZero(Module):
         # transformer
 
         if not inferencing:
+
+            next_state_cached_keys_values = []
+
             for (
                 (attn, state_ff, actions_ff, memories_ff),
                 (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
@@ -1254,7 +1255,7 @@ class PiZero(Module):
                     memories = memory_tokens
                 )
 
-                state_cached_keys_values.append((state_keys, state_values))
+                next_state_cached_keys_values.append((state_keys, state_values))
 
                 actions_value_residual = default(actions_value_residual, action_values)
 
@@ -1298,6 +1299,10 @@ class PiZero(Module):
 
         else:
 
+            assert exists(cached_state_keys_values) and len(cached_state_keys_values) > 0
+
+            next_state_cached_keys_values = cached_state_keys_values
+
             for (
                 (attn, state_ff, actions_ff, memories_ff),
                 (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
@@ -1317,8 +1322,6 @@ class PiZero(Module):
                     mask = mask,
                     return_keys_values = True
                 )
-
-                state_cached_keys_values.append((state_keys, state_values))
 
                 actions_value_residual = default(actions_value_residual, action_values)
 
@@ -1392,7 +1395,7 @@ class PiZero(Module):
             if not return_state_keys_values:
                 return pred_actions_flow, written_memory_tokens
 
-            return pred_actions_flow, state_cached_keys_values
+            return pred_actions_flow, next_state_cached_keys_values
 
         flow_loss = self.zero
 
