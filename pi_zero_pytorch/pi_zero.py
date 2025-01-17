@@ -1203,7 +1203,8 @@ class PiZero(Module):
                 ),
                 Q_LEN = seq_len,
                 KV_LEN = seq_len,
-                device = state_tokens.device
+                device = state_tokens.device,
+                _compile = True,
             )
 
             score_mod_fn = softclamp_score_mod(self.attn_softclamp_value)
