@@ -119,6 +119,9 @@ def default(v, d):
 def identity(t):
     return t
 
+def xnor(x, y):
+    return not (x ^ y)
+
 def maybe(fn):
     @wraps(fn)
     def inner(t, *args, **kwargs):
@@ -628,6 +631,7 @@ class PiZero(Module):
         reward_tokens_dropout_prob = 0.,
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
+        dim_latent_gene = None,
         odeint_kwargs: dict = dict(
             atol = 1e-5,
             rtol = 1e-5,
@@ -683,6 +687,16 @@ class PiZero(Module):
             nn.Linear(dim, dim_time_cond),
             nn.SiLU(),
         )
+
+        # latent variable / gene conditioning
+
+        needs_latent = exists(dim_latent_gene)
+        self.needs_latent = needs_latent
+
+        self.to_latent_cond = nn.Sequential(
+            nn.Linear(dim_latent_gene, dim_time_cond),
+            nn.SiLU()
+        ) if needs_latent else None
 
         # positional embedding
 
@@ -818,7 +832,8 @@ class PiZero(Module):
         token_ids,
         joint_states,
         trajectory_length: int,
-        reward_tokens: Float['b d'] = None,
+        latents: Float['d'] | Float['b d'] = None,
+        reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         steps = 18,
         show_pbar = True,
@@ -849,6 +864,7 @@ class PiZero(Module):
                 joint_states,
                 denoised_actions,
                 times = timestep,
+                latents = latents,
                 reward_tokens = reward_tokens,
                 internal_state_tokens = internal_state_tokens,
                 cached_state_keys_values = (cached_state_kv, null_cached_state_kv),
@@ -1008,6 +1024,7 @@ class PiZero(Module):
         joint_state: Float['b djs'],                                     # joint state
         actions: Float['b na da'] | None = None,                         # action
         times: Float['b'] = None,
+        latents: Float['d'] | Float['b d'] = None,
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         external_states: tuple[Float['b ...']] | None = None,
@@ -1036,6 +1053,11 @@ class PiZero(Module):
         if times.ndim == 0:
             times = repeat(times, '-> b', b = batch)
 
+        # handle latent genes
+
+        if exists(latents) and latents.ndim == 1:
+            latents = repeat(latents, 'd -> b d', b = batch)
+
         # if not returning the actions predicted flow, assume training and noise the actions for loss
 
         if not return_actions_flow:
@@ -1054,6 +1076,15 @@ class PiZero(Module):
 
         time_cond = self.to_time_cond(times)
         action_tokens = self.to_action_tokens(actions)
+
+        # handle maybe latents
+
+        assert xnor(exists(latents), self.needs_latent)
+
+        if self.needs_latent:
+            latent_cond = self.to_latent_cond(latents)
+
+            time_cond = time_cond + latent_cond
 
         # register tokens
 
