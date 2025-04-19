@@ -5,9 +5,11 @@ from pi_zero_pytorch import π0
 
 @pytest.mark.parametrize('only_vlm', (True, False))
 @pytest.mark.parametrize('num_residual_streams', (1, 4))
+@pytest.mark.parametrize('policy_optimizable', (False, True))
 def test_pi_zero_with_vit(
     only_vlm: bool,
-    num_residual_streams: int
+    num_residual_streams: int,
+    policy_optimizable: bool
 ):
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
@@ -33,7 +35,8 @@ def test_pi_zero_with_vit(
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 20_000,
-        num_residual_streams = num_residual_streams
+        num_residual_streams = num_residual_streams,
+        policy_optimizable = policy_optimizable
     )
 
     images = torch.randn(2, 3, 2, 256, 256)

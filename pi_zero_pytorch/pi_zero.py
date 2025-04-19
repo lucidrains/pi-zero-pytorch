@@ -10,8 +10,9 @@ from itertools import count
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, tensor, is_tensor
+from torch import pi, nn, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList
+from torch.distributions import Normal
 from torch.distributions.beta import Beta
 
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
@@ -222,6 +223,41 @@ def noise_assignment(data, noise):
     dist = torch.cdist(data, noise)
     _, assign = linear_sum_assignment(dist.cpu())
     return torch.from_numpy(assign).to(device)
+
+# policy optimization related
+
+class MeanVarianceLoss(Module):
+    def forward(self, maybe_dist, target):
+
+        if is_tensor(maybe_dist):
+            mean, variance = maybe_dist.unbind(dim = -1)
+            maybe_dist = Normal(mean, variance)
+
+        log_probs = maybe_dist.log_prob(target)
+        return -log_probs.mean()
+
+class LinearToMeanVariance(Module):
+    def __init__(self, dim, dim_out):
+        super().__init__()
+
+        self.linear = nn.Sequential(
+            LinearNoBias(dim, dim_out * 2),
+            Rearrange('... (d mu_sigma) -> ... d mu_sigma', mu_sigma = 2)
+        )
+
+    def forward(
+        self,
+        x,
+        return_wrapped_normal = False
+    ):
+        out = self.linear(x)
+        mean, variance = out.unbind(dim = -1)
+        variance = variance.exp()
+
+        if return_wrapped_normal:
+            return Normal(mean, variance)
+
+        return stack((mean, variance), dim = -1)
 
 # attention
 
@@ -632,6 +668,7 @@ class PiZero(Module):
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
         dim_latent_gene = None,
+        policy_optimizable = False, # if set to True, will use mean variance network for access to log prob
         odeint_kwargs: dict = dict(
             atol = 1e-5,
             rtol = 1e-5,
@@ -759,7 +796,15 @@ class PiZero(Module):
         # unembedding
 
         self.state_to_logits = LinearNoBias(dim, num_tokens)
-        self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
+
+        if not policy_optimizable:
+            self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
+            self.loss_fn = nn.MSELoss()
+        else:
+            self.actions_to_pred_flow = LinearToMeanVariance(dim, dim_action_input)
+            self.loss_fn = MeanVarianceLoss()
+
+        self.is_mean_variance_output = policy_optimizable
 
         # the language token id padding id, for fine-tuning as well as taking care of the masking on top of causal mask
 
@@ -858,7 +903,7 @@ class PiZero(Module):
             nonlocal cached_state_kv
             nonlocal null_cached_state_kv
 
-            flow, (new_cached_state_kv, new_null_cached_state_kv) = self.forward_with_reward_cfg(
+            output, (new_cached_state_kv, new_null_cached_state_kv) = self.forward_with_reward_cfg(
                 images,
                 token_ids,
                 joint_states,
@@ -872,6 +917,12 @@ class PiZero(Module):
                 remove_parallel_component = remove_parallel_component,
                 keep_parallel_frac = keep_parallel_frac,
             )
+
+            flow = output
+
+            if self.is_mean_variance_output:
+                mean, variance = output.unbind(dim = -1)
+                flow = torch.normal(mean, variance)
 
             if cache_kv:
                 cached_state_kv = new_cached_state_kv
@@ -1432,8 +1483,8 @@ class PiZero(Module):
         flow_loss = self.zero
 
         if return_action_flow_loss:
-            flow_loss = F.mse_loss(flow, pred_actions_flow)
-        
+            flow_loss = self.loss_fn(pred_actions_flow, flow)
+
         # language cross entropy loss
 
         language_loss = self.zero
