@@ -144,4 +144,22 @@ That's it
 }
 ```
 
+```bibtex
+@inproceedings{Sun2025F5RTTSIF,
+    title   = {F5R-TTS: Improving Flow-Matching based Text-to-Speech with Group Relative Policy Optimization},
+    author  = {Xiaohui Sun and Ruitong Xiao and Jianye Mo and Bowen Wu and Qun Yu and Baoxun Wang},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:277510064}
+}
+```
+
+```bibtex
+@inproceedings{Wang2025EvolutionaryPO,
+    title = {Evolutionary Policy Optimization},
+    author = {Jianren Wang and Yifan Su and Abhinav Gupta and Deepak Pathak},
+    year  = {2025},
+    url   = {https://api.semanticscholar.org/CorpusID:277313729}
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
