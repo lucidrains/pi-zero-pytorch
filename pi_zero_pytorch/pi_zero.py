@@ -227,13 +227,12 @@ def noise_assignment(data, noise):
 # policy optimization related
 
 class MeanVarianceLoss(Module):
-    def forward(self, maybe_dist, target):
+    def forward(self, mu_sigma, target):
 
-        if is_tensor(maybe_dist):
-            mean, variance = maybe_dist.unbind(dim = -1)
-            maybe_dist = Normal(mean, variance)
+        mean, variance = mu_sigma.unbind(dim = -1)
+        dist = Normal(mean, variance)
+        log_probs = dist.log_prob(target)
 
-        log_probs = maybe_dist.log_prob(target)
         return -log_probs.mean()
 
 class LinearToMeanVariance(Module):
@@ -245,18 +244,10 @@ class LinearToMeanVariance(Module):
             Rearrange('... (d mu_sigma) -> ... d mu_sigma', mu_sigma = 2)
         )
 
-    def forward(
-        self,
-        x,
-        return_wrapped_normal = False
-    ):
-        out = self.linear(x)
+    def forward(self, embed):
+        out = self.linear(embed)
         mean, variance = out.unbind(dim = -1)
         variance = variance.exp()
-
-        if return_wrapped_normal:
-            return Normal(mean, variance)
-
         return stack((mean, variance), dim = -1)
 
 # attention
