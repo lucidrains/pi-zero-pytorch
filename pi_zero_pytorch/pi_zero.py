@@ -876,7 +876,8 @@ class PiZero(Module):
         cond_scale = 0.,
         remove_parallel_component = True,
         keep_parallel_frac = 0.,
-        cache_kv = True
+        cache_kv = True,
+        return_log_probs = False
     ):
         batch_size = token_ids.shape[0]
 
@@ -884,6 +885,12 @@ class PiZero(Module):
         self.eval()
 
         pbar = tqdm.tqdm(desc = 'sampling action trajectory', disable = not show_pbar, total = steps)
+
+        # accumulate log probs for ppo
+
+        assert not (return_log_probs and not self.is_mean_variance_output), 'only pi-zero with `policy_optimizable` turned on can return log probs'
+
+        log_probs = []
 
         # ode step function
 
@@ -915,6 +922,9 @@ class PiZero(Module):
                 mean, variance = output.unbind(dim = -1)
                 flow = torch.normal(mean, variance)
 
+                log_prob = Normal(mean, variance).log_prob(flow)
+                log_probs.append(log_prob)
+
             if cache_kv:
                 cached_state_kv = new_cached_state_kv
                 null_cached_state_kv = new_null_cached_state_kv
@@ -941,7 +951,10 @@ class PiZero(Module):
 
         pbar.close()
 
-        return sampled_actions
+        if not return_log_probs:
+            return sampled_actions
+
+        return sampled_actions, stack(log_probs)
 
     @torch.no_grad()
     def forward_with_reward_cfg(
