@@ -3,7 +3,7 @@ from __future__ import annotations
 from random import random, randrange
 
 from beartype import beartype
-from beartype.typing import Callable
+from beartype.typing import Callable, Literal
 
 from functools import partial, wraps
 from itertools import count
@@ -236,8 +236,22 @@ class MeanVarianceLoss(Module):
         return -log_probs.mean()
 
 class LinearToMeanVariance(Module):
-    def __init__(self, dim, dim_out):
+    def __init__(
+        self,
+        dim,
+        dim_out,
+        variance_activation: Literal['softplus', 'exp'] = 'exp'
+    ):
         super().__init__()
+
+        if variance_activation == 'softplus':
+            variance_act = F.softplus
+        elif variance_activation == 'exp':
+            variance_act = torch.exp
+        else:
+            raise ValueError(f'unrecognized activation {variance_activation}')
+
+        self.variance_act = variance_act
 
         self.linear = nn.Sequential(
             LinearNoBias(dim, dim_out * 2),
@@ -247,7 +261,7 @@ class LinearToMeanVariance(Module):
     def forward(self, embed):
         out = self.linear(embed)
         mean, variance = out.unbind(dim = -1)
-        variance = variance.exp()
+        variance = self.variance_act(variance)
         return stack((mean, variance), dim = -1)
 
 # attention
@@ -660,6 +674,7 @@ class PiZero(Module):
         num_residual_streams = 1,
         dim_latent_gene = None,
         policy_optimizable = False, # if set to True, will use mean variance network for access to log prob
+        flow_variance_activation: Literal['exp', 'softplus'] = 'exp',
         odeint_kwargs: dict = dict(
             atol = 1e-5,
             rtol = 1e-5,
@@ -792,7 +807,7 @@ class PiZero(Module):
             self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
             self.loss_fn = nn.MSELoss()
         else:
-            self.actions_to_pred_flow = LinearToMeanVariance(dim, dim_action_input)
+            self.actions_to_pred_flow = LinearToMeanVariance(dim, dim_action_input, variance_activation = flow_variance_activation)
             self.loss_fn = MeanVarianceLoss()
 
         self.is_mean_variance_output = policy_optimizable
