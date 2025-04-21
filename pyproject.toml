@@ -29,7 +29,7 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.0",
     "ema-pytorch>=0.7.3",
-    "evolutionary-policy-optimization>=0.0.32",
+    "evolutionary-policy-optimization>=0.0.52",
     "jaxtyping",
     'hyper-connections>=0.0.10',
     "rotary-embedding-torch>=0.8.5",
