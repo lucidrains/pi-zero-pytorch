@@ -1087,6 +1087,46 @@ class PiZero(Module):
 
         return logits
 
+    def forward_for_policy_loss(
+        self,
+        *args,
+        flow,
+        old_log_probs: Float['b na'],
+        advantages: Float['b'],
+        clip_eps = 0.2,
+        entropy_weight = 1e-2,
+        norm_eps = 1e-5,
+        **kwargs,
+    ):
+
+        assert self.policy_optimizable
+        assert 'return_actions_flow' not in kwargs
+
+        mean_variance = self.forward(*args, return_actions_flow = True, **kwargs)
+
+        normal_dist = Normal(*mean_variance.unbind(dim = -1))
+
+        new_log_probs = normal_dist.log_prob(flow)
+
+        # ppo surrogate loss
+
+        ratio = (new_log_probs - old_log_probs).exp()
+
+        advantages = F.layer_norm(advantages, advantages.shape, eps = norm_eps)
+
+        advantages = rearrange(advantages, 'b -> b 1')
+
+        surr1 = ratio * advantages
+        surr2 = ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages
+
+        clipped_surr_loss = torch.min(surr1, surr2).sum(dim = -1)
+
+        # entropy
+
+        entropy = normal_dist.entropy() * entropy_weight
+
+        return - (clipped_surr_loss + entropy * entropy_weight).mean()
+
     def forward(
         self,
         images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
