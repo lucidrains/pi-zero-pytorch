@@ -889,6 +889,7 @@ class PiZero(Module):
         steps = 18,
         show_pbar = True,
         cond_scale = 0.,
+        temperature = 1.,
         remove_parallel_component = True,
         keep_parallel_frac = 0.,
         cache_kv = True,
@@ -935,7 +936,8 @@ class PiZero(Module):
 
             if self.is_mean_variance_output:
                 mean, variance = output.unbind(dim = -1)
-                flow = torch.normal(mean, variance)
+
+                flow = torch.normal(mean, variance * temperature)
 
                 log_prob = Normal(mean, variance).log_prob(flow)
                 log_probs.append(log_prob)
