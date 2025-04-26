@@ -893,7 +893,7 @@ class PiZero(Module):
         remove_parallel_component = True,
         keep_parallel_frac = 0.,
         cache_kv = True,
-        return_log_probs = False
+        return_states_for_replay = False
     ):
         batch_size = token_ids.shape[0]
 
@@ -904,9 +904,11 @@ class PiZero(Module):
 
         # accumulate log probs for ppo
 
-        assert not (return_log_probs and not self.is_mean_variance_output), 'only pi-zero with `policy_optimizable` turned on can return log probs'
+        assert not (return_states_for_replay and not self.is_mean_variance_output), 'only pi-zero with `policy_optimizable` turned on can return log probs'
 
+        timesteps = []
         log_probs = []
+        sampled_flows = []
 
         # ode step function
 
@@ -940,7 +942,12 @@ class PiZero(Module):
                 flow = torch.normal(mean, variance * temperature)
 
                 log_prob = Normal(mean, variance).log_prob(flow)
+
+                # save for replaying for optimizing actor
+
+                timesteps.append(timestep)
                 log_probs.append(log_prob)
+                sampled_flows.append(flow)
 
             if cache_kv:
                 cached_state_kv = new_cached_state_kv
@@ -948,7 +955,7 @@ class PiZero(Module):
 
             pbar.update(1)
 
-            return -flow
+            return flow
 
         # start with random gaussian noise - y0
 
@@ -968,10 +975,16 @@ class PiZero(Module):
 
         pbar.close()
 
-        if not return_log_probs:
+        if not return_states_for_replay:
             return sampled_actions
 
-        return sampled_actions, stack(log_probs)
+        # place the time step dimension after batch
+
+        timesteps = stack(timesteps)
+        log_probs = stack(log_probs, dim = 1)
+        sampled_flow = stack(sampled_flows, dim = 1)
+
+        return sampled_actions, (timesteps, sampled_flow, log_probs)
 
     @torch.no_grad()
     def forward_with_reward_cfg(
@@ -1179,7 +1192,7 @@ class PiZero(Module):
                 assignment = noise_assignment(actions, noise)
                 noise = noise[assignment]
 
-            flow = noise - actions
+            flow = actions - noise
             padded_times = rearrange(times, 'b -> b 1 1')
 
             actions = noise.lerp(actions, padded_times)

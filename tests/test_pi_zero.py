@@ -62,5 +62,18 @@ def test_pi_zero_with_vit(
 
     assert sampled_actions.shape == (2, 32, 6)
 
-    if policy_optimizable:
-        _, old_log_probs = model(images, commands, joint_state, trajectory_length = 32, return_log_probs = True) # (1, 32, 6)
+    if not policy_optimizable:
+        return
+
+    _, (
+        timesteps,
+        trajectory,
+        log_probs
+    ) = model(
+        images,
+        commands,
+        joint_state,
+        trajectory_length = 32,
+        steps = 4,
+        return_states_for_replay = True
+    ) # (1, 32, 6)
