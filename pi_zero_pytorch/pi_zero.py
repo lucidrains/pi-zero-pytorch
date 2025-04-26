@@ -893,7 +893,8 @@ class PiZero(Module):
         remove_parallel_component = True,
         keep_parallel_frac = 0.,
         cache_kv = True,
-        return_states_for_replay = False
+        return_states_for_replay = False,
+        critic: Module | None = None,
     ):
         batch_size = token_ids.shape[0]
 
@@ -910,6 +911,8 @@ class PiZero(Module):
         log_probs = []
         sampled_flows = []
 
+        critic_values = []
+
         # ode step function
 
         cached_state_kv = None
@@ -919,11 +922,14 @@ class PiZero(Module):
             nonlocal cached_state_kv
             nonlocal null_cached_state_kv
 
-            output, (new_cached_state_kv, new_null_cached_state_kv) = self.forward_with_reward_cfg(
+            input_args = (
                 images,
                 token_ids,
                 joint_states,
-                denoised_actions,
+                denoised_actions
+            )
+
+            input_kwargs = dict(
                 times = timestep,
                 latents = latents,
                 reward_tokens = reward_tokens,
@@ -931,8 +937,14 @@ class PiZero(Module):
                 cached_state_keys_values = (cached_state_kv, null_cached_state_kv),
                 cond_scale = cond_scale,
                 remove_parallel_component = remove_parallel_component,
-                keep_parallel_frac = keep_parallel_frac,
+                keep_parallel_frac = keep_parallel_frac
             )
+
+            output, (new_cached_state_kv, new_null_cached_state_kv) = self.forward_with_reward_cfg(*input_args, **input_kwargs)
+
+            if exists(critic):
+                critic_value, _ = critic.forward_with_reward_cfg(*input_args, **input_kwargs)
+                critic_values.append(critic_value)
 
             flow = output
 
@@ -984,7 +996,15 @@ class PiZero(Module):
         log_probs = stack(log_probs, dim = 1)
         sampled_flow = stack(sampled_flows, dim = 1)
 
-        return sampled_actions, (timesteps, sampled_flow, log_probs)
+        policy_optimization_outputs = (timesteps, log_probs, sampled_flow)
+
+        # return critic value predictions if passed in - will just deepcopy pi-zero + a critic head
+
+        if exists(critic):
+            critic_values = stack(critic_values, dim = 1)
+            policy_optimization_outputs = (*policy_optimization_outputs, critic_values)
+
+        return sampled_actions, policy_optimization_outputs
 
     @torch.no_grad()
     def forward_with_reward_cfg(
