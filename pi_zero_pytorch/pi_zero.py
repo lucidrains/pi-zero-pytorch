@@ -811,6 +811,7 @@ class PiZero(Module):
             self.loss_fn = MeanVarianceLoss()
 
         self.is_mean_variance_output = policy_optimizable
+        self.policy_optimizable = policy_optimizable
 
         # the language token id padding id, for fine-tuning as well as taking care of the masking on top of causal mask
 
@@ -876,7 +877,7 @@ class PiZero(Module):
 
         return ema_pi_zero
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def sample_actions(
         self,
         images,
@@ -910,6 +911,7 @@ class PiZero(Module):
         timesteps = []
         log_probs = []
         sampled_flows = []
+        denoised_actions_across_time = []
 
         critic_values = []
 
@@ -957,7 +959,8 @@ class PiZero(Module):
 
                 # save for replaying for optimizing actor
 
-                timesteps.append(timestep)
+                denoised_actions_across_time.append(denoised_actions)
+                timesteps.append(repeat(timestep, ' -> b', b = batch_size))
                 log_probs.append(log_prob)
                 sampled_flows.append(flow)
 
@@ -992,11 +995,12 @@ class PiZero(Module):
 
         # place the time step dimension after batch
 
-        timesteps = stack(timesteps)
+        timesteps = stack(timesteps, dim = 1)
         log_probs = stack(log_probs, dim = 1)
         sampled_flow = stack(sampled_flows, dim = 1)
+        denoised_actions_across_time = stack(denoised_actions_across_time, dim = 1)
 
-        policy_optimization_outputs = (timesteps, log_probs, sampled_flow)
+        policy_optimization_outputs = (denoised_actions_across_time, timesteps, log_probs, sampled_flow)
 
         # return critic value predictions if passed in - will just deepcopy pi-zero + a critic head
 
@@ -1124,8 +1128,12 @@ class PiZero(Module):
 
     def forward_for_policy_loss(
         self,
-        *args,
+        images,
+        commands,
+        joint_state,
+        actions,
         flow,
+        times,
         old_log_probs: Float['b na'],
         advantages: Float['b'],
         clip_eps = 0.2,
@@ -1137,11 +1145,44 @@ class PiZero(Module):
         assert self.policy_optimizable
         assert 'return_actions_flow' not in kwargs
 
-        mean_variance = self.forward(*args, return_actions_flow = True, **kwargs)
+        # flatten the time into the batch for actions at timestep, sampled flow, and log prob
+
+        if times.ndim == 2:
+            times = rearrange(times, 'b t -> (b t)')
+
+        if flow.ndim == 4:
+            flow = rearrange(flow, 'b t ... -> (b t) ...')
+
+        if old_log_probs.ndim == 4:
+            old_log_probs = rearrange(old_log_probs, 'b t ... -> (b t) ...')
+
+        if actions.ndim == 4:
+            actions = rearrange(actions, 'b t ... -> (b t) ...')
+
+        # expand inputs across timesteps if need be
+
+        (
+            images,
+            commands,
+            joint_state,
+        ) = tuple(repeat(inp, 'b ... -> (b t) ...', t = times.shape[0] // inp.shape[0]) for inp in (
+            images,
+            commands,
+            joint_state
+        ))
+
+        mean_variance = self.forward(
+            images,
+            commands,
+            joint_state,
+            actions,
+            return_actions_flow = True,
+            **kwargs
+        )
 
         normal_dist = Normal(*mean_variance.unbind(dim = -1))
 
-        new_log_probs = normal_dist.log_prob(flow)
+        new_log_probs = normal_dist.log_prob(actions)
 
         # ppo surrogate loss
 
@@ -1149,7 +1190,7 @@ class PiZero(Module):
 
         advantages = F.layer_norm(advantages, advantages.shape, eps = norm_eps)
 
-        advantages = rearrange(advantages, 'b -> b 1')
+        advantages = repeat(advantages, 'b -> (b t) 1 1', t = times.shape[0] // advantages.shape[0])
 
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages
@@ -1158,9 +1199,9 @@ class PiZero(Module):
 
         # entropy
 
-        entropy = normal_dist.entropy() * entropy_weight
+        entropy = (normal_dist.entropy() * entropy_weight).sum(dim = -1)
 
-        return - (clipped_surr_loss + entropy * entropy_weight).mean()
+        return -(clipped_surr_loss + entropy * entropy_weight).mean()
 
     def forward(
         self,
