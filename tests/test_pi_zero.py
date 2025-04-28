@@ -126,3 +126,5 @@ def optimize_policy():
     )
 
     actor_loss.backward()
+
+    critic = model.create_critic()

@@ -135,6 +135,14 @@ def maybe(fn):
 
     return inner
 
+def save_args_kwargs(fn):
+    @wraps(fn)
+    def decorated(self, *args, **kwargs):
+        self._init_args_kwargs = (args, kwargs)
+        return fn(self, *args, **kwargs)
+
+    return decorated
+
 # tensor helpers
 
 def log(t, eps = 1e-20):
@@ -635,6 +643,7 @@ class AdaptiveLayerscale(Module):
 
 class PiZero(Module):
     @beartype
+    @save_args_kwargs
     def __init__(
         self,
         dim,
@@ -888,6 +897,22 @@ class PiZero(Module):
         )
 
         return ema_pi_zero
+
+    def create_critic(self, **kwargs) -> PiZero:
+        assert self.policy_optimizable and not self.is_critic, 'base model must be policy optimizable as well as not a critic already'
+
+        assert 'is_critic' not in kwargs
+        kwargs.update(is_critic = True)
+
+        orig_args, orig_kwargs = self._init_args_kwargs
+        critic = PiZero(*orig_args, **orig_kwargs, **kwargs)
+
+        # load all possible shared parameters except for output head to logits (for histogram loss)
+
+        state_dict = self.state_dict()
+        critic.load_state_dict(state_dict, strict = False)
+
+        return critic
 
     @torch.no_grad()
     def sample_actions(
