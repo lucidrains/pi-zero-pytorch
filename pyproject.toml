@@ -25,6 +25,7 @@ classifiers=[
 ]
 
 dependencies = [
+    "assoc-scan>=0.0.2",
     "beartype",
     "einx>=0.3.0",
     "einops>=0.8.0",
