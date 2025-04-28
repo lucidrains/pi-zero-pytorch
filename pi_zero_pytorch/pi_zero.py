@@ -36,6 +36,8 @@ from pi_zero_pytorch.tensor_typing import Float, Int, Bool
 
 from hyper_connections import HyperConnections
 
+from hl_gauss_pytorch import HLGaussLayer
+
 import tqdm
 
 # ein notation
@@ -226,7 +228,7 @@ def noise_assignment(data, noise):
 
 # policy optimization related
 
-class MeanVarianceLoss(Module):
+class GaussianNLL(Module):
     def forward(self, mu_sigma, target):
 
         mean, variance = mu_sigma.unbind(dim = -1)
@@ -240,18 +242,8 @@ class LinearToMeanVariance(Module):
         self,
         dim,
         dim_out,
-        variance_activation: Literal['softplus', 'exp'] = 'exp'
     ):
         super().__init__()
-
-        if variance_activation == 'softplus':
-            variance_act = F.softplus
-        elif variance_activation == 'exp':
-            variance_act = torch.exp
-        else:
-            raise ValueError(f'unrecognized activation {variance_activation}')
-
-        self.variance_act = variance_act
 
         self.linear = nn.Sequential(
             LinearNoBias(dim, dim_out * 2),
@@ -260,8 +252,8 @@ class LinearToMeanVariance(Module):
 
     def forward(self, embed):
         out = self.linear(embed)
-        mean, variance = out.unbind(dim = -1)
-        variance = self.variance_act(variance)
+        mean, log_variance = out.unbind(dim = -1)
+        variance = log_variance.exp()
         return stack((mean, variance), dim = -1)
 
 # attention
@@ -673,8 +665,13 @@ class PiZero(Module):
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
         dim_latent_gene = None,
-        policy_optimizable = False, # if set to True, will use mean variance network for access to log prob
-        flow_variance_activation: Literal['exp', 'softplus'] = 'exp',
+        policy_optimizable = False,         # if set to True, will use mean variance network for access to log prob
+        is_critic = False,                  # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
+        critic_value_kwargs: dict = dict(
+            min_value = -10.,
+            max_value = 10.,
+            num_bins = 50
+        ),
         odeint_kwargs: dict = dict(
             atol = 1e-5,
             rtol = 1e-5,
@@ -803,15 +800,30 @@ class PiZero(Module):
 
         self.state_to_logits = LinearNoBias(dim, num_tokens)
 
-        if not policy_optimizable:
-            self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
-            self.loss_fn = nn.MSELoss()
-        else:
-            self.actions_to_pred_flow = LinearToMeanVariance(dim, dim_action_input, variance_activation = flow_variance_activation)
-            self.loss_fn = MeanVarianceLoss()
+        # actor related
+
+        self.actions_to_pred_flow = None
+        self.loss_fn = None
+
+        if not is_critic:
+            if not policy_optimizable:
+                self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
+                self.loss_fn = nn.MSELoss()
+            else:
+                self.actions_to_pred_flow = LinearToMeanVariance(dim, dim_action_input)
+                self.loss_fn = GaussianNLL()
 
         self.is_mean_variance_output = policy_optimizable
         self.policy_optimizable = policy_optimizable
+
+        # critic related
+
+        self.is_critic = is_critic
+
+        self.to_critic_value = HLGaussLayer(
+            dim,
+            hl_gauss_loss = critic_value_kwargs
+        )
 
         # the language token id padding id, for fine-tuning as well as taking care of the masking on top of causal mask
 
@@ -897,6 +909,8 @@ class PiZero(Module):
         return_states_for_replay = False,
         critic: Module | None = None,
     ):
+        assert not self.is_critic
+
         batch_size = token_ids.shape[0]
 
         was_training = self.training
@@ -1141,7 +1155,7 @@ class PiZero(Module):
         norm_eps = 1e-5,
         **kwargs,
     ):
-
+        assert not self.is_critic
         assert self.policy_optimizable
         assert 'return_actions_flow' not in kwargs
 
@@ -1203,6 +1217,30 @@ class PiZero(Module):
 
         return -(clipped_surr_loss + entropy * entropy_weight).mean()
 
+    def forward_for_critic_loss(
+        self,
+        *args,
+        old_values: Float['b'],
+        advantages: Float['b'],
+        clip_eps = 0.4,
+        **kwargs
+    ):
+        assert self.is_critic
+
+        eps = clip_eps
+        loss_fn = self.to_critic_value.loss_fn
+
+        critic_value, critic_logits = self.forward(*args, **kwargs)
+
+        # value clipping
+
+        clipped_value = old_values + (critic_value - old_values).clamp(-eps, eps)
+
+        clipped_loss = loss_fn(clipped_value, returns, reduction = 'none')
+        loss = loss_fn(critic_logits, returns, reduction = 'none')
+
+        return torch.max(clipped_loss, loss).mean()
+
     def forward(
         self,
         images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
@@ -1226,7 +1264,7 @@ class PiZero(Module):
         inferencing = exists(cached_state_keys_values)
         assert not (inferencing and not return_actions_flow), 'must be generating action trajectory if receiving cached state key values'
 
-        if not exists(actions):
+        if not exists(actions) and not self.is_critic:
             return self.sample_actions(images, token_ids, joint_state, **kwargs)
 
         batch, device = token_ids.shape[0], token_ids.device
@@ -1595,7 +1633,14 @@ class PiZero(Module):
 
         # final actions norm
 
-        actions = self.final_actions_norm(action_tokens)
+        action_embeds = self.final_actions_norm(action_tokens)
+
+        # pool the action embeds and project if critic loss
+
+        if self.is_critic:
+            action_embeds = reduce(action_embeds, 'b n d -> b d', 'mean')
+
+            return self.to_critic_value(action_embeds, return_value_and_logits = True)
 
         # validate loss being returned
 
@@ -1603,7 +1648,7 @@ class PiZero(Module):
 
         # flow loss for actions tokens
 
-        pred_actions_flow = self.actions_to_pred_flow(actions)
+        pred_actions_flow = self.actions_to_pred_flow(action_embeds)
 
         if return_actions_flow:
 
