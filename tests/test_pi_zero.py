@@ -60,6 +60,11 @@ def test_pi_zero_with_vit(
     assert sampled_actions.shape == (2, 32, 6)
 
 def optimize_policy():
+    from pi_zero_pytorch import (
+        Agent,
+        EPO,
+    )
+
     v = ViT(
         image_size = 256,
         patch_size = 32,
@@ -94,12 +99,16 @@ def optimize_policy():
     loss, _ = model(images, commands, joint_state, actions)
     loss.backward()
 
+    # agent
+
+    agent = Agent(model)
+
     final_action_to_env, (
         actions,
         timesteps,
         sampled_flows,
         log_probs
-    ) = model(
+    ) = agent.actor(
         images,
         commands,
         joint_state,
@@ -114,7 +123,7 @@ def optimize_policy():
 
     # optimize policy with replay tensors from above
 
-    actor_loss = model.forward_for_policy_loss(
+    actor_loss = agent.actor.forward_for_policy_loss(
         images,
         commands,
         joint_state,
@@ -126,5 +135,3 @@ def optimize_policy():
     )
 
     actor_loss.backward()
-
-    critic = model.create_critic()

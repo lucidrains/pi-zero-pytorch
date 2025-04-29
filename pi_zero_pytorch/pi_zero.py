@@ -23,6 +23,8 @@ from scipy.optimize import linear_sum_assignment
 
 from ema_pytorch import EMA
 
+from adam_atan2_pytorch import AdoptAtan2
+
 from rotary_embedding_torch import (
     RotaryEmbedding,
     apply_rotary_emb
@@ -1725,6 +1727,43 @@ class PiZero(Module):
             return total_loss, loss_breakdown
 
         return total_loss, loss_breakdown, written_memory_tokens
+
+# agent
+
+class Agent(Module):
+    def __init__(
+        self,
+        model: PiZero,
+        optim_klass: AdoptAtan2,
+        actor_lr = 3e-4,
+        critic_lr = 3e-4,
+        actor_weight_decay = 1e-3,
+        critic_weight_decay = 1e-3,
+        actor_optim_kwargs: dict = dict(),
+        critic_optim_kwargs: dict = dict(),
+    ):
+        super().__init__()
+        assert model.policy_optimizable
+
+        self.actor = model
+        self.critic = model.create_critic()
+
+        # optimizers
+
+        self.actor_optim = optim_klass(self.actor.parameters(), lr = actor_lr, weight_decay = actor_weight_decay, **actor_optim_kwargs)
+        self.critic_optim = optim_klass(self.critic.parameters(), lr = critic_lr, weight_decay = critic_weight_decay, **critic_optim_kwargs)
+
+    def forward(
+        self,
+        memories
+    ):
+        raise NotImplementedError
+
+
+class EPO(Module):
+    def __init__(self):
+        super().__init__()
+        raise NotImplementedError
 
 # fun
 
