@@ -742,10 +742,15 @@ class PiZero(Module):
         needs_latent = exists(dim_latent_gene)
         self.needs_latent = needs_latent
 
-        self.to_latent_cond = nn.Sequential(
-            nn.Linear(dim_latent_gene, dim_time_cond),
-            nn.SiLU()
-        ) if needs_latent else None
+        if needs_latent:
+            self.to_latent_cond = nn.Sequential(
+                nn.Linear(dim_latent_gene, dim_time_cond * 2),
+                nn.SiLU(),
+                nn.Linear(dim_time_cond * 2, dim_time_cond),
+            )
+
+            nn.init.zeros_(self.to_latent_cond[-1].weight)
+            nn.init.zeros_(self.to_latent_cond[-1].bias)
 
         # positional embedding
 
@@ -1333,7 +1338,7 @@ class PiZero(Module):
         if self.needs_latent:
             latent_cond = self.to_latent_cond(latents)
 
-            time_cond = time_cond + latent_cond
+            time_cond = time_cond * (latent_cond + 1.)
 
         # register tokens
 
