@@ -20,7 +20,7 @@ def test_pi_zero_with_vit(
         patch_size = 32,
         num_classes = 1000,
         dim = 32,
-        depth = 6,
+        depth = 1,
         heads = 16,
         dim_head = 16,
         mlp_dim = 64,
@@ -34,14 +34,15 @@ def test_pi_zero_with_vit(
         dim = 32,
         vit = v,
         vit_dim = 32,
+        depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000,
+        num_tokens = 32,
         num_residual_streams = num_residual_streams,
     ).to(device)
 
     images = torch.randn(2, 3, 2, 256, 256).to(device)
-    commands = torch.randint(0, 20_000, (2, 1024)).to(device)
+    commands = torch.randint(0, 32, (2, 1024)).to(device)
 
     if only_vlm:
         vlm_logits = model.forward_only_vision_language(images, commands)
@@ -75,10 +76,10 @@ def test_policy_optimization():
         patch_size = 32,
         num_classes = 1000,
         dim = 32,
-        depth = 6,
-        heads = 16,
-        dim_head = 16,
-        mlp_dim = 64,
+        depth = 1,
+        heads = 2,
+        dim_head = 8,
+        mlp_dim = 16,
         dropout = 0.1,
         emb_dropout = 0.1
     ).to(device)
@@ -89,14 +90,15 @@ def test_policy_optimization():
         dim = 32,
         vit = v,
         vit_dim = 32,
+        depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000,
+        num_tokens = 32,
         policy_optimizable = True
     ).to(device)
 
     images = torch.randn(1, 3, 2, 256, 256).to(device)
-    commands = torch.randint(0, 20_000, (1, 1024)).to(device)
+    commands = torch.randint(0, 32, (1, 1024)).to(device)
 
     joint_state = torch.randn(1, 12).to(device)
     actions = torch.randn(1, 32, 6).to(device)
@@ -118,7 +120,7 @@ def test_policy_optimization():
 
         final_action_to_env, replay_tensors = agent.actor(
             *input_tensors,
-            trajectory_length = 32,
+            trajectory_length = 4,
             steps = 2,
             return_states_for_replay = True
         )
