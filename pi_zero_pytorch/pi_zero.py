@@ -40,6 +40,8 @@ from hyper_connections import HyperConnections
 
 from hl_gauss_pytorch import HLGaussLayer
 
+from assoc_scan import AssocScan
+
 import tqdm
 
 # ein notation
@@ -919,7 +921,7 @@ class PiZero(Module):
         state_dict = self.state_dict()
         critic.load_state_dict(state_dict, strict = False)
 
-        return critic
+        return critic.to(self.device)
 
     @torch.no_grad()
     def sample_actions(
@@ -1181,7 +1183,7 @@ class PiZero(Module):
         flow,
         times,
         old_log_probs: Float['b na'],
-        advantages: Float['b'],
+        advantages: Float['b t'],
         clip_eps = 0.2,
         entropy_weight = 1e-2,
         norm_eps = 1e-5,
@@ -1236,7 +1238,7 @@ class PiZero(Module):
 
         advantages = F.layer_norm(advantages, advantages.shape, eps = norm_eps)
 
-        advantages = repeat(advantages, 'b -> (b t) 1 1', t = times.shape[0] // advantages.shape[0])
+        advantages = rearrange(advantages, 'b t -> (b t) 1 1')
 
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages
@@ -1252,8 +1254,8 @@ class PiZero(Module):
     def forward_for_critic_loss(
         self,
         *args,
-        old_values: Float['b'],
-        advantages: Float['b'],
+        old_values: Float['b t'],
+        advantages: Float['b t'],
         clip_eps = 0.4,
         **kwargs
     ):
@@ -1265,6 +1267,11 @@ class PiZero(Module):
         critic_value, critic_logits = self.forward(*args, **kwargs)
 
         # value clipping
+
+        advantages = rearrange(advantages, 'b t -> (b t)')
+        old_values = rearrange(old_values, 'b t -> (b t)')
+
+        returns = old_values + advantages
 
         clipped_value = old_values + (critic_value - old_values).clamp(-eps, eps)
 
@@ -1316,7 +1323,7 @@ class PiZero(Module):
 
         # if not returning the actions predicted flow, assume training and noise the actions for loss
 
-        if not return_actions_flow:
+        if not return_actions_flow and not self.is_critic:
             noise = torch.randn_like(actions)
 
             if self.immiscible_flow:
@@ -1728,13 +1735,35 @@ class PiZero(Module):
 
         return total_loss, loss_breakdown, written_memory_tokens
 
+# generalized advantage estimate
+
+def calc_generalized_advantage_estimate(
+    rewards,
+    values,
+    masks,
+    gamma = 0.99,
+    lam = 0.95,
+    use_accelerated = None
+):
+    use_accelerated = default(use_accelerated, rewards.is_cuda)
+
+    values = F.pad(values, (0, 1), value = 0.)
+    values, values_next = values[:, :-1], values[:, 1:]
+
+    delta = rewards + gamma * values_next * masks - values
+    gates = gamma * lam * masks
+
+    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+
+    return scan(gates, delta)
+
 # agent
 
 class Agent(Module):
     def __init__(
         self,
         model: PiZero,
-        optim_klass: AdoptAtan2,
+        optim_klass = AdoptAtan2,
         actor_lr = 3e-4,
         critic_lr = 3e-4,
         actor_weight_decay = 1e-3,
