@@ -285,15 +285,11 @@ class LinearToMeanVariance(Module):
         dim_out,
     ):
         super().__init__()
-
-        self.linear = nn.Sequential(
-            LinearNoBias(dim, dim_out * 2),
-            Rearrange('... (d mu_sigma) -> ... d mu_sigma', mu_sigma = 2)
-        )
+        self.linear = LinearNoBias(dim, dim_out * 2)
 
     def forward(self, embed):
         out = self.linear(embed)
-        mean, log_variance = out.unbind(dim = -1)
+        mean, log_variance = rearrange(out, '... (d mu_sigma) -> mu_sigma ... d')
         variance = log_variance.exp()
         return stack((mean, variance), dim = -1)
 
@@ -935,6 +931,33 @@ class PiZero(Module):
         )
 
         return ema_pi_zero
+
+    def create_actor(self, **kwargs) -> PiZero:
+        assert not self.policy_optimizable and not self.is_critic, 'base model must be non probabilistic flow model'
+
+        # make probabilistic flow
+
+        assert 'policy_optimizable' not in kwargs
+        kwargs.update(policy_optimizable = True)
+
+        orig_args, orig_kwargs = self._init_args_kwargs
+        actor = PiZero(*orig_args, **orig_kwargs, **kwargs)
+
+        # load all possible shared parameters except for output head to logits (for histogram loss)
+
+        state_dict = self.state_dict()
+        actor.load_state_dict(state_dict, strict = False)
+
+        # now, initialize the actor with variance of 0
+        # https://arxiv.org/abs/2302.08875
+
+        orig_mean_weight = self.actions_to_pred_flow.weight
+
+        actor_mean_variance_weight = actor.actions_to_pred_flow.linear.weight
+
+        actor_mean_variance_weight.data.copy_(rearrange([orig_mean_weight, torch.zeros_like(orig_mean_weight)], 'mu_sigma o i -> (o mu_sigma) i'))
+
+        return actor.to(self.device)
 
     def create_critic(self, **kwargs) -> PiZero:
         assert self.policy_optimizable and not self.is_critic, 'base model must be policy optimizable as well as not a critic already'
@@ -1807,7 +1830,11 @@ class Agent(Module):
     ):
         super().__init__()
         assert num_latent_genes == 1, 'evolutionary learning not built yet'
-        assert model.policy_optimizable
+
+        if not model.policy_optimizable:
+            actor = model.create_actor()
+        else:
+            actor = model
 
         self.actor = model
         self.critic = model.create_critic()
