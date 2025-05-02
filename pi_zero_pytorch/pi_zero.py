@@ -1842,7 +1842,11 @@ class EPO(Module):
     @torch.no_grad()
     def gather_experience_from_env(
         self,
-        steps
+        steps,
+        trajectory_length = 16,
+        flow_sampling_steps = 4,
+        temperature = 1.,
+        **sampling_kwargs
     ):
         self.agent.eval()
 
@@ -1854,9 +1858,11 @@ class EPO(Module):
 
             sampled_actions, replay_tensors = temp_batch_dim(self.agent.actor)(
                 *states,
-                trajectory_length = 4,
-                steps = 2,
-                return_states_for_replay = True
+                trajectory_length = trajectory_length,
+                steps = flow_sampling_steps,
+                return_states_for_replay = True,
+                temperature = temperature,
+                **sampling_kwargs
             )
 
             next_states, reward, truncated, terminated = self.env.step(sampled_actions)

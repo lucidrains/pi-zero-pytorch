@@ -1,6 +1,6 @@
 [project]
 name = "pi-zero-pytorch"
-version = "0.1.23"
+version = "0.1.24"
 description = "π0 in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,7 +30,7 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.0",
     "ema-pytorch>=0.7.3",
-    "evolutionary-policy-optimization>=0.0.52",
+    "evolutionary-policy-optimization>=0.1.19",
     "jaxtyping",
     'hyper-connections>=0.0.10',
     "hl-gauss-pytorch>=0.1.21",
