@@ -147,6 +147,31 @@ def save_args_kwargs(fn):
 
     return decorated
 
+def to_device(t, device):
+    return tree_map(lambda el: el.to(device) if is_tensor(el) else el, t)
+
+def move_input_tensors_to_device(fn):
+
+    @wraps(fn)
+    def decorated_fn(self, *args, **kwargs):
+        args, kwargs = to_device((args, kwargs), self.device)
+        return fn(self, *args, **kwargs)
+
+    return decorated_fn
+
+def temp_batch_dim(fn):
+
+    @wraps(fn)
+    def inner(*args, **kwargs):
+        args, kwargs = tree_map(lambda t: rearrange(t, '... -> 1 ...') if is_tensor(t) else t, (args, kwargs))
+
+        out = fn(*args, **kwargs)
+
+        out = tree_map(lambda t: rearrange(t, '1 ... -> ...') if is_tensor(t) else t, out)
+        return out
+
+    return inner
+
 # tensor helpers
 
 def log(t, eps = 1e-20):
@@ -1174,6 +1199,7 @@ class PiZero(Module):
 
         return logits
 
+    @move_input_tensors_to_device
     def forward_for_policy_loss(
         self,
         images,
@@ -1251,6 +1277,7 @@ class PiZero(Module):
 
         return -(clipped_surr_loss + entropy * entropy_weight).mean()
 
+    @move_input_tensors_to_device
     def forward_for_critic_loss(
         self,
         *args,
@@ -1280,6 +1307,7 @@ class PiZero(Module):
 
         return torch.max(clipped_loss, loss).mean()
 
+    @move_input_tensors_to_device
     def forward(
         self,
         images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
@@ -1737,6 +1765,7 @@ class PiZero(Module):
 
 # generalized advantage estimate
 
+@torch.no_grad()
 def calc_generalized_advantage_estimate(
     rewards,
     values,
@@ -1788,11 +1817,156 @@ class Agent(Module):
     ):
         raise NotImplementedError
 
+from torch.utils.data import TensorDataset, DataLoader
 
 class EPO(Module):
-    def __init__(self):
+    def __init__(
+        self,
+        agent: Agent,
+        env,
+    ):
         super().__init__()
-        raise NotImplementedError
+        self.agent = agent
+        self.env = env
+
+    @torch.no_grad()
+    def gather_experience_from_env(
+        self,
+        steps
+    ):
+        self.agent.eval()
+
+        states = self.env.reset()
+
+        memories = []
+
+        for _ in range(steps):
+
+            sampled_actions, replay_tensors = temp_batch_dim(self.agent.actor)(
+                *states,
+                trajectory_length = 4,
+                steps = 2,
+                return_states_for_replay = True
+            )
+
+            next_state, reward, truncated, terminated = self.env.step(sampled_actions)
+
+            memories.append(to_device([*states, reward, terminated, *replay_tensors], torch.device('cpu')))
+
+            state = next_state
+
+        return memories
+
+    def learn_agent(
+        self,
+        memories,
+        epochs = 2,
+        batch_size = 16
+    ):
+        self.agent.train()
+
+        (
+            images,
+            commands,
+            joint_state,
+            rewards,
+            terminated,
+            actions,
+            timesteps,
+            sampled_flows,
+            log_probs
+        ) = map(torch.stack, zip(*memories))
+
+        flow_timesteps = actions.shape[1]
+
+        values, _ = self.agent.critic(
+            repeat(images, 't ... -> (t ft) ...', ft = flow_timesteps),
+            repeat(commands, 't ... -> (t ft) ...', ft = flow_timesteps),
+            repeat(joint_state, 't ... -> (t ft) ...', ft = flow_timesteps),
+            actions = rearrange(actions, 't ft ... -> (t ft) ...'),
+            times = rearrange(timesteps, 't ft ... -> (t ft) ...')
+        )
+
+        values = rearrange(values, '(t ft) -> ft t', ft = flow_timesteps)
+        values = values.detach().cpu()
+
+        # actions go out into the environment, rewards are received, generalized advantage calculated with critic values
+
+        boundaries = repeat(terminated, 't -> ft t', ft = flow_timesteps)
+
+        advantages = calc_generalized_advantage_estimate(rewards, values, boundaries, use_accelerated = False).detach()
+
+        # move time back to first dimension to be batched for learning
+
+        advantages = rearrange(advantages, 'ft t -> t ft')
+        values = rearrange(values, 'ft t -> t ft')
+
+        # dataset and dataloader
+
+        dataset = TensorDataset(
+            images,
+            commands,
+            joint_state,
+            rewards,
+            terminated,
+            actions,
+            timesteps,
+            sampled_flows,
+            log_probs,
+            values,
+            advantages
+        )
+
+        dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
+
+        # training loop
+
+        for _ in range(epochs):
+            for (
+                images,
+                commands,
+                joint_state,
+                rewards,
+                terminated,
+                actions,
+                timesteps,
+                sampled_flows,
+                log_probs,
+                values,
+                advantages
+            ) in dataloader:
+
+                # optimize policy with replay tensors from above
+
+                actor_loss = self.agent.actor.forward_for_policy_loss(
+                    images,
+                    commands,
+                    joint_state,
+                    actions,
+                    times = timesteps,
+                    flow = sampled_flows,
+                    old_log_probs = log_probs,
+                    advantages = advantages,
+                )
+
+                actor_loss.backward()
+
+                self.agent.actor_optim.step()
+                self.agent.actor_optim.zero_grad()
+
+                critic_loss = self.agent.critic.forward_for_critic_loss(
+                    repeat(images, 't ... -> (ft t) ...', ft = flow_timesteps),
+                    repeat(commands, 't ... -> (ft t) ...', ft = flow_timesteps),
+                    repeat(joint_state, 't ... -> (ft t) ...', ft = flow_timesteps),
+                    rearrange(actions, 't ft ... -> (ft t) ...'),
+                    old_values = values,
+                    advantages = advantages,
+                )
+
+                critic_loss.backward()
+
+                self.agent.critic_optim.step()
+                self.agent.critic_optim.zero_grad()
 
 # fun
 

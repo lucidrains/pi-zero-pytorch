@@ -50,6 +50,32 @@ loss.backward()
 sampled_actions = model(vision, commands, joint_state, trajectory_length = 32) # (1, 32, 6)
 ```
 
+To do online learning, you need to make sure `policy_optimizable` is set to `True` when instantiating the model. Then do the following
+
+```python
+from pi_zero_pytorch import π0, Agent, EPO
+
+model = π0(
+    ...
+    policy_optimizable = True
+)
+
+# wrap the model with `Agent`, which will instantiate actor critic for PPO
+
+agent = Agent(model)
+
+from pi_zero_pytorch.mock_env import Env    # you'll want to supply your own environment
+mock_env = Env((256, 256), 2, 32, 1024, 12)
+
+# pass your agent and environment to EPO for learning to be orchestrated
+
+epo = EPO(agent, mock_env)
+
+memories = epo.gather_experience_from_env(steps = 10)
+
+epo.learn_agent(memories, batch_size = 2)
+```
+
 ### Contributing
 
 At the project root, run
