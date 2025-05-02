@@ -44,6 +44,8 @@ from hl_gauss_pytorch import HLGaussLayer
 
 from assoc_scan import AssocScan
 
+from evolutionary_policy_optimization import LatentGenePool
+
 import tqdm
 
 # ein notation
@@ -1795,6 +1797,7 @@ class Agent(Module):
         self,
         model: PiZero,
         optim_klass = AdoptAtan2,
+        num_latent_genes = 1,
         actor_lr = 3e-4,
         critic_lr = 3e-4,
         actor_weight_decay = 1e-3,
@@ -1803,10 +1806,17 @@ class Agent(Module):
         critic_optim_kwargs: dict = dict(),
     ):
         super().__init__()
+        assert num_latent_genes == 1, 'evolutionary learning not built yet'
         assert model.policy_optimizable
 
         self.actor = model
         self.critic = model.create_critic()
+
+        # evolutionary policy optimization related
+        # Wang et al. https://web3.arxiv.org/abs/2503.19037
+
+        self.has_gene_pool = num_latent_genes > 1
+        self.latent_gene_pool = LatentGenePool(dim_latent = model.dim, num_latents = num_latent_genes) if self.has_gene_pool else None
 
         # optimizers
 
