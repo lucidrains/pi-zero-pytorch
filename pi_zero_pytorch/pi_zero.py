@@ -704,7 +704,7 @@ class PiZero(Module):
         reward_tokens_dropout_prob = 0.,
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
-        dim_latent_gene = None,
+        dim_latent = None,
         policy_optimizable = False,         # if set to True, will use mean variance network for access to log prob
         is_critic = False,                  # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
         critic_value_kwargs: dict = dict(
@@ -770,12 +770,12 @@ class PiZero(Module):
 
         # latent variable / gene conditioning
 
-        needs_latent = exists(dim_latent_gene)
-        self.needs_latent = needs_latent
+        can_accept_latent = exists(dim_latent)
+        self.can_accept_latent = can_accept_latent
 
-        if needs_latent:
+        if can_accept_latent:
             self.to_latent_cond = nn.Sequential(
-                nn.Linear(dim_latent_gene, dim_time_cond * 2),
+                nn.Linear(dim_latent, dim_time_cond * 2),
                 nn.SiLU(),
                 nn.Linear(dim_time_cond * 2, dim_time_cond),
             )
@@ -935,12 +935,13 @@ class PiZero(Module):
         return ema_pi_zero
 
     def create_actor(self, **kwargs) -> PiZero:
-        assert not self.policy_optimizable and not self.is_critic, 'base model must be non probabilistic flow model'
+        assert not self.is_critic, 'base model must not be a critic'
 
-        # make probabilistic flow
+        # make probabilistic flow if not already
 
-        assert 'policy_optimizable' not in kwargs
-        kwargs.update(policy_optimizable = True)
+        if not self.policy_optimizable:
+            assert 'policy_optimizable' not in kwargs
+            kwargs.update(policy_optimizable = True)
 
         orig_args, orig_kwargs = self._init_args_kwargs
         actor = PiZero(*orig_args, **orig_kwargs, **kwargs)
@@ -953,11 +954,12 @@ class PiZero(Module):
         # now, initialize the actor with variance of 0
         # https://arxiv.org/abs/2302.08875
 
-        orig_mean_weight = self.actions_to_pred_flow.weight
+        if not self.policy_optimizable:
+            orig_mean_weight = self.actions_to_pred_flow.weight
 
-        actor_mean_variance_weight = actor.actions_to_pred_flow.linear.weight
+            actor_mean_variance_weight = actor.actions_to_pred_flow.linear.weight
 
-        actor_mean_variance_weight.data.copy_(rearrange([orig_mean_weight, torch.zeros_like(orig_mean_weight)], 'mu_sigma o i -> (o mu_sigma) i'))
+            actor_mean_variance_weight.data.copy_(rearrange([orig_mean_weight, torch.zeros_like(orig_mean_weight)], 'mu_sigma o i -> (o mu_sigma) i'))
 
         return actor.to(self.device)
 
@@ -1163,6 +1165,7 @@ class PiZero(Module):
 
         return flow_with_reward_cfg, (with_reward_cache_kv, without_reward_cache_kv)
 
+    @move_input_tensors_to_device
     def forward_only_vision_language(
         self,
         images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
@@ -1399,9 +1402,9 @@ class PiZero(Module):
 
         # handle maybe latents
 
-        assert xnor(exists(latents), self.needs_latent)
+        if exists(latents):
+            assert self.can_accept_latent
 
-        if self.needs_latent:
             latent_cond = self.to_latent_cond(latents)
 
             time_cond = time_cond * (latent_cond + 1.)
@@ -1829,23 +1832,32 @@ class Agent(Module):
         critic_weight_decay = 1e-3,
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
+        latent_gene_pool_kwargs: dict = dict(
+            frac_tournaments = 0.5
+        )
     ):
         super().__init__()
-        assert num_latent_genes == 1, 'evolutionary learning not built yet'
-
-        if not model.policy_optimizable:
-            actor = model.create_actor()
-        else:
-            actor = model
-
-        self.actor = actor
-        self.critic = actor.create_critic()
 
         # evolutionary policy optimization related
         # Wang et al. https://web3.arxiv.org/abs/2503.19037
 
-        self.has_gene_pool = num_latent_genes > 1
-        self.latent_gene_pool = LatentGenePool(dim_latent = model.dim, num_latents = num_latent_genes) if self.has_gene_pool else None
+        assert num_latent_genes >= 1
+        evolutionary_learning = num_latent_genes > 1
+
+        dim_latent = model.dim if evolutionary_learning else None
+
+        self.latent_gene_pool = LatentGenePool(dim_latent = dim_latent, num_latents = num_latent_genes, **latent_gene_pool_kwargs) if evolutionary_learning else None
+        self.has_gene_pool = evolutionary_learning
+
+        # init actor critic, taking into account model may not have probabilistic flow to start off with, and determine whether it needs to be reinstantiated for latent conditioning
+
+        actor = model
+
+        if not model.policy_optimizable or evolutionary_learning:
+            actor = model.create_actor(dim_latent = dim_latent)
+
+        self.actor = actor
+        self.critic = actor.create_critic()
 
         # optimizers
 

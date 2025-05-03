@@ -26,7 +26,7 @@ def test_pi_zero_with_vit(
         mlp_dim = 64,
         dropout = 0.1,
         emb_dropout = 0.1
-    )
+    ).to(device)
 
     v = Extractor(v, return_embeddings_only = True)
 
@@ -61,7 +61,11 @@ def test_pi_zero_with_vit(
 
     assert sampled_actions.shape == (2, 32, 6)
 
-def test_policy_optimization():
+@pytest.mark.parametrize('num_latent_genes', (1, 16))
+def test_policy_optimization(
+    num_latent_genes
+):
+
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
 
@@ -109,7 +113,10 @@ def test_policy_optimization():
 
     # agent
 
-    agent = Agent(model)
+    agent = Agent(
+        model,
+        num_latent_genes = num_latent_genes
+    )
 
     mock_env = Env((256, 256), 2, 32, 1024, 12)
 
