@@ -48,6 +48,8 @@ from evolutionary_policy_optimization import LatentGenePool
 
 import tqdm
 
+from accelerate import Accelerator
+
 # ein notation
 
 # b - batch
@@ -1830,6 +1832,7 @@ class Agent(Module):
         critic_lr = 3e-4,
         actor_weight_decay = 1e-3,
         critic_weight_decay = 1e-3,
+        max_grad_norm = 0.5,
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
         latent_gene_pool_kwargs: dict = dict(
@@ -1859,10 +1862,20 @@ class Agent(Module):
         self.actor = actor
         self.critic = actor.create_critic()
 
+        # gradient clipping
+
+        self.max_grad_norm = max_grad_norm
+
         # optimizers
 
         self.actor_optim = optim_klass(self.actor.parameters(), lr = actor_lr, weight_decay = actor_weight_decay, **actor_optim_kwargs)
         self.critic_optim = optim_klass(self.critic.parameters(), lr = critic_lr, weight_decay = critic_weight_decay, **critic_optim_kwargs)
+
+    def take_genetic_algorithm_step_(self, fitnesses):
+        if not self.has_gene_pool:
+            return
+
+        self.latent_gene_pool.genetic_algorithm_step(fitnesses)
 
     def forward(
         self,
@@ -1875,10 +1888,38 @@ class EPO(Module):
         self,
         agent: Agent,
         env,
+        accelerate_kwargs: dict = dict()
     ):
         super().__init__()
+        self.accelerate = Accelerator(**accelerate_kwargs)
+
         self.agent = agent
         self.env = env
+
+        (
+            agent.actor,
+            agent.critic,
+            agent.actor_optim,
+            agent.critic_optim
+        ) = self.accelerate.prepare(
+            agent.actor,
+            agent.critic,
+            agent.actor_optim,
+            agent.critic_optim
+        )
+
+        self.register_buffer('step', tensor(0))
+
+    @property
+    def unwrapped_actor(self):
+        return self.accelerate.unwrap_model(self.agent.actor)
+
+    @property
+    def unwrapped_critic(self):
+        return self.accelerate.unwrap_model(self.agent.critic)
+
+    def log(self, **data_kwargs):
+        return self.accelerate.log(data_kwargs, step = self.step.item())
 
     @torch.no_grad()
     def gather_experience_from_env(
@@ -1891,13 +1932,15 @@ class EPO(Module):
     ):
         self.agent.eval()
 
+        actor = self.unwrapped_actor
+
         states = self.env.reset()
 
         memories = []
 
         for _ in range(steps):
 
-            sampled_actions, replay_tensors = temp_batch_dim(self.agent.actor)(
+            sampled_actions, replay_tensors = temp_batch_dim(actor)(
                 *states,
                 trajectory_length = trajectory_length,
                 steps = flow_sampling_steps,
@@ -1912,11 +1955,14 @@ class EPO(Module):
 
             states = next_states
 
+        self.accelerate.wait_for_everyone()
+
         return memories
 
     def learn_agent(
         self,
         memories,
+        fitnesses = None,
         epochs = 2,
         batch_size = 16
     ):
@@ -2008,6 +2054,10 @@ class EPO(Module):
 
                 actor_loss.backward()
 
+                self.log(actor_loss = actor_loss.item())
+
+                self.accelerate.clip_grad_norm_(self.agent.actor.parameters(), self.agent.max_grad_norm)
+
                 self.agent.actor_optim.step()
                 self.agent.actor_optim.zero_grad()
 
@@ -2022,8 +2072,19 @@ class EPO(Module):
 
                 critic_loss.backward()
 
+                self.log(critic_loss = critic_loss.item())
+
+                self.accelerate.clip_grad_norm_(self.agent.critic.parameters(), self.agent.max_grad_norm)
+
                 self.agent.critic_optim.step()
                 self.agent.critic_optim.zero_grad()
+
+            if exists(fitnesses):
+                self.log(fitnesses = fitnesses)
+
+                self.agent.take_genetic_algorithm_step_(fitnesses)
+
+        self.step.add_(1)
 
 # fun
 
