@@ -273,12 +273,8 @@ def noise_assignment(data, noise):
 
 class GaussianNLL(Module):
     def forward(self, mu_sigma, target):
-
         mean, variance = mu_sigma.unbind(dim = -1)
-        dist = Normal(mean, variance)
-        log_probs = dist.log_prob(target)
-
-        return -log_probs.mean()
+        return F.gaussian_nll_loss(mean, target, variance)
 
 class LinearToMeanVariance(Module):
     def __init__(
