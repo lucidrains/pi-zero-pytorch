@@ -281,16 +281,14 @@ class LinearToMeanVariance(Module):
         self,
         dim,
         dim_out,
-        log_variance_bias = -5.
     ):
         super().__init__()
         self.linear = LinearNoBias(dim, dim_out * 2)
-        self.log_variance_bias = log_variance_bias
 
     def forward(self, embed):
         out = self.linear(embed)
         mean, log_variance = rearrange(out, '... (d mu_sigma) -> mu_sigma ... d', mu_sigma = 2)
-        variance = (log_variance + self.log_variance_bias).exp()
+        variance = log_variance.exp()
         return stack((mean, variance), dim = -1)
 
 # attention
@@ -949,7 +947,7 @@ class PiZero(Module):
         state_dict = self.state_dict()
         actor.load_state_dict(state_dict, strict = False)
 
-        # now, initialize the actor with variance of 0
+        # now, initialize the actor with variance of 1.
         # https://arxiv.org/abs/2302.08875
 
         if not self.policy_optimizable:

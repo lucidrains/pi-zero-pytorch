@@ -120,7 +120,13 @@ def test_policy_optimization(
 
     mock_env = Env((256, 256), 2, 32, 1024, 12)
 
-    epo = EPO(agent, mock_env)
+    epo = EPO(
+        agent,
+        mock_env,
+        accelerate_kwargs = dict(
+            cpu = True
+        )
+    )
 
     memories = epo.gather_experience_from_env(steps = 10)
 
