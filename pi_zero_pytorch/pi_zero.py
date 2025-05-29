@@ -276,20 +276,25 @@ class GaussianNLL(Module):
         mean, variance = mu_sigma.unbind(dim = -1)
         return F.gaussian_nll_loss(mean, target, variance)
 
-class LinearToMeanVariance(Module):
+class LinearToMeanStd(Module):
     def __init__(
         self,
         dim,
         dim_out,
+        eps = 1e-5
     ):
         super().__init__()
         self.linear = LinearNoBias(dim, dim_out * 2)
+        self.eps = eps
 
     def forward(self, embed):
         out = self.linear(embed)
+
         mean, log_variance = rearrange(out, '... (d mu_sigma) -> mu_sigma ... d', mu_sigma = 2)
         variance = log_variance.exp()
-        return stack((mean, variance), dim = -1)
+        std = variance.clamp(min = self.eps).sqrt()
+
+        return stack((mean, std), dim = -1)
 
 # attention
 
@@ -851,10 +856,10 @@ class PiZero(Module):
                 self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
                 self.loss_fn = nn.MSELoss()
             else:
-                self.actions_to_pred_flow = LinearToMeanVariance(dim, dim_action_input)
+                self.actions_to_pred_flow = LinearToMeanStd(dim, dim_action_input)
                 self.loss_fn = GaussianNLL()
 
-        self.is_mean_variance_output = policy_optimizable
+        self.is_mean_std_output = policy_optimizable
         self.policy_optimizable = policy_optimizable
 
         # critic related
@@ -953,9 +958,9 @@ class PiZero(Module):
         if not self.policy_optimizable:
             orig_mean_weight = self.actions_to_pred_flow.weight
 
-            actor_mean_variance_weight = actor.actions_to_pred_flow.linear.weight
+            actor_mean_std_weight = actor.actions_to_pred_flow.linear.weight
 
-            actor_mean_variance_weight.data.copy_(rearrange([orig_mean_weight, torch.zeros_like(orig_mean_weight)], 'mu_sigma o i -> (o mu_sigma) i'))
+            actor_mean_std_weight.data.copy_(rearrange([orig_mean_weight, torch.zeros_like(orig_mean_weight)], 'mu_sigma o i -> (o mu_sigma) i'))
 
         return actor.to(self.device)
 
@@ -1006,7 +1011,7 @@ class PiZero(Module):
 
         # accumulate log probs for ppo
 
-        assert not (return_states_for_replay and not self.is_mean_variance_output), 'only pi-zero with `policy_optimizable` turned on can return log probs'
+        assert not (return_states_for_replay and not self.is_mean_std_output), 'only pi-zero with `policy_optimizable` turned on can return log probs'
 
         timesteps = []
         log_probs = []
@@ -1050,12 +1055,12 @@ class PiZero(Module):
 
             flow = output
 
-            if self.is_mean_variance_output:
-                mean, variance = output.unbind(dim = -1)
+            if self.is_mean_std_output:
+                mean, std = output.unbind(dim = -1)
 
-                flow = torch.normal(mean, variance * temperature)
+                flow = torch.normal(mean, std * temperature)
 
-                log_prob = Normal(mean, variance).log_prob(flow)
+                log_prob = Normal(mean, std).log_prob(flow)
 
                 # save for replaying for optimizing actor
 
@@ -1273,7 +1278,7 @@ class PiZero(Module):
             joint_state
         ))
 
-        mean_variance = self.forward(
+        mean_std = self.forward(
             images,
             commands,
             joint_state,
@@ -1282,7 +1287,7 @@ class PiZero(Module):
             **kwargs
         )
 
-        normal_dist = Normal(*mean_variance.unbind(dim = -1))
+        normal_dist = Normal(*mean_std.unbind(dim = -1))
 
         new_log_probs = normal_dist.log_prob(actions)
 
