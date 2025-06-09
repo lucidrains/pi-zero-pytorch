@@ -10,7 +10,7 @@ from itertools import count
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, stack, tensor, is_tensor
+from torch import pi, nn, cat, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList
 from torch.distributions import Normal
 from torch.distributions.beta import Beta
@@ -59,6 +59,7 @@ from accelerate import Accelerator
 # nv - seq of visual tokens
 # ns - seq of additional internal state tokens
 # nm - seq of memory tokens
+# nfa - seq of frozen actions
 # d - dimension
 # da - action dimension
 # djs - joint state dimension
@@ -373,7 +374,7 @@ class Attention(Module):
 
         # concat cache key / values with action key / values
 
-        k, v = tuple(torch.cat(tensors, dim = -2) for tensors in zip((mk, mv), (ak, av)))
+        k, v = tuple(cat(tensors, dim = -2) for tensors in zip((mk, mv), (ak, av)))
 
         # handle read, write memories
 
@@ -493,7 +494,7 @@ class Attention(Module):
             mix = self.to_action_value_residual_mix(actions)
             av = av * mix + actions_value_residual * (1. - mix)
 
-        q, k, v = tuple(torch.cat(tensors, dim = -2) for tensors in zip((mq, mk, mv), (aq, ak, av)))
+        q, k, v = tuple(cat(tensors, dim = -2) for tensors in zip((mq, mk, mv), (aq, ak, av)))
 
         # handle read, write memories
 
@@ -509,8 +510,8 @@ class Attention(Module):
 
             mqr, mkr, mvr, mqw, mkw, mvw = tuple(self.split_heads(t) for t in (*mqkv_read.chunk(3, dim = -1), *mqkv_write.chunk(3, dim = -1)))
 
-            k = torch.cat((mkr, k, mkw), dim = -2)
-            v = torch.cat((mvr, v, mvw), dim = -2)
+            k = cat((mkr, k, mkw), dim = -2)
+            v = cat((mvr, v, mvw), dim = -2)
             q, attn_output_unpack_memories = pack_with_inverse((mqr, q, mqw), 'b h * d')
 
         # rotary embedding
@@ -990,6 +991,7 @@ class PiZero(Module):
         latents: Float['d'] | Float['b d'] = None,
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
+        frozen_actions: Float['b nfa da'] | None = None,
         steps = 18,
         show_pbar = True,
         cond_scale = 0.,
@@ -1020,6 +1022,15 @@ class PiZero(Module):
 
         critic_values = []
 
+        # validate frozen actions for real-time action chunking, if any
+
+        inpaint_actions = exists(frozen_actions)
+
+        if inpaint_actions:
+            num_frozen_actions = frozen_actions.shape[1]
+
+            assert num_frozen_actions < trajectory_length, 'frozen actions must have length less than number of actions being decoded'
+
         # ode step function
 
         cached_state_kv = None
@@ -1028,6 +1039,15 @@ class PiZero(Module):
         def ode_fn(timestep, denoised_actions):
             nonlocal cached_state_kv
             nonlocal null_cached_state_kv
+
+            # take care of inpainting if needed
+
+            if inpaint_actions:
+
+                denoised_actions = cat((
+                    frozen_actions,
+                    denoised_actions[:, num_frozen_actions:]
+                ), dim = 1)
 
             input_args = (
                 images,
@@ -1090,6 +1110,14 @@ class PiZero(Module):
         trajectory = self.odeint_fn(ode_fn, noise, times)
 
         sampled_actions = trajectory[-1]
+
+        # final inpaint if needed
+
+        if inpaint_actions:
+            sampled_actions = cat((
+                frozen_actions,
+                sampled_actions[:, num_frozen_actions:]
+            ), dim = 1)
 
         self.train(was_training)
 

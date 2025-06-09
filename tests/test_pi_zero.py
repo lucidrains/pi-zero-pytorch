@@ -8,9 +8,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 @pytest.mark.parametrize('only_vlm', (True, False))
 @pytest.mark.parametrize('num_residual_streams', (1, 4))
+@pytest.mark.parametrize('inpaint_with_frozen_actions', (False, True))
 def test_pi_zero_with_vit(
     only_vlm: bool,
     num_residual_streams: int,
+    inpaint_with_frozen_actions: bool
 ):
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
@@ -55,9 +57,15 @@ def test_pi_zero_with_vit(
     loss, _ = model(images, commands, joint_state, actions)
     loss.backward()
 
+    # maybe inpaint
+
+    frozen_actions = None
+    if inpaint_with_frozen_actions:
+        frozen_actions = actions[:, -3:]
+
     # after much training
 
-    sampled_actions = model(images, commands, joint_state, trajectory_length = 32) # (1, 32, 6)
+    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions) # (1, 32, 6)
 
     assert sampled_actions.shape == (2, 32, 6)
 

@@ -189,4 +189,13 @@ That's it
 }
 ```
 
+```bibtex
+@misc{PI2025,
+    title   = {Real-Time Action Chunking with Large Models},
+    author  = {Kevin Black, Manuel Y. Galliker, Sergey Levine},
+    year    = {2025},
+    url     = {https://www.pi.website/research/real_time_chunking}
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
