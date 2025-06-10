@@ -992,6 +992,7 @@ class PiZero(Module):
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         frozen_actions: Float['b nfa da'] | None = None,
+        return_frozen_actions_with_sampled = False,
         steps = 18,
         show_pbar = True,
         cond_scale = 0.,
@@ -1114,10 +1115,10 @@ class PiZero(Module):
         # final inpaint if needed
 
         if inpaint_actions:
-            sampled_actions = cat((
-                frozen_actions,
-                sampled_actions[:, num_frozen_actions:]
-            ), dim = 1)
+            sampled_actions = sampled_actions[:, num_frozen_actions:]
+
+            if return_frozen_actions_with_sampled:
+                sampled_actions = cat((frozen_actions, sampled_actions), dim = 1)
 
         self.train(was_training)
 

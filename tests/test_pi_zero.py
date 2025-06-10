@@ -65,7 +65,7 @@ def test_pi_zero_with_vit(
 
     # after much training
 
-    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions) # (1, 32, 6)
+    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, return_frozen_actions_with_sampled = True) # (1, 32, 6)
 
     assert sampled_actions.shape == (2, 32, 6)
 
