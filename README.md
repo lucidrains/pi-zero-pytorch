@@ -198,4 +198,13 @@ That's it
 }
 ```
 
+```bibtex
+@misc{PI2025,
+    title = {VLAs that Train Fast, Run Fast, and Generalize Better},
+    author = {Danny Driess, Jost Tobias Springenberg, Brian Ichter, Lili Yu, Adrian Li-Bell, Karl Pertsch, Allen Z. Ren, Homer Walke, Quan Vuong, Lucy Xiaoyang Shi, Sergey Levine},
+    year   = {2025}
+    url    = {https://www.physicalintelligence.company/research/knowledge_insulation}
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)

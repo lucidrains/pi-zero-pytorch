@@ -359,7 +359,8 @@ class Attention(Module):
         mask: Bool['b n'] | None = None,
         actions_value_residual: Tensor | None = None,
         return_keys_values = False,
-        flex_attn_fn: Callable | None = None
+        flex_attn_fn: Callable | None = None,
+        knowledge_insulate = False
     ):
         aq, ak, av, ag = self.to_actions_qkvg(actions).chunk(4, dim = -1)
 
@@ -371,6 +372,11 @@ class Attention(Module):
 
         q = aq
         mk, mv = cached_state_keys_values
+
+        # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
+
+        if knowledge_insulate:
+            mk, mv = tuple(t.detach() for t in (mk, mv))
 
         # concat cache key / values with action key / values
 
@@ -476,7 +482,8 @@ class Attention(Module):
         mask: Bool['b n'] | None = None,
         actions_value_residual: Tensor | None = None,
         return_keys_values = False,
-        flex_attn_fn: Callable | None = None
+        flex_attn_fn: Callable | None = None,
+        knowledge_insulate = False
     ):
         seq_len, device = multimodal_seq.shape[-2], multimodal_seq.device
 
@@ -489,6 +496,13 @@ class Attention(Module):
         aq, ak, av, ag = self.to_actions_qkvg(actions).chunk(4, dim = -1)
 
         mq, mk, mv, aq, ak, av, ag = tuple(self.split_heads(t) for t in (mq, mk, mv, aq, ak, av, ag))
+
+        # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
+
+        if knowledge_insulate:
+            mk, mv = tuple(t.detach() for t in (mk, mv))
+
+        # value residual
 
         if exists(actions_value_residual):
             mix = self.to_action_value_residual_mix(actions)
@@ -1388,6 +1402,7 @@ class PiZero(Module):
         cached_state_keys_values: list[tuple[Tensor, Tensor]] | None = None,
         return_language_loss = True,
         return_action_flow_loss = True,
+        knowledge_insulate = False,
         **kwargs
     ):
         inferencing = exists(cached_state_keys_values)
@@ -1637,6 +1652,7 @@ class PiZero(Module):
                     actions_value_residual = actions_value_residual,
                     mask = mask,
                     return_keys_values = True,
+                    knowledge_insulate = knowledge_insulate,
                     memories = memory_tokens
                 )
 
