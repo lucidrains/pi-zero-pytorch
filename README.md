@@ -207,4 +207,25 @@ That's it
 }
 ```
 
+```bibtex
+@inproceedings{Wagenmaker2025SteeringYD,
+    title   = {Steering Your Diffusion Policy with Latent Space Reinforcement Learning},
+    author  = {Andrew Wagenmaker and Mitsuhiko Nakamoto and Yunchu Zhang and Seohong Park and Waleed Yagoub and Anusha Nagabandi and Abhishek Gupta and Sergey Levine},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:279464702}
+}
+```
+
+```bibtex
+@misc{dong2025reinforcementlearningimplicitimitation,
+    title   = {Reinforcement Learning via Implicit Imitation Guidance}, 
+    author  = {Perry Dong and Alec M. Lessing and Annie S. Chen and Chelsea Finn},
+    year    = {2025},
+    eprint  = {2506.07505},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url = {https://arxiv.org/abs/2506.07505}, 
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)

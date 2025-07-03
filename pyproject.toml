@@ -40,7 +40,9 @@ dependencies = [
     "torch>=2.5",
     'torchdiffeq',
     'torchtyping>=0.1.5',
-    "tqdm"
+    'tqdm',
+    'x-mlps-pytorch>=0.0.24',
+    'x-transformers>=2.4.1'
 ]
 
 [project.urls]
