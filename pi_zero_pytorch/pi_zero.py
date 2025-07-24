@@ -275,7 +275,7 @@ def noise_assignment(data, noise):
 class GaussianNLL(Module):
     def forward(self, mu_sigma, target):
         mean, variance = mu_sigma.unbind(dim = -1)
-        return F.gaussian_nll_loss(mean, target, variance)
+        return F.gaussian_nll_loss(mean, target, variance, reduction = 'none')
 
 class LinearToMeanStd(Module):
     def __init__(
@@ -757,7 +757,11 @@ class PiZero(Module):
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
         dim_latent = None,
-        action_dit_norm_all_linears = True,  # https://arxiv.org/abs/2507.15493v1 - in GR-3, Bytedance shares the finding that aggressive normalization of the action diffusion transformer (one after each linear), stabilizes training and greatly improves results
+        action_dit_norm_all_linears = True,  # Cheang et al. https://arxiv.org/abs/2507.15493v1 - in GR-3, Bytedance shares the finding that aggressive normalization of the action diffusion transformer (one after each linear), stabilizes training and greatly improves results
+        predict_task_status_head = False,    # Cheang et al. https://arxiv.org/abs/2507.15493v1 - an important detail in the paper where they add a prediction head for task status; they generate negative pairs of language - action samples and force the network to predict "invalid" label. this made the robot follow the language significantly better.
+        num_task_status = 3,
+        task_status_is_invalid = 2,          # the index for which the task status is invalid - `-1` in paper, but we'll do 2 here
+        task_status_loss_weight = 1.,
         policy_optimizable = False,          # if set to True, will use mean variance network for access to log prob
         is_critic = False,                   # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
         critic_value_kwargs: dict = dict(
@@ -898,6 +902,12 @@ class PiZero(Module):
 
         self.state_to_logits = LinearNoBias(dim, num_tokens)
 
+        # to task status prediction
+
+        self.to_task_status = LinearNoBias(dim, num_task_status)
+        self.task_status_is_invalid = task_status_is_invalid
+        self.task_status_loss_weight = task_status_loss_weight
+
         # actor related
 
         self.actions_to_pred_flow = None
@@ -906,7 +916,7 @@ class PiZero(Module):
         if not is_critic:
             if not policy_optimizable:
                 self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
-                self.loss_fn = nn.MSELoss()
+                self.loss_fn = nn.MSELoss(reduction = 'none')
             else:
                 self.actions_to_pred_flow = LinearToMeanStd(dim, dim_action_input)
                 self.loss_fn = GaussianNLL()
@@ -1434,6 +1444,7 @@ class PiZero(Module):
         external_states: tuple[Float['b ...']] | None = None,
         record_and_return_memory_tokens = False,
         past_recurrent_memory_tokens: Float['b {self._nm} d'] | None = None,
+        task_status: Int['b'] | None = None,
         return_actions_flow = False,
         return_state_keys_values = False,
         cached_state_keys_values: list[tuple[Tensor, Tensor]] | None = None,
@@ -1826,7 +1837,17 @@ class PiZero(Module):
 
         # validate loss being returned
 
-        assert return_language_loss or return_action_flow_loss
+        assert return_language_loss or return_action_flow_loss or exists(task_status)
+
+        # task status cross entropy loss
+
+        if exists(task_status):
+            assert exists(self.to_task_status), f'`predict_task_status_head` must be set to True on `PiZero`'
+
+            pooled_action_embeds = reduce(action_embeds, 'b n d -> b d', 'mean')
+            pred_task_status = self.to_task_status(pooled_action_embeds)
+
+            pred_task_status_loss = F.cross_entropy(pred_task_status, task_status)
 
         # flow loss for actions tokens
 
@@ -1846,6 +1867,17 @@ class PiZero(Module):
 
         if return_action_flow_loss:
             flow_loss = self.loss_fn(pred_actions_flow, flow)
+            flow_loss = reduce(flow_loss, 'b ... -> b ...', 'mean')
+
+            # maybe mask out the loss for invalid task labels from GR-3 paper for improved language following
+
+            if exists(task_status):
+                is_invalid_mask = task_status == self.task_status_is_invalid
+                flow_loss = flow_loss[is_invalid_mask]
+
+            # average
+
+            flow_loss = flow_loss.mean()
 
         # language cross entropy loss
 
@@ -1872,6 +1904,18 @@ class PiZero(Module):
             language_loss * self.lm_loss_weight +
             flow_loss * self.flow_loss_weight
         )
+
+        # add the task status loss if needed
+
+        if exists(task_status):
+            loss_breakdown = (*loss_breakdown, pred_task_status_loss)
+
+            total_loss = (
+                total_loss +
+                pred_task_status_loss * self.task_status_loss_weight
+            )
+
+        # returning
 
         if not record_and_return_memory_tokens:
             return total_loss, loss_breakdown
