@@ -309,6 +309,7 @@ class Attention(Module):
         dropout = 0.,
         softclamp_value = 50.,
         accept_memories = False,
+        actions_norm_all = False,
         learned_value_action_residual_mix = False,
         rotary_emb: RotaryEmbedding | None = None
     ):
@@ -348,6 +349,17 @@ class Attention(Module):
 
         self.to_actions_out = LinearNoBias(dim_inner, dim)
 
+        # norms for all action linears
+        # from Bytedance's GR-3
+
+        self.actions_norm_all = actions_norm_all
+
+        if actions_norm_all:
+            self.actions_q_norm = nn.RMSNorm(dim_head)
+            self.actions_k_norm = nn.RMSNorm(dim_head)
+            self.actions_v_norm = nn.RMSNorm(dim_head)
+            self.actions_out_norm = nn.RMSNorm(dim)
+
         self.softclamp_value = softclamp_value
 
     def forward_actions_with_cached_state(
@@ -365,6 +377,9 @@ class Attention(Module):
         aq, ak, av, ag = self.to_actions_qkvg(actions).chunk(4, dim = -1)
 
         aq, ak, av, ag = tuple(self.split_heads(t) for t in (aq, ak, av, ag))
+
+        if self.actions_norm_all:
+            aq, ak, av = tuple(norm(t) for norm, t in zip((self.actions_q_norm, self.actions_k_norm, self.actions_v_norm), (aq, ak, av)))
 
         if exists(actions_value_residual):
             mix = self.to_action_value_residual_mix(actions)
@@ -425,6 +440,9 @@ class Attention(Module):
         out = self.merge_heads(out)
 
         actions_out = self.to_actions_out(out)
+
+        if self.actions_norm_all:
+            actions_out = self.actions_out_norm(actions_out)
 
         if not return_keys_values:
             return actions_out
@@ -496,6 +514,9 @@ class Attention(Module):
         aq, ak, av, ag = self.to_actions_qkvg(actions).chunk(4, dim = -1)
 
         mq, mk, mv, aq, ak, av, ag = tuple(self.split_heads(t) for t in (mq, mk, mv, aq, ak, av, ag))
+
+        if self.actions_norm_all:
+            aq, ak, av = tuple(norm(t) for norm, t in zip((self.actions_q_norm, self.actions_k_norm, self.actions_v_norm), (aq, ak, av)))
 
         # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
 
@@ -581,7 +602,12 @@ class Attention(Module):
 
         mout, aout = out[:, :seq_len], out[:, seq_len:]
 
-        output =  self.to_out(mout), self.to_actions_out(aout)
+        mout, aout = self.to_out(mout), self.to_actions_out(aout)
+
+        if self.actions_norm_all:
+            aout = self.actions_out_norm(aout)
+
+        output = (mout, aout)
 
         if self.accept_memories:
             mem_out, unpack_memories = pack_with_inverse((mem_read_out, mem_write_out), 'b h * d')
@@ -603,7 +629,8 @@ class SwiGLUFeedForward(Module):
         dim,
         expand_factor = 4.,
         dim_inner = None,
-        rmsnorm = True
+        rmsnorm = True,
+        norm_all = False
     ):
         super().__init__()
         dim_inner = default(dim_inner, int(dim * expand_factor * 2 / 3))
@@ -612,14 +639,23 @@ class SwiGLUFeedForward(Module):
         self.proj_in = LinearNoBias(dim, dim_inner * 2)
         self.proj_out = LinearNoBias(dim_inner, dim)
 
+        # maybe additional norms for action branch
+
+        self.post_proj_in_norm = nn.RMSNorm(dim_inner) if norm_all else nn.Identity()
+        self.post_proj_out_norm = nn.RMSNorm(dim) if norm_all else nn.Identity()
+
     def forward(
         self,
         seq
     ):
         seq = self.rmsnorm(seq)
         seq, gates = self.proj_in(seq).chunk(2, dim = -1)
+
         seq = seq * F.gelu(gates)
-        return self.proj_out(seq)
+        seq = self.post_proj_in_norm(seq)
+
+        out = self.proj_out(seq)
+        return self.post_proj_out_norm(out)
 
 # actions need time conditioning
 # ada-ln zero from DiT - here we will improvise with adaptive rmsnorm
@@ -721,8 +757,9 @@ class PiZero(Module):
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
         dim_latent = None,
-        policy_optimizable = False,         # if set to True, will use mean variance network for access to log prob
-        is_critic = False,                  # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
+        action_dit_norm_all_linears = True,  # https://arxiv.org/abs/2507.15493v1 - in GR-3, Bytedance shares the finding that aggressive normalization of the action diffusion transformer (one after each linear), stabilizes training and greatly improves results
+        policy_optimizable = False,          # if set to True, will use mean variance network for access to log prob
+        is_critic = False,                   # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
         critic_value_kwargs: dict = dict(
             min_value = -10.,
             max_value = 10.,
@@ -829,9 +866,9 @@ class PiZero(Module):
             is_first_block = i == 0
 
             layers.append(ModuleList([
-                Attention(dim = dim, dim_head = dim_head, heads = heads, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **attn_kwargs),
+                Attention(dim = dim, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **attn_kwargs),
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs),
-                SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, rmsnorm = False, **ff_kwargs),
+                SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, rmsnorm = False, norm_all = action_dit_norm_all_linears, **ff_kwargs),
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
