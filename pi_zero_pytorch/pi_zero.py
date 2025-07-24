@@ -358,7 +358,7 @@ class Attention(Module):
             self.actions_q_norm = nn.RMSNorm(dim_head)
             self.actions_k_norm = nn.RMSNorm(dim_head)
             self.actions_v_norm = nn.RMSNorm(dim_head)
-            self.actions_out_norm = nn.RMSNorm(dim)
+            self.actions_out_norm = nn.RMSNorm(dim, elementwise_affine = False)
 
         self.softclamp_value = softclamp_value
 
@@ -642,7 +642,7 @@ class SwiGLUFeedForward(Module):
         # maybe additional norms for action branch
 
         self.post_proj_in_norm = nn.RMSNorm(dim_inner) if norm_all else nn.Identity()
-        self.post_proj_out_norm = nn.RMSNorm(dim) if norm_all else nn.Identity()
+        self.post_proj_out_norm = nn.RMSNorm(dim, elementwise_affine = False) if norm_all else nn.Identity()
 
     def forward(
         self,
