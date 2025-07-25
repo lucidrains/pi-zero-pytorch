@@ -1054,6 +1054,7 @@ class PiZero(Module):
         internal_state_tokens: Float['b ns d'] | None = None,
         frozen_actions: Float['b nfa da'] | None = None,
         return_frozen_actions_with_sampled = False,
+        return_original_noise = False,
         steps = 18,
         show_pbar = True,
         cond_scale = 0.,
@@ -1185,8 +1186,13 @@ class PiZero(Module):
 
         pbar.close()
 
+        if return_original_noise:
+            out = (sampled_actions, noise) # for diffusion steering paper from Wagenmaker et al.
+        else:
+            out = sampled_actions
+
         if not return_states_for_replay:
-            return sampled_actions
+            return out
 
         # place the time step dimension after batch
 
@@ -1203,7 +1209,7 @@ class PiZero(Module):
             critic_values = stack(critic_values, dim = 1)
             policy_optimization_outputs = (*policy_optimization_outputs, critic_values)
 
-        return sampled_actions, policy_optimization_outputs
+        return out, policy_optimization_outputs
 
     @torch.no_grad()
     def forward_with_reward_cfg(
