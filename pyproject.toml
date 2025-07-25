@@ -28,6 +28,7 @@ dependencies = [
     "accelerate>=1.6.0",
     "assoc-scan>=0.0.2",
     "beartype",
+    "bidirectional-cross-attention",
     "einx>=0.3.0",
     "einops>=0.8.0",
     "ema-pytorch>=0.7.3",
