@@ -264,4 +264,16 @@ That's it
 }
 ```
 
+```bibtex
+@misc{mcallister2025flowmatchingpolicygradients,
+    title   = {Flow Matching Policy Gradients}, 
+    author  = {David McAllister and Songwei Ge and Brent Yi and Chung Min Kim and Ethan Weber and Hongsuk Choi and Haiwen Feng and Angjoo Kanazawa},
+    year    = {2025},
+    eprint  = {2507.21053},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url = {https://arxiv.org/abs/2507.21053}, 
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
