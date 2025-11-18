@@ -291,9 +291,9 @@ class LinearToMeanStd(Module):
     def forward(self, embed):
         out = self.linear(embed)
 
-        mean, log_variance = rearrange(out, '... (d mu_sigma) -> mu_sigma ... d', mu_sigma = 2)
-        variance = log_variance.exp()
-        std = variance.clamp(min = self.eps).sqrt()
+        mean, log_std = rearrange(out, '... (d mu_sigma) -> mu_sigma ... d', mu_sigma = 2)
+
+        std = log_std.exp()
 
         return stack((mean, std), dim = -1)
 
