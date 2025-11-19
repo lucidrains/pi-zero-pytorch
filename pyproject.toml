@@ -1,6 +1,6 @@
 [project]
 name = "pi-zero-pytorch"
-version = "0.2.5"
+version = "0.2.6"
 description = "π0 in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -64,12 +64,12 @@ pythonpath = [
 ]
 
 [tool.ruff]
-line-length = 1000
 
 lint.ignore = [
     "F722", # for jaxtyping shape annotation
     "F401",
-    "F821"
+    "F821",
+    "E501"
 ]
 
 lint.extend-select = [
