@@ -12,12 +12,14 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 @param('inpaint_with_frozen_actions', (False, True))
 @param('action_dit_norm_all_linears', (False, True))
 @param('task_status_loss', (False, True))
+@param('model_predict_output', ('flow', 'clean'))
 def test_pi_zero_with_vit(
     only_vlm: bool,
     num_residual_streams: int,
     inpaint_with_frozen_actions: bool,
     action_dit_norm_all_linears: bool,
     task_status_loss: bool,
+    model_predict_output
 ):
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
@@ -47,6 +49,7 @@ def test_pi_zero_with_vit(
         num_tokens = 32,
         action_dit_norm_all_linears = action_dit_norm_all_linears,
         num_residual_streams = num_residual_streams,
+        model_predict_output = model_predict_output
     ).to(device)
 
     images = torch.randn(2, 3, 2, 256, 256)
@@ -193,7 +196,7 @@ def test_evo_strat():
 
     evo_strat = EvoStrategy(
         model,
-        environment = lambda noised_model: randrange(1e7),
+        environment = lambda noised_model: randrange(int(1e7)),
         noise_population_size = 4,
         num_generations = 1
     )

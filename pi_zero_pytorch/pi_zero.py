@@ -750,6 +750,7 @@ class PiZero(Module):
         ff_kwargs: dict = dict(),
         lm_pad_id = -1,
         lm_loss_weight = 1.,
+        model_predict_output: Literal['flow', 'clean'] = 'clean', # dreamer4 as well as https://arxiv.org/abs/2511.13720 - something is going around, make sure it is not missed.
         flow_loss_weight = 1.,
         immiscible_flow = False, # https://arxiv.org/abs/2406.12303
         sample_times_fn = default_sample_times,
@@ -925,7 +926,13 @@ class PiZero(Module):
         self.is_mean_std_output = policy_optimizable
         self.policy_optimizable = policy_optimizable
 
-        self.use_spo = use_spo # use simple policy optimization
+        # use simple policy optimization
+
+        self.use_spo = use_spo
+
+        # whether the model outputs x0 or flow
+
+        self.model_predict_output = model_predict_output
 
         # critic related
 
@@ -1502,6 +1509,26 @@ class PiZero(Module):
 
             actions = noise.lerp(actions, padded_times)
 
+        # take care of model output maybe needing a transformation from x0 to flow
+
+        def model_output_clean_to_flow(clean, eps = 5e-3):
+            padded_times = rearrange(times, 'b -> b 1 1')
+            shift = -actions
+            scale = 1. / (1. - padded_times).clamp_min(eps)
+
+            if not self.policy_optimizable:
+                return (clean + shift) * scale
+
+            # if doing on-policy learning, break out the mean and std and transform
+
+            mean, std = clean.unbind(dim = -1)
+            mean = (mean + shift) * scale
+            std = std * scale
+
+            return stack((mean, std), dim = -1)
+
+        model_output_to_flow = identity if self.model_predict_output == 'flow' else model_output_clean_to_flow
+
         # actions
 
         time_cond = self.to_time_cond(times)
@@ -1865,7 +1892,9 @@ class PiZero(Module):
 
         # flow loss for actions tokens
 
-        pred_actions_flow = self.actions_to_pred_flow(action_embeds)
+        model_output = self.actions_to_pred_flow(action_embeds)
+
+        pred_actions_flow = model_output_to_flow(model_output)
 
         if return_actions_flow:
 
