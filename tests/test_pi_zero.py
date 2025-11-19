@@ -192,13 +192,12 @@ def test_evo_strat():
         policy_optimizable = True,
     ).to(device)
 
-    from random import randrange
+    # for parallelism
+    # $ accelerate config
+    # $ accelerate launch <evolve.py>
 
-    evo_strat = EvoStrategy(
-        model,
-        environment = lambda noised_model: randrange(int(1e7)),
+    model.evolve(
+        environment = lambda noised_model: torch.randint(0, int(1e6), ()), # some simulation
         noise_population_size = 4,
         num_generations = 1
     )
-
-    evo_strat()

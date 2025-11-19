@@ -46,6 +46,8 @@ from assoc_scan import AssocScan
 
 from evolutionary_policy_optimization import LatentGenePool
 
+from x_evolution import EvoStrategy
+
 import tqdm
 
 from accelerate import Accelerator
@@ -1337,6 +1339,19 @@ class PiZero(Module):
         logits = self.state_to_logits(embed)
 
         return logits
+
+    def evolve(
+        self,
+        return_evo_strat = False,
+        **kwargs,
+    ):
+
+        evo_strat = EvoStrategy(self, **kwargs)
+
+        if return_evo_strat:
+            return evo_strat
+
+        evo_strat()
 
     @move_input_tensors_to_device
     def forward_for_policy_loss(
