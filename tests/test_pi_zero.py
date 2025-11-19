@@ -1,4 +1,5 @@
 import pytest
+param = pytest.mark.parametrize
 
 import torch
 from pi_zero_pytorch import π0
@@ -6,17 +7,17 @@ from einops import repeat, rearrange
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-@pytest.mark.parametrize('only_vlm', (True, False))
-@pytest.mark.parametrize('num_residual_streams', (1, 4))
-@pytest.mark.parametrize('inpaint_with_frozen_actions', (False, True))
-@pytest.mark.parametrize('action_dit_norm_all_linears', (False, True))
-@pytest.mark.parametrize('task_status_loss', (False, True))
+@param('only_vlm', (True, False))
+@param('num_residual_streams', (1, 4))
+@param('inpaint_with_frozen_actions', (False, True))
+@param('action_dit_norm_all_linears', (False, True))
+@param('task_status_loss', (False, True))
 def test_pi_zero_with_vit(
     only_vlm: bool,
     num_residual_streams: int,
     inpaint_with_frozen_actions: bool,
     action_dit_norm_all_linears: bool,
-    task_status_loss: bool
+    task_status_loss: bool,
 ):
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
@@ -76,9 +77,11 @@ def test_pi_zero_with_vit(
 
     assert sampled_actions.shape == (2, 32, 6)
 
-@pytest.mark.parametrize('num_latent_genes', (1, 16))
+@param('num_latent_genes', (1, 16))
+@param('use_spo', (False, True))
 def test_policy_optimization(
-    num_latent_genes
+    num_latent_genes,
+    use_spo
 ):
 
     from vit_pytorch import ViT
@@ -114,7 +117,8 @@ def test_policy_optimization(
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 32,
-        policy_optimizable = True
+        policy_optimizable = True,
+        use_spo = use_spo
     ).to(device)
 
     images = torch.randn(2, 3, 2, 256, 256)
