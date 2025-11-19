@@ -762,6 +762,7 @@ class PiZero(Module):
         num_task_status = 3,
         task_status_is_invalid = 2,          # the index for which the task status is invalid - `-1` in paper, but we'll do 2 here
         task_status_loss_weight = 1.,
+        use_spo = False,                     # Xie et al. https://arxiv.org/abs/2401.16025 - validated by PI to learn while PPO is unstable and does not - will start adopting SPO for all future on-policy work, until some paper points out deficiencies
         policy_optimizable = False,          # if set to True, will use mean variance network for access to log prob
         is_critic = False,                   # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
         critic_value_kwargs: dict = dict(
@@ -923,6 +924,8 @@ class PiZero(Module):
 
         self.is_mean_std_output = policy_optimizable
         self.policy_optimizable = policy_optimizable
+
+        self.use_spo = use_spo # use simple policy optimization
 
         # critic related
 
@@ -1396,15 +1399,20 @@ class PiZero(Module):
         advantages = rearrange(advantages, 'b t -> (b t) 1 1')
 
         surr1 = ratio * advantages
-        surr2 = ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages
 
-        clipped_surr_loss = torch.min(surr1, surr2).sum(dim = -1)
+        if self.use_spo:
+            policy_loss = surr1 - advantages.abs() * (ratio - 1.).square() / (2 * clip_eps)
+        else:
+
+            surr2 = ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages
+
+            policy_loss = torch.min(surr1, surr2)
 
         # entropy
 
         entropy = (normal_dist.entropy() * entropy_weight).sum(dim = -1)
 
-        return -(clipped_surr_loss + entropy * entropy_weight).mean()
+        return -(policy_loss.sum(dim = -1) + entropy * entropy_weight).mean()
 
     @move_input_tensors_to_device
     def forward_for_critic_loss(
