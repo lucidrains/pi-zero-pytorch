@@ -150,3 +150,52 @@ def test_policy_optimization(
     memories = epo.gather_experience_from_env(steps = 10)
 
     epo.learn_agent(memories, batch_size = 2)
+
+def test_evo_strat():
+    from x_evolution import EvoStrategy
+
+    from vit_pytorch import ViT
+    from vit_pytorch.extractor import Extractor
+
+    from pi_zero_pytorch.pi_zero import (
+        Agent
+    )
+
+    from pi_zero_pytorch.mock_env import Env
+
+    v = ViT(
+        image_size = 256,
+        patch_size = 32,
+        num_classes = 1000,
+        dim = 32,
+        depth = 1,
+        heads = 2,
+        dim_head = 8,
+        mlp_dim = 16,
+        dropout = 0.1,
+        emb_dropout = 0.1
+    )
+
+    v = Extractor(v, return_embeddings_only = True)
+
+    model = π0(
+        dim = 32,
+        vit = v,
+        vit_dim = 32,
+        depth = 1,
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 32,
+        policy_optimizable = True,
+    ).to(device)
+
+    from random import randrange
+
+    evo_strat = EvoStrategy(
+        model,
+        environment = lambda noised_model: randrange(1e7),
+        noise_population_size = 4,
+        num_generations = 1
+    )
+
+    evo_strat()
