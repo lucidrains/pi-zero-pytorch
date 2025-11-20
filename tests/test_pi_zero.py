@@ -81,9 +81,10 @@ def test_pi_zero_with_vit(
     assert sampled_actions.shape == (2, 32, 6)
 
 @param('num_latent_genes', (1, 16))
-@param('use_spo', (False, True))
+@param('model_predict_output,use_spo', (('flow', False), ('flow', True), ('clean', True)))
 def test_policy_optimization(
     num_latent_genes,
+    model_predict_output,
     use_spo
 ):
 
@@ -121,6 +122,7 @@ def test_policy_optimization(
         dim_joint_state = 12,
         num_tokens = 32,
         policy_optimizable = True,
+        model_predict_output = model_predict_output,
         use_spo = use_spo
     ).to(device)
 
