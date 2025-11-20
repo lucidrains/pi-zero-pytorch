@@ -1098,8 +1098,7 @@ class PiZero(Module):
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         frozen_actions: Float['b nfa da'] | None = None,
-        num_frozen_with_transition = None,      # default to frozen action seq dimension 'nfa' above, but can be overridden
-        inpaint_transition_len = 0,             # for soft inpainting mask
+        soft_mask_lens: tuple[int, int, int] | None = None, # (condition, transition, generation) lengths - default to frozen action seq dimension 'nfa' above for condition len with 0 transition, but can be overridden
         return_frozen_actions_with_sampled = False,
         return_original_noise = False,
         steps = 18,
@@ -1140,14 +1139,14 @@ class PiZero(Module):
             frozen_action_input_len = frozen_actions.shape[1]
             frozen_actions_for_inpaint = pad_at_dim(frozen_actions, (0, trajectory_length - frozen_action_input_len), dim = 1)
 
-            num_frozen_with_transition = default(num_frozen_with_transition, frozen_action_input_len)
+            soft_mask_lens = default(soft_mask_lens, (frozen_action_input_len, 0, trajectory_length - frozen_action_input_len)) # default to 0 transition
 
-            assert num_frozen_with_transition < trajectory_length, 'frozen actions must have length less than number of actions being decoded'
-            assert inpaint_transition_len < num_frozen_with_transition
+            assert all([l >= 0 for l in soft_mask_lens])
+            assert sum(soft_mask_lens) == trajectory_length, f'if specifying the soft mask configuration, it must sum up to the trajectory length {trajectory_length}'
 
-            generate_len = trajectory_length - num_frozen_with_transition
+            condition_len, _, generate_len = soft_mask_lens
+            soft_mask = create_soft_inpaint_mask(trajectory_length, condition_len, generate_len, device = self.device)
 
-            soft_mask = create_soft_inpaint_mask(trajectory_length, num_frozen_with_transition - inpaint_transition_len, generate_len, device = self.device)
             soft_mask = rearrange(soft_mask, 'n -> 1 n 1')
 
         # ode step function
@@ -1229,10 +1228,10 @@ class PiZero(Module):
         # final inpaint if needed
 
         if inpaint_actions:
-            sampled_actions = sampled_actions[:, frozen_action_input_len:]
+            sampled_actions.lerp_(frozen_actions_for_inpaint, soft_mask)
 
-            if return_frozen_actions_with_sampled:
-                sampled_actions = cat((frozen_actions, sampled_actions), dim = 1)
+            if not return_frozen_actions_with_sampled:
+                sampled_actions = sampled_actions[:, frozen_action_input_len:]
 
         self.train(was_training)
 
