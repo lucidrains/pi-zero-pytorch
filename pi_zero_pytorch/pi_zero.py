@@ -303,6 +303,44 @@ def create_soft_inpaint_mask(
 
     return mask
 
+class SoftMaskInpainter(Module):
+    def __init__(
+        self,
+        condition_len,
+        transition_len,
+        generate_len
+    ):
+        super().__init__()
+        assert condition_len > 0 and generate_len > 0 and transition_len >= 0
+
+        self.trajectory_length = condition_len + transition_len + generate_len
+
+        soft_mask = create_soft_inpaint_mask(self.trajectory_length, condition_len, generate_len)
+        soft_mask = rearrange(soft_mask, 'na -> 1 na 1')
+
+        self.register_buffer('soft_mask', soft_mask, persistent = False)
+
+    def pad_frozen(
+        self,
+        frozen_actions: Float['b nfa d']
+    ):
+        traj_len = self.trajectory_length
+        frozen_len = frozen_actions.shape[1]
+
+        if frozen_len >= traj_len:
+            return frozen_actions[:, :traj_len]
+
+        return pad_at_dim(frozen_actions, (0, traj_len - frozen_len), dim = 1)
+
+    def forward(
+        self,
+        frozen_actions: Float['b nfa d'],
+        new_actions: Float['b na d']
+    ):
+        frozen_actions = self.pad_frozen(frozen_actions)
+
+        return new_actions.lerp(frozen_actions, self.soft_mask)
+
 # policy optimization related
 
 class GaussianNLL(Module):
@@ -788,6 +826,7 @@ class PiZero(Module):
         flow_loss_weight = 1.,
         immiscible_flow = False, # https://arxiv.org/abs/2406.12303
         sample_times_fn = default_sample_times,
+        sample_soft_mask_lens: tuple[int, int, int] | None = None, # (condition, transition, generation) lengths - default to frozen action seq dimension 'nfa' above for condition len with 0 transition, but can be overridden
         reward_tokens_dropout_prob = 0.,
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
@@ -994,6 +1033,10 @@ class PiZero(Module):
 
         self.sample_times_fn = default(sample_times_fn, torch.rand)
 
+        # soft mask for sampling with inpainting of frozen actions
+
+        self.soft_mask_inpainter = SoftMaskInpainter(*sample_soft_mask_lens) if exists(sample_soft_mask_lens) else None
+
         # loss related
 
         self.lm_loss_weight = lm_loss_weight
@@ -1098,7 +1141,7 @@ class PiZero(Module):
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         frozen_actions: Float['b nfa da'] | None = None,
-        soft_mask_lens: tuple[int, int, int] | None = None, # (condition, transition, generation) lengths - default to frozen action seq dimension 'nfa' above for condition len with 0 transition, but can be overridden
+        soft_mask_lens: tuple[int, int, int] | None = None, # overriding the softmax inpainter at init
         return_frozen_actions_with_sampled = False,
         return_original_noise = False,
         steps = 18,
@@ -1136,18 +1179,14 @@ class PiZero(Module):
         inpaint_actions = exists(frozen_actions)
 
         if inpaint_actions:
-            frozen_action_input_len = frozen_actions.shape[1]
-            frozen_actions_for_inpaint = pad_at_dim(frozen_actions, (0, trajectory_length - frozen_action_input_len), dim = 1)
+            soft_mask_inpainter = self.soft_mask_inpainter
 
-            soft_mask_lens = default(soft_mask_lens, (frozen_action_input_len, 0, trajectory_length - frozen_action_input_len)) # default to 0 transition
+            if not exists(soft_mask_inpainter):
+                soft_mask_len = default(soft_mask_lens, (frozen_actions.shape[1], 0, trajectory_length))
+                soft_mask_inpainter = SoftMaskInpainter(*soft_mask_lens)
 
-            assert all([l >= 0 for l in soft_mask_lens])
-            assert sum(soft_mask_lens) == trajectory_length, f'if specifying the soft mask configuration, it must sum up to the trajectory length {trajectory_length}'
-
-            condition_len, _, generate_len = soft_mask_lens
-            soft_mask = create_soft_inpaint_mask(trajectory_length, condition_len, generate_len, device = self.device)
-
-            soft_mask = rearrange(soft_mask, 'n -> 1 n 1')
+            assert soft_mask_inpainter.trajectory_length== trajectory_length
+            frozen_actions_for_inpaint = soft_mask_inpainter.pad_frozen(frozen_actions)
 
         # ode step function
 
@@ -1161,7 +1200,7 @@ class PiZero(Module):
             # take care of inpainting if needed
 
             if inpaint_actions:
-                denoised_actions.lerp_(frozen_actions_for_inpaint, soft_mask)
+                denoised_actions = soft_mask_inpainter(frozen_actions_for_inpaint, denoised_actions)
 
             input_args = (
                 images,
@@ -1228,7 +1267,7 @@ class PiZero(Module):
         # final inpaint if needed
 
         if inpaint_actions:
-            sampled_actions.lerp_(frozen_actions_for_inpaint, soft_mask)
+            sampled_actions = soft_mask_inpainter(frozen_actions_for_inpaint, sampled_actions)
 
             if not return_frozen_actions_with_sampled:
                 sampled_actions = sampled_actions[:, frozen_action_input_len:]

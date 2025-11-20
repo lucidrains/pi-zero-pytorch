@@ -47,6 +47,7 @@ def test_pi_zero_with_vit(
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 32,
+        sample_soft_mask_lens = (2, 1, 29),
         action_dit_norm_all_linears = action_dit_norm_all_linears,
         num_residual_streams = num_residual_streams,
         model_predict_output = model_predict_output
@@ -76,7 +77,7 @@ def test_pi_zero_with_vit(
 
     # after much training
 
-    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, soft_mask_lens = (2, 1, 29), return_frozen_actions_with_sampled = True) # (1, 32, 6)
+    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, return_frozen_actions_with_sampled = True) # (1, 32, 6)
 
     assert sampled_actions.shape == (2, 32, 6)
 
