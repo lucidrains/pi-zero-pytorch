@@ -76,7 +76,7 @@ def test_pi_zero_with_vit(
 
     # after much training
 
-    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, inpaint_transition_len = 2, return_frozen_actions_with_sampled = True) # (1, 32, 6)
+    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, soft_mask_lens = (2, 1, 29), return_frozen_actions_with_sampled = True) # (1, 32, 6)
 
     assert sampled_actions.shape == (2, 32, 6)
 
@@ -210,5 +210,5 @@ def test_soft_mask():
 
     soft_mask = create_soft_inpaint_mask(24, 5, 5)
 
-    assert (soft_mask[:5] == 0.).all() and (soft_mask[-5:] == 1.).all()
+    assert (soft_mask[:5] == 1.).all() and (soft_mask[-5:] == 0.).all()
     assert ((soft_mask[5:-5] > 0.) & (soft_mask[5:-5] < 1.)).all()
