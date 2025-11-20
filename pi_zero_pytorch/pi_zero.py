@@ -1098,6 +1098,7 @@ class PiZero(Module):
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         frozen_actions: Float['b nfa da'] | None = None,
+        inpaint_transition_len = 0,     # for soft inpainting mask
         return_frozen_actions_with_sampled = False,
         return_original_noise = False,
         steps = 18,
@@ -1138,6 +1139,12 @@ class PiZero(Module):
             num_frozen_actions = frozen_actions.shape[1]
 
             assert num_frozen_actions < trajectory_length, 'frozen actions must have length less than number of actions being decoded'
+            assert inpaint_transition_len < num_frozen_actions
+
+            frozen_actions_for_inpaint = pad_at_dim(frozen_actions, (0, trajectory_length - num_frozen_actions), dim = 1)
+
+            soft_mask = create_soft_inpaint_mask(trajectory_length, num_frozen_actions, inpaint_transition_len, device = self.device)
+            soft_mask = rearrange(soft_mask, 'n -> 1 n 1')
 
         # ode step function
 
@@ -1151,11 +1158,7 @@ class PiZero(Module):
             # take care of inpainting if needed
 
             if inpaint_actions:
-
-                denoised_actions = cat((
-                    frozen_actions,
-                    denoised_actions[:, num_frozen_actions:]
-                ), dim = 1)
+                denoised_actions.lerp_(frozen_actions_for_inpaint, soft_mask)
 
             input_args = (
                 images,
