@@ -191,15 +191,6 @@ That's it
 
 ```bibtex
 @misc{PI2025,
-    title   = {Real-Time Action Chunking with Large Models},
-    author  = {Kevin Black, Manuel Y. Galliker, Sergey Levine},
-    year    = {2025},
-    url     = {https://www.pi.website/research/real_time_chunking}
-}
-```
-
-```bibtex
-@misc{PI2025,
     title = {VLAs that Train Fast, Run Fast, and Generalize Better},
     author = {Danny Driess, Jost Tobias Springenberg, Brian Ichter, Lili Yu, Adrian Li-Bell, Karl Pertsch, Allen Z. Ren, Homer Walke, Quan Vuong, Lucy Xiaoyang Shi, Sergey Levine},
     year   = {2025},
@@ -273,6 +264,18 @@ That's it
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url = {https://arxiv.org/abs/2507.21053}, 
+}
+```
+
+```bibtex
+@misc{black2025realtimeexecutionactionchunking,
+    title   = {Real-Time Execution of Action Chunking Flow Policies}, 
+    author  = {Kevin Black and Manuel Y. Galliker and Sergey Levine},
+    year    = {2025},
+    eprint  = {2506.07339},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2506.07339}, 
 }
 ```
 
