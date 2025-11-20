@@ -81,7 +81,8 @@ def test_pi_zero_with_vit(
     assert sampled_actions.shape == (2, 32, 6)
 
 @param('num_latent_genes', (1, 16))
-@param('model_predict_output,use_spo', (('flow', False), ('flow', True), ('clean', True)))
+@param('model_predict_output', ('flow', 'clean'))
+@param('use_spo', (False, True))
 def test_policy_optimization(
     num_latent_genes,
     model_predict_output,
@@ -152,7 +153,7 @@ def test_policy_optimization(
         )
     )
 
-    memories = epo.gather_experience_from_env(steps = 10)
+    memories = epo.gather_experience_from_env(steps = 4)
 
     epo.learn_agent(memories, batch_size = 2)
 

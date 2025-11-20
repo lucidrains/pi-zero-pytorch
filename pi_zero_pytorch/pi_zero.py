@@ -753,7 +753,7 @@ class PiZero(Module):
         lm_pad_id = -1,
         lm_loss_weight = 1.,
         model_predict_output: Literal['flow', 'clean'] = 'clean', # dreamer4 as well as https://arxiv.org/abs/2511.13720 - something is going around, make sure it is not missed.
-        max_timesteps = 100,
+        max_timesteps = 16,
         flow_loss_weight = 1.,
         immiscible_flow = False, # https://arxiv.org/abs/2406.12303
         sample_times_fn = default_sample_times,
@@ -1530,10 +1530,11 @@ class PiZero(Module):
 
         # take care of model output maybe needing a transformation from x0 to flow
 
-        def model_output_clean_to_flow(clean, eps = 5e-3):
+        def model_output_clean_to_flow(clean, eps = 1e-2):
             padded_times = rearrange(times, 'b -> b 1 1')
+
             shift = -actions
-            scale = 1. / (1. - padded_times)
+            scale = 1. / (1. - padded_times).clamp_min(eps) # todo - remove this eps, it shouldn't be needed with max timesteps
 
             if not self.policy_optimizable:
                 return (clean + shift) * scale
