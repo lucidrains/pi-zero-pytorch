@@ -204,3 +204,11 @@ def test_evo_strat():
         noise_population_size = 4,
         num_generations = 1
     )
+
+def test_soft_mask():
+    from pi_zero_pytorch.pi_zero import create_soft_inpaint_mask
+
+    soft_mask = create_soft_inpaint_mask(24, 5, 5)
+
+    assert (soft_mask[:5] == 0.).all() and (soft_mask[-5:] == 1.).all()
+    assert ((soft_mask[5:-5] > 0.) & (soft_mask[5:-5] < 1.)).all()

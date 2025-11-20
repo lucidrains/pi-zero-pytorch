@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from random import random, randrange
 
 from beartype import beartype
@@ -271,6 +272,36 @@ def noise_assignment(data, noise):
     dist = torch.cdist(data, noise)
     _, assign = linear_sum_assignment(dist.cpu())
     return torch.from_numpy(assign).to(device)
+
+# inpainting softmask, for real-time action chunking
+# https://arxiv.org/abs/2506.07339 - eq (5)
+
+def create_soft_inpaint_mask(
+    chunk_len,
+    condition_len,  # 'd' in the equation, action that is frozen
+    generate_len,   # 's' in the equation, action being generated
+    device = None
+):
+    transition_len = chunk_len - condition_len - generate_len
+    assert transition_len >= 0, 'invalid lens, chunk length must be greater than the sum of the condition and generation lengths'
+
+    # use same notation as paper
+
+    H, s, d = chunk_len, generate_len, condition_len
+
+    i = torch.arange(chunk_len, device = device)
+
+    # transition exponential decay equation from frozen to generate section
+
+    c = (H - s - i) / (H - s - d + 1)
+    mask = c * (c.exp() - 1) / (math.exp(1) - 1)
+
+    # inplace for 0 and 1 on left and right
+
+    mask[:condition_len] = 0.
+    mask[(H - s):] = 1.
+
+    return mask
 
 # policy optimization related
 
@@ -1504,7 +1535,8 @@ class PiZero(Module):
         if not exists(times):
             times = self.sample_times_fn((batch,), device = device)
 
-            times *= (1. - self.max_timesteps ** -1)
+            if self.model_predict_output == 'clean':
+                times *= (1. - self.max_timesteps ** -1)
 
         if times.ndim == 0:
             times = repeat(times, '-> b', b = batch)
@@ -1534,7 +1566,7 @@ class PiZero(Module):
             padded_times = rearrange(times, 'b -> b 1 1')
 
             shift = -actions
-            scale = 1. / (1. - padded_times).clamp_min(eps) # todo - remove this eps, it shouldn't be needed with max timesteps
+            scale = 1. / (1. - padded_times).clamp_min(eps)
 
             if not self.policy_optimizable:
                 return (clean + shift) * scale

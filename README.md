@@ -276,4 +276,16 @@ That's it
 }
 ```
 
+```bibtex
+@misc{black2025realtimeexecutionactionchunking,
+    title   = {Real-Time Execution of Action Chunking Flow Policies}, 
+    author  = {Kevin Black and Manuel Y. Galliker and Sergey Levine},
+    year    = {2025},
+    eprint  = {2506.07339},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2506.07339}, 
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
