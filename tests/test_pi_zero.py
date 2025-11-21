@@ -12,6 +12,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 @param('inpaint_with_frozen_actions', (False, True))
 @param('action_dit_norm_all_linears', (False, True))
 @param('task_status_loss', (False, True))
+@param('advantage_condition', (False, True))
 @param('model_predict_output', ('flow', 'clean'))
 def test_pi_zero_with_vit(
     only_vlm: bool,
@@ -19,6 +20,7 @@ def test_pi_zero_with_vit(
     inpaint_with_frozen_actions: bool,
     action_dit_norm_all_linears: bool,
     task_status_loss: bool,
+    advantage_condition,
     model_predict_output
 ):
     from vit_pytorch import ViT
@@ -47,6 +49,7 @@ def test_pi_zero_with_vit(
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 32,
+        num_advantage_tokens = 2 if advantage_condition else 0,
         sample_soft_mask_lens = (2, 1, 29),
         action_dit_norm_all_linears = action_dit_norm_all_linears,
         num_residual_streams = num_residual_streams,
@@ -64,9 +67,17 @@ def test_pi_zero_with_vit(
     joint_state = torch.randn(2, 12)
     actions = torch.randn(2, 32, 6)
 
+    # for pi0.6
+
+    advantage_ids = None
+    if advantage_condition:
+        advantage_ids = torch.randint(0, 2, (2,))
+
+    # task status
+
     task_status = torch.randint(0, 3, (2,)) if task_status_loss else None
 
-    loss, _ = model(images, commands, joint_state, actions, task_status = task_status)
+    loss, _ = model(images, commands, joint_state, actions, task_status = task_status, advantage_ids = advantage_ids)
     loss.backward()
 
     # maybe inpaint
@@ -77,7 +88,9 @@ def test_pi_zero_with_vit(
 
     # after much training
 
-    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, return_frozen_actions_with_sampled = True) # (1, 32, 6)
+    inference_advantage_id = 1 if advantage_condition else None # fixed to always advantage positive
+
+    sampled_actions = model(images, commands, joint_state, trajectory_length = 32, frozen_actions = frozen_actions, advantage_ids = inference_advantage_id, return_frozen_actions_with_sampled = True) # (1, 32, 6)
 
     assert sampled_actions.shape == (2, 32, 6)
 

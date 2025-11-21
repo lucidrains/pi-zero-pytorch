@@ -136,6 +136,9 @@ def default(v, d):
 def identity(t):
     return t
 
+def sample(prob):
+    return random() < prob
+
 def xnor(x, y):
     return not (x ^ y)
 
@@ -828,6 +831,8 @@ class PiZero(Module):
         sample_times_fn = default_sample_times,
         sample_soft_mask_lens: tuple[int, int, int] | None = None, # (condition, transition, generation) lengths - default to frozen action seq dimension 'nfa' above for condition len with 0 transition, but can be overridden
         reward_tokens_dropout_prob = 0.,
+        num_advantage_tokens = 0,
+        advantage_tokens_dropout_prob = 0.,
         num_recurrent_memory_tokens = 0,
         num_residual_streams = 1,
         dim_latent = None,
@@ -1029,6 +1034,15 @@ class PiZero(Module):
 
         self.reward_tokens_dropout_prob = reward_tokens_dropout_prob
 
+        # advantage tokens and cfg related
+
+        self.can_advantage_token_cond = num_advantage_tokens > 0
+
+        if self.can_advantage_token_cond:
+            self.advantage_embed = nn.Embedding(num_advantage_tokens, dim)
+
+        self.advantage_tokens_dropout_prob = 0.
+
         # time sampling related
 
         self.sample_times_fn = default(sample_times_fn, torch.rand)
@@ -1139,6 +1153,7 @@ class PiZero(Module):
         trajectory_length: int,
         latents: Float['d'] | Float['b d'] = None,
         reward_tokens: Float['b d'] | None = None,
+        advantage_ids: Int['b'] | int | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
         frozen_actions: Float['b nfa da'] | None = None,
         soft_mask_lens: tuple[int, int, int] | None = None, # overriding the softmax inpainter at init
@@ -1213,6 +1228,7 @@ class PiZero(Module):
                 times = timestep,
                 latents = latents,
                 reward_tokens = reward_tokens,
+                advantage_ids = advantage_ids,
                 internal_state_tokens = internal_state_tokens,
                 cached_state_keys_values = (cached_state_kv, null_cached_state_kv),
                 cond_scale = cond_scale,
@@ -1559,6 +1575,7 @@ class PiZero(Module):
         record_and_return_memory_tokens = False,
         past_recurrent_memory_tokens: Float['b {self._nm} d'] | None = None,
         task_status: Int['b'] | None = None,
+        advantage_ids: Int['b'] | int | None = None,
         return_actions_flow = False,
         return_state_keys_values = False,
         cached_state_keys_values: list[tuple[Tensor, Tensor]] | None = None,
@@ -1718,15 +1735,34 @@ class PiZero(Module):
 
             visual_tokens = self.maybe_to_image_tokens(visual_tokens)
 
+            # empty
+
+            empty_token = visual_tokens.new_empty((batch, 0, self.dim))
+
             # maybe reward tokens
 
             if not exists(reward_tokens):
-                reward_tokens = visual_tokens.new_empty((batch, 0, self.dim))
+                reward_tokens = empty_token
 
-            # maybe dropout reward tokens
+            # maybe advantage tokens
 
-            if self.training and random() < self.reward_tokens_dropout_prob:
+            if exists(advantage_ids):
+                assert self.can_advantage_token_cond
+
+                if isinstance(advantage_ids, int):
+                    advantage_ids = torch.full((batch,), advantage_ids, device = self.device)
+
+                advantage_tokens = self.advantage_embed(advantage_ids)
+            else:
+                advantage_tokens = empty_token
+
+            # maybe dropout reward or advantage tokens for cfg
+
+            if self.training and sample(self.reward_tokens_dropout_prob):
                 reward_tokens = reward_tokens[:, 0:0]
+
+            if self.training and sample(self.advantage_tokens_dropout_prob):
+                advantage_tokens = advantage_tokens[:, 0:0]
 
             # additional external states
 
@@ -1743,7 +1779,8 @@ class PiZero(Module):
                 external_state_tokens,
                 visual_tokens,
                 language_tokens,
-                reward_tokens
+                reward_tokens,
+                advantage_tokens
             ], 'b * d')
 
         # take care of masking for variable lengthed states, starting with the language tokens
