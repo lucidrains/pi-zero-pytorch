@@ -344,6 +344,50 @@ class SoftMaskInpainter(Module):
 
         return new_actions.lerp(frozen_actions, self.soft_mask)
 
+# action guidance related
+
+class RTCGuidance(Module):
+    def __init__(
+        self,
+        guidance_weight_beta = 5.
+    ):
+        super().__init__()
+        self.guidance_weight_beta = guidance_weight_beta
+
+    def forward(
+        self,
+        noise_actions: Float['b na d'],
+        pred_actions: Float['b na d'],
+        frozen_actions: Float['b na d'],
+        times: Float[''],
+        soft_mask: Float['na'] | Float['1 na 1'],
+        eps = 1e-4
+    ):
+
+        assert noise_actions.requires_grad, 'the input noised actions must have had grad enabled'
+
+        # handle varaibles
+
+        beta = self.guidance_weight_beta
+
+        if soft_mask.ndim == 1:
+            soft_mask = rearrange(soft_mask, 'nfa -> 1 nfa 1')
+
+        # take care of the weight, which decays over time, clamped at beta at time = 0
+
+        r_tau_squared = (1 - times).square() / (times.square() + (1 - times).square())
+
+        guidance_weight = min(beta, (1 - times) / (times * r_tau_squared).clamp_min(eps))
+
+        # now carry out equation 2 for jvp
+
+        error = soft_mask * (frozen_actions - pred_actions)
+        vjp_scalar = (error.detach() * pred_actions).sum()
+
+        gradient = torch.autograd.grad(vjp_scalar, noise_actions)[0]
+
+        return gradient * guidance_weight
+
 # policy optimization related
 
 class GaussianNLL(Module):
@@ -824,11 +868,13 @@ class PiZero(Module):
         ff_kwargs: dict = dict(),
         lm_pad_id = -1,
         lm_loss_weight = 1.,
-        model_predict_output: Literal['flow', 'clean'] = 'clean', # dreamer4 as well as https://arxiv.org/abs/2511.13720 - something is going around, make sure it is not missed.
+        model_predict_output: Literal['flow', 'clean'] = 'flow', # dreamer4 as well as https://arxiv.org/abs/2511.13720 - something is going around, make sure it is not missed.
         max_timesteps = 16,
         flow_loss_weight = 1.,
-        immiscible_flow = False, # https://arxiv.org/abs/2406.12303
+        immiscible_flow = False,             # https://arxiv.org/abs/2406.12303
         sample_times_fn = default_sample_times,
+        rtc_guidance = None,                 # use the guidance proposed in https://arxiv.org/abs/2506.07339, which in turn is inspired by training-free guidance paper, which in turn from pseudo-inverse paper.
+        sample_guidance_beta = 5.,           # corresponds to the beta max guidance term in the RTC paper
         sample_soft_mask_lens: tuple[int, int, int] | None = None, # (condition, transition, generation) lengths - default to frozen action seq dimension 'nfa' above for condition len with 0 transition, but can be overridden
         reward_tokens_dropout_prob = 0.,
         num_advantage_tokens = 0,
@@ -1051,6 +1097,11 @@ class PiZero(Module):
 
         self.soft_mask_inpainter = SoftMaskInpainter(*sample_soft_mask_lens) if exists(sample_soft_mask_lens) else None
 
+        # guidance as proposed in their RTC paper
+
+        rtc_guidance = default(rtc_guidance, model_predict_output == 'flow')
+        self.rtc_guidance = RTCGuidance(sample_guidance_beta) if rtc_guidance else None
+
         # loss related
 
         self.lm_loss_weight = lm_loss_weight
@@ -1144,7 +1195,6 @@ class PiZero(Module):
 
         return critic.to(self.device)
 
-    @torch.no_grad()
     def sample_actions(
         self,
         images,
@@ -1192,16 +1242,21 @@ class PiZero(Module):
         # validate frozen actions for real-time action chunking, if any
 
         inpaint_actions = exists(frozen_actions)
+        use_rtc_guidance = False
 
         if inpaint_actions:
             soft_mask_inpainter = self.soft_mask_inpainter
 
+            frozen_action_input_len = frozen_actions.shape[1]
+
             if not exists(soft_mask_inpainter):
-                soft_mask_len = default(soft_mask_lens, (frozen_actions.shape[1], 0, trajectory_length))
+                soft_mask_lens = default(soft_mask_lens, (frozen_action_input_len, 0, trajectory_length - frozen_action_input_len))
                 soft_mask_inpainter = SoftMaskInpainter(*soft_mask_lens)
 
-            assert soft_mask_inpainter.trajectory_length== trajectory_length
+            assert soft_mask_inpainter.trajectory_length == trajectory_length
             frozen_actions_for_inpaint = soft_mask_inpainter.pad_frozen(frozen_actions)
+
+            use_rtc_guidance = exists(self.rtc_guidance)
 
         # ode step function
 
@@ -1216,6 +1271,11 @@ class PiZero(Module):
 
             if inpaint_actions:
                 denoised_actions = soft_mask_inpainter(frozen_actions_for_inpaint, denoised_actions)
+
+                if exists(self.rtc_guidance):
+                    # the denoised actions must have grad enabled to calculate the vjp
+
+                    denoised_actions.requires_grad_()
 
             input_args = (
                 images,
@@ -1244,6 +1304,20 @@ class PiZero(Module):
 
             flow = output
 
+            # in the follow up improved real time chunking guidance paper, they propose modifying the flow using a technique from some previous inpainting research
+            # it involves calculating the jacobian of the error between the frozen action and predicted action (of the frozen section), iiuc
+
+            guidance_term = 0.
+
+            if inpaint_actions and exists(self.rtc_guidance):
+                assert self.model_predict_output == 'flow' # handle this eventually
+
+                pred_actions = denoised_actions + flow * (1. - timestep)
+
+                guidance_term = self.rtc_guidance(denoised_actions, pred_actions, frozen_actions_for_inpaint, timestep, soft_mask_inpainter.soft_mask)
+
+            # handle probabilistic
+
             if self.is_mean_std_output:
                 mean, std = output.unbind(dim = -1)
 
@@ -1264,7 +1338,12 @@ class PiZero(Module):
 
             pbar.update(1)
 
-            return flow
+            return flow + guidance_term
+
+        # maybe wrap ode_fn with no grad if not needed, but will be needed for RTC Guidance
+
+        if not use_rtc_guidance:
+            ode_fn = torch.no_grad()(ode_fn)
 
         # start with random gaussian noise - y0
 
