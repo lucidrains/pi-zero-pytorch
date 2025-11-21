@@ -216,7 +216,8 @@ def test_evo_strat():
     model.evolve(
         environment = lambda noised_model: torch.randint(0, int(1e6), ()), # some simulation
         noise_population_size = 4,
-        num_generations = 1
+        num_generations = 1,
+        params_to_optimize = None
     )
 
 def test_soft_mask():

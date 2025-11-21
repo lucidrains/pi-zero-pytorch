@@ -1117,6 +1117,26 @@ class PiZero(Module):
 
         self._nm = num_recurrent_memory_tokens
 
+    def action_params_for_evolution(self):
+        action_params = set()
+
+        add_module = lambda m: action_params.update(set(m.parameters()))
+
+        add_module(self.to_action_tokens)
+
+        for (
+            (attn, state_ff, actions_ff, memories_ff),
+            (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
+            (attn_residual, actions_ff_residual),
+        ) in zip(self.layers, self.cond_layers, self.residual_layers):
+
+            add_module(attn.to_actions_out)
+            add_module(attn.to_actions_qkvg)
+            add_module(actions_ff)
+
+        add_module(self.actions_to_pred_flow)
+        return action_params
+
     @property
     def can_cfg(self):
         return self.reward_tokens_dropout_prob > 0.
@@ -1519,7 +1539,10 @@ class PiZero(Module):
         **kwargs,
     ):
 
-        evo_strat = EvoStrategy(self, **kwargs)
+        evo_strat = EvoStrategy(
+            self,
+            **{'params_to_optimize': self.action_params_for_evolution(), **kwargs}
+        )
 
         if return_evo_strat:
             return evo_strat
