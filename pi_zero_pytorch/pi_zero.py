@@ -299,7 +299,7 @@ def create_soft_inpaint_mask(
     c = (H - s - i) / (H - s - d + 1)
     mask = c * (c.exp() - 1) / (math.exp(1) - 1)
 
-    # inplace for 0 and 1 on left and right
+    # inplace for 1 and 0 on left and right
 
     mask[:condition_len] = 1.
     mask[(H - s):] = 0.
