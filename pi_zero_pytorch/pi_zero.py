@@ -352,14 +352,14 @@ class RTCGuidance(Module):
         guidance_weight_beta = 5.
     ):
         super().__init__()
-        self.guidance_weight_beta = guidance_weight_beta
+        self.register_buffer('beta', tensor(guidance_weight_beta), persistent = False)
 
     def forward(
         self,
         noise_actions: Float['b na d'],
         pred_actions: Float['b na d'],
         frozen_actions: Float['b na d'],
-        times: Float[''],
+        times: Float[''] | Float['b'],
         soft_mask: Float['na'] | Float['1 na 1'],
         eps = 1e-4
     ):
@@ -368,7 +368,7 @@ class RTCGuidance(Module):
 
         # handle varaibles
 
-        beta = self.guidance_weight_beta
+        beta = self.beta
 
         if soft_mask.ndim == 1:
             soft_mask = rearrange(soft_mask, 'nfa -> 1 nfa 1')
@@ -379,7 +379,10 @@ class RTCGuidance(Module):
 
         guidance_weight = min(beta, (1 - times) / (times * r_tau_squared).clamp_min(eps))
 
-        # now carry out equation 2 for jvp
+        if guidance_weight.ndim == 1:
+            guidance_weight = rearrange(guidance_weight, 'b -> b 1 1')
+
+        # now carry out equation 2 for vjp
 
         error = soft_mask * (frozen_actions - pred_actions)
         vjp_scalar = (error.detach() * pred_actions).sum()
