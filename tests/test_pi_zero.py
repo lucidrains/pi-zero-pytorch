@@ -227,3 +227,37 @@ def test_soft_mask():
 
     assert (soft_mask[:5] == 1.).all() and (soft_mask[-5:] == 0.).all()
     assert ((soft_mask[5:-5] > 0.) & (soft_mask[5:-5] < 1.)).all()
+
+def test_self_contained_rtc_guidance():
+    from pi_zero_pytorch import RTCGuidance
+
+    model = π0(
+        dim = 512,
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 20_000,
+        action_dit_norm_all_linears = True
+    )
+
+    vision = torch.randn(1, 1024, 512)
+    commands = torch.randint(0, 20_000, (1, 1024))
+    joint_state = torch.randn(1, 12)
+    times = torch.rand(1,)
+    actions = torch.randn(1, 32, 6)
+
+    assert flow.shape == actions.shape
+
+    rtc_guidance = RTCGuidance()
+
+    model_forward_with_guidance = rtc_guidance.with_model_and_frozen_actions(
+        model,
+        frozen_actions = actions,
+        soft_mask = (24, 3, 5),
+        input_time_arg_name = 'times',
+        input_noised_actions_arg_name = 'actions',
+        add_guidance_to_flow = True
+    )
+
+    flow_with_guidance = model_forward_with_guidance(vision, commands, joint_state, actions, times = times, return_actions_flow = True)
+
+    assert flow_with_guidance.shape == actions.shape

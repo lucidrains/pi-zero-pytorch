@@ -6,6 +6,7 @@ from random import random, randrange
 from beartype import beartype
 from beartype.typing import Callable, Literal
 
+from inspect import signature
 from functools import partial, wraps
 from itertools import count
 
@@ -354,6 +355,51 @@ class RTCGuidance(Module):
         super().__init__()
         self.register_buffer('beta', tensor(guidance_weight_beta), persistent = False)
 
+    def with_model_and_frozen_actions(
+        self,
+        model: Module,
+        frozen_actions: Float['b na d'],
+        soft_mask: tuple[int, int, int] | Float['na'] | Float['1 na 1'],
+        input_time_arg_name = 'times',
+        input_noised_actions_arg_name = 'actions',
+        add_guidance_to_flow = True,
+        eps = 1e-4
+    ):
+        sig = signature(model.forward)
+
+        if isinstance(soft_mask, tuple):
+            soft_mask = SoftMaskInpainter(*soft_mask).soft_mask
+
+        param_names = set(sig.parameters.keys())
+        assert input_time_arg_name in param_names and input_noised_actions_arg_name in param_names
+
+        def fn(*args, **kwargs):
+            bound_args = sig.bind(*args, **kwargs).arguments
+
+            # extract the time and noise actions from the flow function being invoked on pi-zero
+
+            times = bound_args[input_time_arg_name]
+            noise_actions = bound_args[input_noised_actions_arg_name]
+
+            # make sure the input into the flow function has requires_grad turned on
+
+            noise_actions.requires_grad_()
+
+            # the actual forward
+
+            pred_flow = model(*args, **kwargs)
+
+            # invoke the proposal
+
+            guidance = self.forward(noise_actions, pred_flow, frozen_actions, times, soft_mask, eps)
+
+            if add_guidance_to_flow:
+                return pred_flow + guidance
+
+            return pred_flow, guidance
+
+        return fn
+
     def forward(
         self,
         noise_actions: Float['b na d'],
@@ -366,7 +412,7 @@ class RTCGuidance(Module):
 
         assert noise_actions.requires_grad, 'the input noised actions must have had grad enabled'
 
-        # handle varaibles
+        # handle variables
 
         beta = self.beta
 
