@@ -392,16 +392,27 @@ class RTCGuidance(Module):
 
             # the actual forward
 
-            pred_flow = flow_fn(*args, **kwargs)
+            output = flow_fn(*args, **kwargs)
+
+            # assume predicted flow is first tensor
+
+            (pred_flow, *rest), inverse_flatten = tree_flatten_with_inverse(output)
 
             # invoke the proposal
 
             guidance = self.forward(noise_actions, pred_flow, frozen_actions, times, soft_mask, eps)
 
             if add_guidance_to_flow:
-                return pred_flow + guidance
+                pred_flow = pred_flow + guidance
 
-            return pred_flow, guidance
+            # constitute output
+
+            output = inverse_flatten((pred_flow, *rest))
+
+            if add_guidance_to_flow:
+                return output
+
+            return output, guidance
 
         return fn
 
