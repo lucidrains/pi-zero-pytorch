@@ -363,9 +363,14 @@ class RTCGuidance(Module):
         input_time_arg_name = 'times',
         input_noised_actions_arg_name = 'actions',
         add_guidance_to_flow = True,
+        flow_fn_name = 'forward',
         eps = 1e-4
     ):
-        sig = signature(model.forward)
+
+        flow_fn = getattr(model, flow_fn_name, None)
+        assert exists(flow_fn)
+
+        sig = signature(flow_fn)
 
         if isinstance(soft_mask, tuple):
             soft_mask = SoftMaskInpainter(*soft_mask).soft_mask
@@ -387,7 +392,7 @@ class RTCGuidance(Module):
 
             # the actual forward
 
-            pred_flow = model(*args, **kwargs)
+            pred_flow = flow_fn(*args, **kwargs)
 
             # invoke the proposal
 

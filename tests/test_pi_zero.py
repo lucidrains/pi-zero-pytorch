@@ -245,8 +245,6 @@ def test_self_contained_rtc_guidance():
     times = torch.rand(1,)
     actions = torch.randn(1, 32, 6)
 
-    assert flow.shape == actions.shape
-
     rtc_guidance = RTCGuidance()
 
     model_forward_with_guidance = rtc_guidance.with_model_and_frozen_actions(
