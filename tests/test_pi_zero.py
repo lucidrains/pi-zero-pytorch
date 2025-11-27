@@ -259,3 +259,32 @@ def test_self_contained_rtc_guidance():
     flow_with_guidance = model_forward_with_guidance(vision, commands, joint_state, actions, times = times, return_actions_flow = True)
 
     assert flow_with_guidance.shape == actions.shape
+
+@param('critic_use_discrete_bins', (False, True))
+def test_value(
+    critic_use_discrete_bins
+):
+
+    model = π0(
+        dim = 512,
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 20_000,
+        is_critic = True,
+        critic_use_discrete_bins = critic_use_discrete_bins
+    )
+
+    vision = torch.randn(1, 1024, 512)
+    commands = torch.randint(0, 20_000, (1, 1024))
+    joint_state = torch.randn(1, 12)
+    times = torch.rand(1,)
+    actions = torch.randn(1, 32, 6)
+
+    values, logits = model(vision, commands, joint_state, actions, times = times, return_actions_flow = True)
+
+    assert values.shape == (1,)
+    assert logits.shape == (1, 50)
+
+    loss = model.forward_for_critic_loss(vision, commands, joint_state, actions, times = times, old_values = values, advantages = values)
+
+    assert loss.numel() == 1

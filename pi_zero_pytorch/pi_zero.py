@@ -453,6 +453,79 @@ class RTCGuidance(Module):
 
         return gradient * guidance_weight
 
+# the layer that projects from the embedding to a prediction of binned values (from -1. to 0.) in pi0.6
+# alternative is the HL gauss layer proposed from deepmind
+
+class BinnedValueLayer(Module):
+    def __init__(
+        self,
+        dim,
+        min_value = -1.,
+        max_value = 0.,
+        num_bins = 201
+    ):
+        super().__init__()
+        self.num_bins = num_bins
+
+        # params
+
+        self.to_pred = LinearNoBias(dim, num_bins)
+
+        # bins
+
+        bins = torch.linspace(min_value, max_value, num_bins)
+        self.register_buffer('bins', bins, persistent = False)
+
+    def value_to_prob(
+        self,
+        value: Float['...'],
+        temperature = 0.1,
+        hard = False
+    ) -> Float['... bins']:
+
+        distance = einx.subtract('..., bins -> ... bins', value, self.bins)
+
+        prob = (-distance / temperature).softmax(dim = -1)
+
+        if not hard:
+            return prob
+
+        # straight through one hot if hard
+
+        one_hot = F.one_hot(prob.argmax(dim = -1), num_classes = self.num_bins)
+
+        return one_hot + prob - prob.detach()
+
+    def loss_fn(
+        self,
+        pred,
+        target,
+        reduction = 'none'
+    ):
+        if pred.ndim == 1:
+            pred = log(self.value_to_prob(pred))
+
+        if target.ndim == 1:
+            target = self.value_to_prob(target)
+
+        return F.cross_entropy(pred, target, reduction = reduction)
+
+    def forward(
+        self,
+        embed,
+        return_value_and_logits = False
+    ):
+
+        logits = self.to_pred(embed)
+        prob = logits.softmax(dim = -1)
+
+        values = reduce(prob * self.bins, '... bins -> ...', 'sum')
+
+        if not return_value_and_logits:
+            return values
+
+        return values, logits
+
 # policy optimization related
 
 class GaussianNLL(Module):
@@ -955,6 +1028,7 @@ class PiZero(Module):
         use_spo = True,                      # Xie et al. https://arxiv.org/abs/2401.16025 - validated by PI to learn while PPO is unstable and does not - will start adopting SPO for all future on-policy work, until some paper points out deficiencies
         policy_optimizable = False,          # if set to True, will use mean variance network for access to log prob
         is_critic = False,                   # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
+        critic_use_discrete_bins = True,     # use the categorical discrete binning of the rewards (which is normalized to between -1. and 0.) for pi0.6
         critic_value_kwargs: dict = dict(
             min_value = -10.,
             max_value = 10.,
@@ -1128,10 +1202,16 @@ class PiZero(Module):
 
         self.is_critic = is_critic
 
-        self.to_critic_value = HLGaussLayer(
-            dim,
-            hl_gauss_loss = critic_value_kwargs
-        )
+        if critic_use_discrete_bins:
+            self.to_critic_value = BinnedValueLayer(
+                dim,
+                **critic_value_kwargs
+            )
+        else:
+            self.to_critic_value = HLGaussLayer(
+                dim,
+                hl_gauss_loss = critic_value_kwargs
+            )
 
         # the language token id padding id, for fine-tuning as well as taking care of the masking on top of causal mask
 
@@ -1715,8 +1795,8 @@ class PiZero(Module):
 
         # value clipping
 
-        advantages = rearrange(advantages, 'b t -> (b t)')
-        old_values = rearrange(old_values, 'b t -> (b t)')
+        advantages = rearrange(advantages, '... -> (...)')
+        old_values = rearrange(old_values, '... -> (...)')
 
         returns = old_values + advantages
 
