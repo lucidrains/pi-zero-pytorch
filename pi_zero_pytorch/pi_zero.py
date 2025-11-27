@@ -462,7 +462,8 @@ class BinnedValueLayer(Module):
         dim,
         min_value = -1.,
         max_value = 0.,
-        num_bins = 201
+        num_bins = 201,
+        hard_discrete_targets = True
     ):
         super().__init__()
         self.num_bins = num_bins
@@ -470,6 +471,8 @@ class BinnedValueLayer(Module):
         # params
 
         self.to_pred = LinearNoBias(dim, num_bins)
+
+        self.hard_discrete_targets = hard_discrete_targets
 
         # bins
 
@@ -482,6 +485,7 @@ class BinnedValueLayer(Module):
         temperature = 0.1,
         hard = False
     ) -> Float['... bins']:
+        requires_grad = value.requires_grad
 
         distance = einx.subtract('..., bins -> ... bins', value, self.bins)
 
@@ -494,19 +498,23 @@ class BinnedValueLayer(Module):
 
         one_hot = F.one_hot(prob.argmax(dim = -1), num_classes = self.num_bins)
 
+        if not requires_grad:
+            return one_hot
+
         return one_hot + prob - prob.detach()
 
     def loss_fn(
         self,
         pred,
         target,
-        reduction = 'none'
+        reduction = 'none',
+        hard_discretized_target = True
     ):
         if pred.ndim == 1:
             pred = log(self.value_to_prob(pred))
 
         if target.ndim == 1:
-            target = self.value_to_prob(target)
+            target = self.value_to_prob(target, hard = self.hard_discrete_targets)
 
         return F.cross_entropy(pred, target, reduction = reduction)
 
