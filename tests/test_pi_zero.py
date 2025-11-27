@@ -261,8 +261,10 @@ def test_self_contained_rtc_guidance():
     assert flow_with_guidance.shape == actions.shape
 
 @param('critic_use_discrete_bins', (False, True))
+@param('value_clip', (False, True))
 def test_value(
-    critic_use_discrete_bins
+    critic_use_discrete_bins,
+    value_clip
 ):
 
     model = π0(
@@ -285,6 +287,6 @@ def test_value(
     assert values.shape == (1,)
     assert logits.shape == (1, 50)
 
-    loss = model.forward_for_critic_loss(vision, commands, joint_state, actions, times = times, old_values = values, advantages = values)
+    loss = model.forward_for_critic_loss(vision, commands, joint_state, actions, times = times, old_values = values, advantages = values, value_clip = value_clip)
 
     assert loss.numel() == 1

@@ -1783,6 +1783,7 @@ class PiZero(Module):
         *args,
         old_values: Float['b t'],
         advantages: Float['b t'],
+        value_clip = True,
         clip_eps = 0.4,
         **kwargs
     ):
@@ -1793,17 +1794,23 @@ class PiZero(Module):
 
         critic_value, critic_logits = self.forward(*args, **kwargs)
 
-        # value clipping
+        # derive returns
 
         advantages = rearrange(advantages, '... -> (...)')
         old_values = rearrange(old_values, '... -> (...)')
 
         returns = old_values + advantages
 
+        loss = loss_fn(critic_logits, returns, reduction = 'none')
+
+        if not value_clip:
+            return loss.mean()
+
+        # maybe value clipping
+
         clipped_value = old_values + (critic_value - old_values).clamp(-eps, eps)
 
         clipped_loss = loss_fn(clipped_value, returns, reduction = 'none')
-        loss = loss_fn(critic_logits, returns, reduction = 'none')
 
         return torch.max(clipped_loss, loss).mean()
 
