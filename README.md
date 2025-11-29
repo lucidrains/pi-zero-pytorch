@@ -53,7 +53,7 @@ sampled_actions = model(vision, commands, joint_state, trajectory_length = 32) #
 To do online learning, just wrap the model with the `Agent` class
 
 ```python
-from pi_zero_pytorch import π0, Agent, EPO
+from pi_zero_pytorch import π0, Agent, EFPO
 
 # wrap the model with `Agent`, which will instantiate actor and critic for PPO
 
@@ -64,9 +64,9 @@ agent = Agent(model)
 from pi_zero_pytorch.mock_env import Env
 mock_env = Env((256, 256), 2, 32, 1024, 12)
 
-# pass your agent and environment to EPO for learning to be orchestrated
+# pass your agent and environment to EFPO for learning to be orchestrated
 
-epo = EPO(agent, mock_env)
+epo = EFPO(agent, mock_env)
 
 # gather memories from environment
 
@@ -256,6 +256,18 @@ That's it
 ```
 
 ```bibtex
+@misc{black2025realtimeexecutionactionchunking,
+    title   = {Real-Time Execution of Action Chunking Flow Policies}, 
+    author  = {Kevin Black and Manuel Y. Galliker and Sergey Levine},
+    year    = {2025},
+    eprint  = {2506.07339},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2506.07339}, 
+}
+```
+
+```bibtex
 @misc{mcallister2025flowmatchingpolicygradients,
     title   = {Flow Matching Policy Gradients}, 
     author  = {David McAllister and Songwei Ge and Brent Yi and Chung Min Kim and Ethan Weber and Hongsuk Choi and Haiwen Feng and Angjoo Kanazawa},
@@ -268,14 +280,13 @@ That's it
 ```
 
 ```bibtex
-@misc{black2025realtimeexecutionactionchunking,
-    title   = {Real-Time Execution of Action Chunking Flow Policies}, 
-    author  = {Kevin Black and Manuel Y. Galliker and Sergey Levine},
+@inproceedings{anonymous2025flow,
+    title   = {Flow Policy Gradients for Legged Robots},
+    author  = {Anonymous},
+    booktitle = {Submitted to The Fourteenth International Conference on Learning Representations},
     year    = {2025},
-    eprint  = {2506.07339},
-    archivePrefix = {arXiv},
-    primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2506.07339}, 
+    url     = {https://openreview.net/forum?id=BA6n0nmagi},
+    note    = {under review}
 }
 ```
 

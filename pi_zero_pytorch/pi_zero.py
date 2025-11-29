@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from random import random, randrange
 
 from beartype import beartype
@@ -14,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from torch import pi, nn, cat, stack, tensor, is_tensor
 from torch.nn import Module, ModuleList
-from torch.distributions import Normal
 from torch.distributions.beta import Beta
 
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
@@ -161,8 +161,11 @@ def save_args_kwargs(fn):
 
     return decorated
 
+def tree_map_tensor(t, fn):
+    return tree_map(lambda el: fn(el) if is_tensor(el) else el, t)
+
 def to_device(t, device):
-    return tree_map(lambda el: el.to(device) if is_tensor(el) else el, t)
+    return tree_map_tensor(t, lambda el: el.to(device))
 
 def move_input_tensors_to_device(fn):
 
@@ -193,6 +196,9 @@ def log(t, eps = 1e-20):
 
 def l2norm(t, dim = -1):
     return F.normalize(t, dim = dim)
+
+def straight_through(src, tgt):
+    return src + (tgt - src).detach()
 
 def softclamp(t, value):
     if value <= 0.:
@@ -533,33 +539,6 @@ class BinnedValueLayer(Module):
             return values
 
         return values, logits
-
-# policy optimization related
-
-class GaussianNLL(Module):
-    def forward(self, mu_sigma, target):
-        mean, variance = mu_sigma.unbind(dim = -1)
-        return F.gaussian_nll_loss(mean, target, variance, reduction = 'none')
-
-class LinearToMeanStd(Module):
-    def __init__(
-        self,
-        dim,
-        dim_out,
-        eps = 1e-5
-    ):
-        super().__init__()
-        self.linear = LinearNoBias(dim, dim_out * 2)
-        self.eps = eps
-
-    def forward(self, embed):
-        out = self.linear(embed)
-
-        mean, log_std = rearrange(out, '... (d mu_sigma) -> mu_sigma ... d', mu_sigma = 2)
-
-        std = log_std.exp()
-
-        return stack((mean, std), dim = -1)
 
 # attention
 
@@ -1034,7 +1013,7 @@ class PiZero(Module):
         task_status_is_invalid = 2,          # the index for which the task status is invalid - `-1` in paper, but we'll do 2 here
         task_status_loss_weight = 1.,
         use_spo = True,                      # Xie et al. https://arxiv.org/abs/2401.16025 - validated by PI to learn while PPO is unstable and does not - will start adopting SPO for all future on-policy work, until some paper points out deficiencies
-        policy_optimizable = False,          # if set to True, will use mean variance network for access to log prob
+        use_asymmetric_spo = True,           # FPO++ paper proposes combining ppo and spo
         is_critic = False,                   # whether this model is used as the critic, with the histogram classification loss from Imani et al. https://arxiv.org/html/2402.13425v1
         critic_use_discrete_bins = True,     # use the categorical discrete binning of the rewards (which is normalized to between -1. and 0.) for pi0.6
         critic_value_kwargs: dict = dict(
@@ -1187,19 +1166,14 @@ class PiZero(Module):
         self.loss_fn = None
 
         if not is_critic:
-            if not policy_optimizable:
-                self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
-                self.loss_fn = nn.MSELoss(reduction = 'none')
-            else:
-                self.actions_to_pred_flow = LinearToMeanStd(dim, dim_action_input)
-                self.loss_fn = GaussianNLL()
-
-        self.is_mean_std_output = policy_optimizable
-        self.policy_optimizable = policy_optimizable
+            self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
+            self.loss_fn = nn.MSELoss(reduction = 'none')
 
         # use simple policy optimization
 
         self.use_spo = use_spo
+
+        self.use_asymmetric_spo = use_asymmetric_spo
 
         # whether the model outputs x0 or flow
 
@@ -1326,12 +1300,6 @@ class PiZero(Module):
     def create_actor(self, **kwargs) -> PiZero:
         assert not self.is_critic, 'base model must not be a critic'
 
-        # make probabilistic flow if not already
-
-        if not self.policy_optimizable:
-            assert 'policy_optimizable' not in kwargs
-            kwargs.update(policy_optimizable = True)
-
         orig_args, orig_kwargs = self._init_args_kwargs
         actor = PiZero(*orig_args, **orig_kwargs, **kwargs)
 
@@ -1340,20 +1308,10 @@ class PiZero(Module):
         state_dict = self.state_dict()
         actor.load_state_dict(state_dict, strict = False)
 
-        # now, initialize the actor with variance of 1.
-        # https://arxiv.org/abs/2302.08875
-
-        if not self.policy_optimizable:
-            orig_mean_weight = self.actions_to_pred_flow.weight
-
-            actor_mean_std_weight = actor.actions_to_pred_flow.linear.weight
-
-            actor_mean_std_weight.data.copy_(rearrange([orig_mean_weight, torch.zeros_like(orig_mean_weight)], 'mu_sigma o i -> (o mu_sigma) i'))
-
         return actor.to(self.device)
 
     def create_critic(self, **kwargs) -> PiZero:
-        assert self.policy_optimizable and not self.is_critic, 'base model must be policy optimizable as well as not a critic already'
+        assert not self.is_critic, 'base model must be policy optimizable as well as not a critic already'
 
         assert 'is_critic' not in kwargs
         kwargs.update(is_critic = True)
@@ -1401,14 +1359,7 @@ class PiZero(Module):
 
         pbar = tqdm.tqdm(desc = 'sampling action trajectory', disable = not show_pbar, total = steps)
 
-        # accumulate log probs for ppo
-
-        assert not (return_states_for_replay and not self.is_mean_std_output), 'only pi-zero with `policy_optimizable` turned on can return log probs'
-
-        timesteps = []
-        log_probs = []
-        sampled_flows = []
-        denoised_actions_across_time = []
+        # accumulate for flow policy optimization
 
         critic_values = []
 
@@ -1435,10 +1386,14 @@ class PiZero(Module):
 
         cached_state_kv = None
         null_cached_state_kv = None
+        input_args = None
+        input_kwargs = None
 
         def ode_fn(timestep, denoised_actions):
             nonlocal cached_state_kv
             nonlocal null_cached_state_kv
+            nonlocal input_args
+            nonlocal input_kwargs
 
             # take care of inpainting if needed
 
@@ -1471,10 +1426,6 @@ class PiZero(Module):
 
             output, (new_cached_state_kv, new_null_cached_state_kv) = self.forward_with_reward_cfg(*input_args, **input_kwargs)
 
-            if exists(critic):
-                critic_value, _ = critic.forward_with_reward_cfg(*input_args, **input_kwargs)
-                critic_values.append(critic_value)
-
             flow = output
 
             # in the follow up improved real time chunking guidance paper, they propose modifying the flow using a technique from some previous inpainting research
@@ -1490,20 +1441,6 @@ class PiZero(Module):
                 guidance_term = self.rtc_guidance(denoised_actions, pred_actions, frozen_actions_for_inpaint, timestep, soft_mask_inpainter.soft_mask)
 
             # handle probabilistic
-
-            if self.is_mean_std_output:
-                mean, std = output.unbind(dim = -1)
-
-                flow = torch.normal(mean, std * temperature)
-
-                log_prob = Normal(mean, std).log_prob(flow)
-
-                # save for replaying for optimizing actor
-
-                denoised_actions_across_time.append(denoised_actions)
-                timesteps.append(repeat(timestep, ' -> b', b = batch_size))
-                log_probs.append(log_prob)
-                sampled_flows.append(flow)
 
             if cache_kv:
                 cached_state_kv = new_cached_state_kv
@@ -1549,25 +1486,17 @@ class PiZero(Module):
         else:
             out = sampled_actions
 
-        if not return_states_for_replay:
+        if not exists(critic):
             return out
 
-        # place the time step dimension after batch
+        # return critic value predictions if passed in
 
-        timesteps = stack(timesteps, dim = 1)
-        log_probs = stack(log_probs, dim = 1)
-        sampled_flow = stack(sampled_flows, dim = 1)
-        denoised_actions_across_time = stack(denoised_actions_across_time, dim = 1)
+        del input_kwargs['cached_state_keys_values']
+        input_kwargs['times'].zero_().add_(1.)
 
-        policy_optimization_outputs = (denoised_actions_across_time, timesteps, log_probs, sampled_flow)
+        values, _ = critic(*input_args, **input_kwargs)
 
-        # return critic value predictions if passed in - will just deepcopy pi-zero + a critic head
-
-        if exists(critic):
-            critic_values = stack(critic_values, dim = 1)
-            policy_optimization_outputs = (*policy_optimization_outputs, critic_values)
-
-        return out, policy_optimization_outputs
+        return out, values
 
     @torch.no_grad()
     def forward_with_reward_cfg(
@@ -1709,98 +1638,111 @@ class PiZero(Module):
         commands,
         joint_state,
         actions,
-        flow,
-        times,
-        old_log_probs: Float['b na'],
+        old_actor: PiZero,
         advantages: Float['b t'],
         clip_eps = 0.2,
-        entropy_weight = 1e-2,
         norm_eps = 1e-5,
+        num_monte_carlo = 2,
+        loss_clamp_value = 5.,
         **kwargs,
     ):
+        batch = actions.shape[0]
+
         assert not self.is_critic
-        assert self.policy_optimizable
         assert 'return_actions_flow' not in kwargs
 
-        # flatten the time into the batch for actions at timestep, sampled flow, and log prob
-
-        if times.ndim == 2:
-            times = rearrange(times, 'b t -> (b t)')
-
-        if flow.ndim == 4:
-            flow = rearrange(flow, 'b t ... -> (b t) ...')
-
-        if old_log_probs.ndim == 4:
-            old_log_probs = rearrange(old_log_probs, 'b t ... -> (b t) ...')
-
-        if actions.ndim == 4:
-            actions = rearrange(actions, 'b t ... -> (b t) ...')
-
-        # expand inputs across timesteps if need be
-
-        (
-            images,
-            commands,
-            joint_state,
-        ) = tuple(repeat(inp, 'b ... -> (b t) ...', t = times.shape[0] // inp.shape[0]) for inp in (
-            images,
-            commands,
-            joint_state
-        ))
-
-        mean_std = self.forward(
-            images,
-            commands,
-            joint_state,
-            actions,
+        actor_inputs = dict(
+            images = images,
+            token_ids = commands,
+            joint_state = joint_state,
+            actions = actions,
             return_actions_flow = True,
             **kwargs
         )
 
-        normal_dist = Normal(*mean_std.unbind(dim = -1))
+        # flow matching policy optimization - McAllister et al.
+        # https://arxiv.org/abs/2507.21053
 
-        new_log_probs = normal_dist.log_prob(actions)
+        # generate random noise and timesteps - in paper they noted even num monte carlo of 1 did well - lets do 2
 
-        # ppo surrogate loss
+        actor_inputs, advantages = tree_map_tensor((actor_inputs, advantages), lambda t: repeat(t, 'b ... -> (b n_mc) ...', n_mc = num_monte_carlo))
 
-        ratio = (new_log_probs - old_log_probs).exp()
+        repeated_batch = batch * num_monte_carlo
+
+        repeated_actions = actor_inputs['actions']
+
+        noise = torch.randn_like(repeated_actions)
+        times = torch.rand((repeated_batch,), device = self.device)
+
+        actor_inputs.update(noise = noise, times = times)
+
+        target_flow = repeated_actions - noise
+
+        # random times and noises and do flow loss calculation manually for more control
+
+        pred_flow = self.forward(**actor_inputs)
+
+        with torch.no_grad():
+            old_actor.eval()
+            old_pred_flow = old_actor(**actor_inputs)
+
+        # asymmetric spo - ppo for positive advantages, spo for negative
+        # proposed by fpo++ paper for legged robots
+        # https://openreview.net/forum?id=BA6n0nmagi
+
+        flow_loss = F.mse_loss(pred_flow, target_flow, reduction = 'none')
+        old_flow_loss = F.mse_loss(old_pred_flow, target_flow, reduction = 'none')
+
+        loss_diff = (flow_loss - old_flow_loss.detach())
+
+        loss_diff_clamped = loss_diff.clamp_max(loss_clamp_value).detach()
+
+        loss_diff = straight_through(loss_diff, loss_diff_clamped)
+
+        # ppo, spo, or both (asymmetric spo)
+
+        ratio = loss_diff.exp()
 
         advantages = F.layer_norm(advantages, advantages.shape, eps = norm_eps)
 
-        advantages = rearrange(advantages, 'b t -> (b t) 1 1')
+        advantages = rearrange(advantages, 'b -> b 1 1')
 
-        if self.use_spo:
-            policy_loss = ratio * advantages - advantages.abs() * (ratio - 1.).square() / (2 * clip_eps)
+        calc_spo = lambda: ratio * advantages - advantages.abs() * (ratio - 1.).square() / (2 * clip_eps)
+
+        calc_ppo = lambda: torch.min(ratio * advantages, ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages)
+
+        if self.use_asymmetric_spo:
+            policy_loss = torch.where(advantages >= 0., calc_ppo(), calc_spo())
+        elif self.use_spo:
+            policy_loss = calc_spo()
         else:
-            surr1 = ratio * advantages
-            surr2 = ratio.clamp(1. - clip_eps, 1. + clip_eps) * advantages
+            policy_loss = calc_ppo()
 
-            policy_loss = torch.min(surr1, surr2)
+        # sum across actions, then average
 
         policy_loss = policy_loss.sum(dim = -1)
 
-        # entropy
-
-        entropy = (normal_dist.entropy() * entropy_weight).sum(dim = -1)
-
-        return -(policy_loss + entropy * entropy_weight).mean()
+        return -policy_loss.mean()
 
     @move_input_tensors_to_device
     def forward_for_critic_loss(
         self,
         *args,
-        old_values: Float['b t'],
-        advantages: Float['b t'],
+        old_values: Float['b'],
+        advantages: Float['b'],
         value_clip = True,
         clip_eps = 0.4,
-        **kwargs
     ):
         assert self.is_critic
 
         eps = clip_eps
         loss_fn = self.to_critic_value.loss_fn
 
-        critic_value, critic_logits = self.forward(*args, **kwargs)
+        forward_kwargs = dict(
+            times = torch.ones_like(old_values)
+        )
+
+        critic_value, critic_logits = self.forward(*args, **forward_kwargs)
 
         # derive returns
 
@@ -1830,6 +1772,7 @@ class PiZero(Module):
         joint_state: Float['b djs'],                                     # joint state
         actions: Float['b na da'] | None = None,                         # action
         times: Float['b'] = None,
+        noise: Float['b na da'] | None = None,
         latents: Float['d'] | Float['b d'] = None,
         reward_tokens: Float['b d'] | None = None,
         internal_state_tokens: Float['b ns d'] | None = None,
@@ -1873,7 +1816,7 @@ class PiZero(Module):
         # if not returning the actions predicted flow, assume training and noise the actions for loss
 
         if not return_actions_flow and not self.is_critic:
-            noise = torch.randn_like(actions)
+            noise = default(noise, torch.randn_like(actions))
 
             if self.immiscible_flow:
                 assignment = noise_assignment(actions, noise)
@@ -1889,19 +1832,7 @@ class PiZero(Module):
         def model_output_clean_to_flow(clean, eps = 1e-2):
             padded_times = rearrange(times, 'b -> b 1 1')
 
-            shift = -actions
-            scale = 1. / (1. - padded_times).clamp_min(eps)
-
-            if not self.policy_optimizable:
-                return (clean + shift) * scale
-
-            # if doing on-policy learning, break out the mean and std and transform
-
-            mean, std = clean.unbind(dim = -1)
-            mean = (mean + shift) * scale
-            std = std * scale
-
-            return stack((mean, std), dim = -1)
+            return (clean - actions) / (1. - padded_times).clamp_min(eps)
 
         model_output_to_flow = identity if self.model_predict_output == 'flow' else model_output_clean_to_flow
 
@@ -2420,7 +2351,7 @@ class Agent(Module):
 
         actor = model
 
-        if not model.policy_optimizable or evolutionary_learning:
+        if evolutionary_learning:
             actor = model.create_actor(dim_latent = dim_latent)
 
         self.actor = actor
@@ -2447,7 +2378,7 @@ class Agent(Module):
     ):
         raise NotImplementedError
 
-class EPO(Module):
+class EFPO(Module):
     def __init__(
         self,
         agent: Agent,
@@ -2489,39 +2420,47 @@ class EPO(Module):
     def gather_experience_from_env(
         self,
         steps,
+        num_episodes = 1,
         trajectory_length = 16,
         flow_sampling_steps = 4,
-        temperature = 1.,
         **sampling_kwargs
     ):
         self.agent.eval()
 
         actor = self.unwrapped_actor
+        critic = self.unwrapped_critic
 
-        states = self.env.reset()
+        all_episode_memories = []
 
-        memories = []
+        for _ in range(num_episodes):
 
-        for _ in range(steps):
+            states = self.env.reset()
 
-            sampled_actions, replay_tensors = temp_batch_dim(actor)(
-                *states,
-                trajectory_length = trajectory_length,
-                steps = flow_sampling_steps,
-                return_states_for_replay = True,
-                temperature = temperature,
-                **sampling_kwargs
-            )
+            memories = []
 
-            next_states, reward, truncated, terminated = self.env.step(sampled_actions)
+            for _ in range(steps):
 
-            memories.append(to_device([*states, reward, terminated, *replay_tensors], torch.device('cpu')))
+                sampled_actions, values = temp_batch_dim(actor)(
+                    *states,
+                    trajectory_length = trajectory_length,
+                    steps = flow_sampling_steps,
+                    critic = critic,
+                    **sampling_kwargs
+                )
 
-            states = next_states
+                next_states, reward, truncated, terminated = self.env.step(sampled_actions)
+
+                memories.append(to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu')))
+
+                states = next_states
+
+            stacked_memories = tuple(map(torch.stack, zip(*memories)))
+
+            all_episode_memories.append(stacked_memories)
 
         self.accelerate.wait_for_everyone()
 
-        return memories
+        return all_episode_memories
 
     def learn_agent(
         self,
@@ -2539,52 +2478,39 @@ class EPO(Module):
             rewards,
             terminated,
             actions,
-            timesteps,
-            sampled_flows,
-            log_probs
+            old_values
         ) = map(torch.stack, zip(*memories))
 
         flow_timesteps = actions.shape[1]
 
-        values, _ = self.agent.critic(
-            repeat(images, 't ... -> (t ft) ...', ft = flow_timesteps),
-            repeat(commands, 't ... -> (t ft) ...', ft = flow_timesteps),
-            repeat(joint_state, 't ... -> (t ft) ...', ft = flow_timesteps),
-            actions = rearrange(actions, 't ft ... -> (t ft) ...'),
-            times = rearrange(timesteps, 't ft ... -> (t ft) ...')
-        )
-
-        values = rearrange(values, '(t ft) -> ft t', ft = flow_timesteps)
-        values = values.detach().cpu()
-
         # actions go out into the environment, rewards are received, generalized advantage calculated with critic values
 
-        boundaries = repeat(terminated, 't -> ft t', ft = flow_timesteps)
+        boundaries = terminated
 
-        advantages = calc_generalized_advantage_estimate(rewards, values, boundaries, use_accelerated = False).detach()
+        advantages = calc_generalized_advantage_estimate(rewards, old_values, boundaries, use_accelerated = False).detach()
 
-        # move time back to first dimension to be batched for learning
-
-        advantages = rearrange(advantages, 'ft t -> t ft')
-        values = rearrange(values, 'ft t -> t ft')
-
-        # dataset and dataloader
-
-        dataset = TensorDataset(
+        data_tensors = (
             images,
             commands,
             joint_state,
             rewards,
             terminated,
             actions,
-            timesteps,
-            sampled_flows,
-            log_probs,
-            values,
+            old_values,
             advantages
         )
 
+        data_tensors = tuple(rearrange(t, 'b t ... -> (b t) ...') for t in data_tensors)
+
+        # dataset and dataloader
+
+        dataset = TensorDataset(*data_tensors)
+
         dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
+
+        # copy of old actor
+
+        old_actor = deepcopy(self.unwrapped_actor)
 
         # training loop
 
@@ -2596,23 +2522,16 @@ class EPO(Module):
                 rewards,
                 terminated,
                 actions,
-                timesteps,
-                sampled_flows,
-                log_probs,
-                values,
+                old_values,
                 advantages
             ) in dataloader:
-
-                # optimize policy with replay tensors from above
 
                 actor_loss = self.agent.actor.forward_for_policy_loss(
                     images,
                     commands,
                     joint_state,
                     actions,
-                    times = timesteps,
-                    flow = sampled_flows,
-                    old_log_probs = log_probs,
+                    old_actor = old_actor,
                     advantages = advantages,
                 )
 
@@ -2626,11 +2545,11 @@ class EPO(Module):
                 self.agent.actor_optim.zero_grad()
 
                 critic_loss = self.agent.critic.forward_for_critic_loss(
-                    repeat(images, 't ... -> (ft t) ...', ft = flow_timesteps),
-                    repeat(commands, 't ... -> (ft t) ...', ft = flow_timesteps),
-                    repeat(joint_state, 't ... -> (ft t) ...', ft = flow_timesteps),
-                    rearrange(actions, 't ft ... -> (ft t) ...'),
-                    old_values = values,
+                    images,
+                    commands,
+                    joint_state,
+                    actions,
+                    old_values = old_values,
                     advantages = advantages,
                 )
 

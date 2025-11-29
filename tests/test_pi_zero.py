@@ -97,10 +97,12 @@ def test_pi_zero_with_vit(
 @param('num_latent_genes', (1, 16))
 @param('model_predict_output', ('flow', 'clean'))
 @param('use_spo', (False, True))
-def test_policy_optimization(
+@param('use_asymmetric_spo', (False, True))
+def test_flow_policy_optimization(
     num_latent_genes,
     model_predict_output,
-    use_spo
+    use_spo,
+    use_asymmetric_spo
 ):
 
     from vit_pytorch import ViT
@@ -108,7 +110,7 @@ def test_policy_optimization(
 
     from pi_zero_pytorch.pi_zero import (
         Agent,
-        EPO,
+        EFPO,
     )
 
     from pi_zero_pytorch.mock_env import Env
@@ -136,9 +138,9 @@ def test_policy_optimization(
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 32,
-        policy_optimizable = True,
         model_predict_output = model_predict_output,
-        use_spo = use_spo
+        use_spo = use_spo,
+        use_asymmetric_spo = use_asymmetric_spo
     ).to(device)
 
     images = torch.randn(2, 3, 2, 256, 256)
@@ -159,7 +161,7 @@ def test_policy_optimization(
 
     mock_env = Env((256, 256), 2, 32, 1024, 12)
 
-    epo = EPO(
+    epo = EFPO(
         agent,
         mock_env,
         accelerate_kwargs = dict(
@@ -206,7 +208,6 @@ def test_evo_strat():
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 32,
-        policy_optimizable = True,
     ).to(device)
 
     # for parallelism
@@ -287,6 +288,6 @@ def test_value(
     assert values.shape == (1,)
     assert logits.shape == (1, 50)
 
-    loss = model.forward_for_critic_loss(vision, commands, joint_state, actions, times = times, old_values = values, advantages = values, value_clip = value_clip)
+    loss = model.forward_for_critic_loss(vision, commands, joint_state, actions, old_values = values, advantages = values, value_clip = value_clip)
 
     assert loss.numel() == 1
