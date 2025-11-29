@@ -53,11 +53,7 @@ sampled_actions = model(vision, commands, joint_state, trajectory_length = 32) #
 To do online learning, just wrap the model with the `Agent` class
 
 ```python
-from pi_zero_pytorch import π0, Agent, EFPO
-
-# wrap the model with `Agent`, which will instantiate actor and critic for PPO
-
-agent = Agent(model)
+from pi_zero_pytorch import π0, EFPO
 
 # you'll want to supply your own environment
 
@@ -66,7 +62,7 @@ mock_env = Env((256, 256), 2, 32, 1024, 12)
 
 # pass your agent and environment to EFPO for learning to be orchestrated
 
-epo = EFPO(agent, mock_env)
+epo = EFPO(model, mock_env)
 
 # gather memories from environment
 

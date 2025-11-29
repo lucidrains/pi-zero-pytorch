@@ -27,7 +27,7 @@ from scipy.optimize import linear_sum_assignment
 
 from ema_pytorch import EMA
 
-from adam_atan2_pytorch import AdoptAtan2
+from adam_atan2_pytorch import AdamAtan2
 
 from rotary_embedding_torch import (
     RotaryEmbedding,
@@ -1184,6 +1184,8 @@ class PiZero(Module):
 
         self.is_critic = is_critic
 
+        self.critic_use_discrete_bins = critic_use_discrete_bins
+
         if critic_use_discrete_bins:
             self.to_critic_value = BinnedValueLayer(
                 dim,
@@ -2321,13 +2323,14 @@ class Agent(Module):
     def __init__(
         self,
         model: PiZero,
-        optim_klass = AdoptAtan2,
+        optim_klass = AdamAtan2,
         num_latent_genes = 1,
         actor_lr = 3e-4,
         critic_lr = 3e-4,
         actor_weight_decay = 1e-3,
         critic_weight_decay = 1e-3,
         max_grad_norm = 0.5,
+        critic_use_discrete_bins = False,
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
         latent_gene_pool_kwargs: dict = dict(
@@ -2355,7 +2358,7 @@ class Agent(Module):
             actor = model.create_actor(dim_latent = dim_latent)
 
         self.actor = actor
-        self.critic = actor.create_critic()
+        self.critic = actor.create_critic(critic_use_discrete_bins = critic_use_discrete_bins)
 
         # gradient clipping
 
@@ -2378,15 +2381,22 @@ class Agent(Module):
     ):
         raise NotImplementedError
 
+# online
+
 class EFPO(Module):
     def __init__(
         self,
-        agent: Agent,
+        agent_or_model: Agent | PiZero,
         env,
         accelerate_kwargs: dict = dict()
     ):
         super().__init__()
         self.accelerate = Accelerator(**accelerate_kwargs)
+
+        if isinstance(agent_or_model, PiZero):
+            agent = Agent(agent_or_model)
+        else:
+            agent = agent_or_model
 
         self.agent = agent
         self.env = env
@@ -2568,6 +2578,26 @@ class EFPO(Module):
                 self.agent.take_genetic_algorithm_step_(fitnesses)
 
         self.step.add_(1)
+
+# offline
+
+class PiZeroSix(Module):
+    def __init__(
+        self,
+        agent_or_model: PiZero | Agent
+    ):
+        super().__init__()
+
+        if isinstance(agent_or_model, PiZero):
+            agent = Agent(agent_or_model, critic_use_discrete_bins = True)
+        else:
+            agent = agent_or_model
+
+        self.agent = agent
+
+        assert agent.critic.critic_use_discrete_bins, 'they use discretized values'
+
+        raise NotImplementedError
 
 # fun
 
