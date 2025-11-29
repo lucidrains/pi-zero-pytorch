@@ -1646,6 +1646,7 @@ class PiZero(Module):
         norm_eps = 1e-5,
         num_monte_carlo = 2,
         loss_clamp_value = 5.,
+        fpo_loss_fn = F.huber_loss,
         **kwargs,
     ):
         batch = actions.shape[0]
@@ -1692,8 +1693,8 @@ class PiZero(Module):
         # proposed by fpo++ paper for legged robots
         # https://openreview.net/forum?id=BA6n0nmagi
 
-        flow_loss = F.mse_loss(pred_flow, target_flow, reduction = 'none')
-        old_flow_loss = F.mse_loss(old_pred_flow, target_flow, reduction = 'none')
+        flow_loss = fpo_loss_fn(pred_flow, target_flow, reduction = 'none')
+        old_flow_loss = fpo_loss_fn(old_pred_flow, target_flow, reduction = 'none')
 
         loss_diff = (flow_loss - old_flow_loss.detach())
 
@@ -2330,6 +2331,7 @@ class Agent(Module):
         actor_weight_decay = 1e-3,
         critic_weight_decay = 1e-3,
         max_grad_norm = 0.5,
+        actor_fpo_loss_fn = F.huber_loss,
         critic_use_discrete_bins = False,
         actor_optim_kwargs: dict = dict(),
         critic_optim_kwargs: dict = dict(),
@@ -2359,6 +2361,10 @@ class Agent(Module):
 
         self.actor = actor
         self.critic = actor.create_critic(critic_use_discrete_bins = critic_use_discrete_bins)
+
+        # fpo related
+
+        self.actor_fpo_loss_fn = actor_fpo_loss_fn
 
         # gradient clipping
 
@@ -2479,6 +2485,8 @@ class EFPO(Module):
         epochs = 2,
         batch_size = 16
     ):
+        actor_fpo_loss_fn = self.agent.actor_fpo_loss_fn
+
         self.agent.train()
 
         (
@@ -2543,6 +2551,7 @@ class EFPO(Module):
                     actions,
                     old_actor = old_actor,
                     advantages = advantages,
+                    fpo_loss_fn = actor_fpo_loss_fn
                 )
 
                 actor_loss.backward()
