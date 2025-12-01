@@ -291,3 +291,15 @@ def test_value(
     loss = model.forward_for_critic_loss(vision, commands, joint_state, actions, old_values = values, advantages = values, value_clip = value_clip)
 
     assert loss.numel() == 1
+
+def test_pi_zero_six():
+    from pi_zero_pytorch.pi_zero import PiZeroSix
+
+    model = π0(
+        dim = 512,
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 20_000
+    )
+
+    model = PiZeroSix(model)

@@ -54,6 +54,8 @@ import tqdm
 
 from accelerate import Accelerator
 
+from pydantic import BaseModel, Field, model_validator
+
 # ein notation
 
 # b - batch
@@ -2590,12 +2592,101 @@ class EFPO(Module):
 
 # offline
 
+class PhaseConfig(BaseModel):
+    advantage_lookahead: int = Field(..., description = "-1 for full episode.")
+    positive_data_fraction: float = Field(..., ge = 0.0, le = 1.0)
+    percentile_cutoff: int = Field(..., ge = 0, le = 100)
+
+class TaskConfig(BaseModel):
+    max_episode_length_seconds: int
+    pretrain: PhaseConfig
+    finetune: PhaseConfig
+
+class RecapGlobalConfig(BaseModel):
+    tasks: dict[str, TaskConfig]
+
+DEFAULT_RECAP_CONFIG = dict(
+    tasks = dict(
+        laundry_tshirt_shorts = dict(
+            max_episode_length_seconds = 200,
+            pretrain = dict(
+                advantage_lookahead = -1,
+                positive_data_fraction = 0.30,
+                percentile_cutoff = 70
+            ),
+            finetune = dict(
+                advantage_lookahead = 50,
+                positive_data_fraction = 0.10,
+                percentile_cutoff = 90
+            )
+        ),
+        laundry_diverse = dict(
+            max_episode_length_seconds = 500,
+            pretrain = dict(
+                advantage_lookahead = -1,
+                positive_data_fraction = 0.30,
+                percentile_cutoff = 70
+            ),
+            finetune = dict(
+                advantage_lookahead = 50,
+                positive_data_fraction = 0.40,
+                percentile_cutoff = 60
+            )
+        ),
+        cafe_espresso = dict(
+            max_episode_length_seconds = 200,
+            pretrain = dict(
+                advantage_lookahead = -1,
+                positive_data_fraction = 0.30,
+                percentile_cutoff = 70
+            ),
+            finetune = dict(
+                advantage_lookahead = 50,
+                positive_data_fraction = 0.40,
+                percentile_cutoff = 60
+            )
+        ),
+        box_assembly = dict(
+            max_episode_length_seconds = 600,
+            pretrain = dict(
+                advantage_lookahead = -1,
+                positive_data_fraction = 0.30,
+                percentile_cutoff = 70
+            ),
+            finetune = dict(
+                advantage_lookahead = 50,
+                positive_data_fraction = 0.40,
+                percentile_cutoff = 60
+            )
+        ),
+        laundry_failure_removal_ablation = dict(
+            max_episode_length_seconds = 200,
+            pretrain = dict(
+                advantage_lookahead = -1,
+                positive_data_fraction = 0.30,
+                percentile_cutoff = 70
+            ),
+            finetune = dict(
+                advantage_lookahead = 50,
+                positive_data_fraction = 0.40,
+                percentile_cutoff = 60
+            )
+        )
+    )
+)
+
 class PiZeroSix(Module):
     def __init__(
         self,
-        agent_or_model: PiZero | Agent
+        agent_or_model: PiZero | Agent,
+        config: dict | RecapConfig = DEFAULT_RECAP_CONFIG
     ):
         super().__init__()
+
+        if isinstance(config, dict):
+            config = RecapGlobalConfig(**config)
+
+        self.config = config
 
         if isinstance(agent_or_model, PiZero):
             agent = Agent(agent_or_model, critic_use_discrete_bins = True)
