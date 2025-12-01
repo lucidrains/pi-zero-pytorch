@@ -2592,17 +2592,17 @@ class EFPO(Module):
 
 # offline
 
-class PhaseConfig(BaseModel):
+class TrainConfig(BaseModel):
     advantage_lookahead: int = Field(..., description = "-1 for full episode.")
     positive_data_fraction: float = Field(..., ge = 0.0, le = 1.0)
     percentile_cutoff: int = Field(..., ge = 0, le = 100)
 
 class TaskConfig(BaseModel):
     max_episode_length_seconds: int
-    pretrain: PhaseConfig
-    finetune: PhaseConfig
+    pretrain: TrainConfig
+    finetune: TrainConfig
 
-class RecapGlobalConfig(BaseModel):
+class RecapConfig(BaseModel):
     tasks: dict[str, TaskConfig]
 
 DEFAULT_RECAP_CONFIG = dict(
@@ -2684,7 +2684,7 @@ class PiZeroSix(Module):
         super().__init__()
 
         if isinstance(config, dict):
-            config = RecapGlobalConfig(**config)
+            config = RecapConfig(**config)
 
         self.config = config
 
@@ -2696,8 +2696,6 @@ class PiZeroSix(Module):
         self.agent = agent
 
         assert agent.critic.critic_use_discrete_bins, 'they use discretized values'
-
-        raise NotImplementedError
 
 # fun
 
