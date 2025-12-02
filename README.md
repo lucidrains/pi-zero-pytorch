@@ -310,4 +310,16 @@ That's it
 }
 ```
 
+```bibtex
+@misc{li2025grrlgoingdexterousprecise,
+    title   = {GR-RL: Going Dexterous and Precise for Long-Horizon Robotic Manipulation}, 
+    author={Yunfei Li and Xiao Ma and Jiafeng Xu and Yu Cui and Zhongren Cui and Zhigang Han and Liqun Huang and Tao Kong and Yuxiao Liu and Hao Niu and Wanli Peng and Jingchao Qiao and Zeyu Ren and Haixin Shi and Zhi Su and Jiawen Tian and Yuyang Xiao and Shenyu Zhang and Liwei Zheng and Hang Li and Yonghui Wu},
+    year    = {2025},
+    eprint  = {2512.01801},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2512.01801}, 
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
