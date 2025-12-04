@@ -1213,6 +1213,7 @@ class PiZero(Module):
 
         # advantage tokens and cfg related
 
+        self.num_advantage_tokens = num_advantage_tokens
         self.can_advantage_token_cond = num_advantage_tokens > 0
 
         if self.can_advantage_token_cond:
@@ -2395,11 +2396,11 @@ class EFPO(Module):
     def __init__(
         self,
         agent_or_model: Agent | PiZero,
-        env,
+        cpu = False,
         accelerate_kwargs: dict = dict()
     ):
         super().__init__()
-        self.accelerate = Accelerator(**accelerate_kwargs)
+        self.accelerate = Accelerator(cpu = cpu, **accelerate_kwargs)
 
         if isinstance(agent_or_model, PiZero):
             agent = Agent(agent_or_model)
@@ -2407,7 +2408,6 @@ class EFPO(Module):
             agent = agent_or_model
 
         self.agent = agent
-        self.env = env
 
         (
             agent.actor,
@@ -2437,6 +2437,7 @@ class EFPO(Module):
     @torch.no_grad()
     def gather_experience_from_env(
         self,
+        env,
         steps,
         num_episodes = 1,
         trajectory_length = 16,
@@ -2452,7 +2453,7 @@ class EFPO(Module):
 
         for _ in range(num_episodes):
 
-            states = self.env.reset()
+            states = env.reset()
 
             memories = []
 
@@ -2463,10 +2464,11 @@ class EFPO(Module):
                     trajectory_length = trajectory_length,
                     steps = flow_sampling_steps,
                     critic = critic,
+
                     **sampling_kwargs
                 )
 
-                next_states, reward, truncated, terminated = self.env.step(sampled_actions)
+                next_states, reward, truncated, terminated = env.step(sampled_actions)
 
                 memories.append(to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu')))
 
@@ -2679,14 +2681,24 @@ class PiZeroSix(Module):
     def __init__(
         self,
         agent_or_model: PiZero | Agent,
-        config: dict | RecapConfig = DEFAULT_RECAP_CONFIG
+        config: dict | RecapConfig = DEFAULT_RECAP_CONFIG,
+        cpu = False,
+        accelerate_kwargs: dict = dict()
     ):
         super().__init__()
+
+        # accelerate
+
+        self.accelerate = Accelerator(cpu = cpu, **accelerate_kwargs)
+
+        # config
 
         if isinstance(config, dict):
             config = RecapConfig(**config)
 
         self.config = config
+
+        # agent
 
         if isinstance(agent_or_model, PiZero):
             agent = Agent(agent_or_model, critic_use_discrete_bins = True)
@@ -2695,7 +2707,79 @@ class PiZeroSix(Module):
 
         self.agent = agent
 
+        assert agent.actor.can_advantage_token_cond, '`num_advantage_tokens` must be set to greater than 1 to employ the Pi0.6 learning from experience scheme'
+
         assert agent.critic.critic_use_discrete_bins, 'they use discretized values'
+
+        # wrapping
+
+        agent.actor, agent.critic = self.accelerate.prepare(agent.actor, agent.critic)
+
+    @property
+    def unwrapped_actor(self):
+        return self.accelerate.unwrap_model(self.agent.actor)
+
+    @property
+    def unwrapped_critic(self):
+        return self.accelerate.unwrap_model(self.agent.critic)
+
+    @torch.no_grad()
+    def gather_experience_from_env(
+        self,
+        env,
+        steps,
+        num_episodes = 1,
+        trajectory_length = 16,
+        flow_sampling_steps = 4,
+        cond_scale = 1.,
+        **sampling_kwargs
+    ):
+        assert cond_scale > 0., f'classifier free guidance scaling must be enabled for proposed pi0.6'
+
+        self.agent.eval()
+
+        actor = self.unwrapped_actor
+        critic = self.unwrapped_critic
+
+        all_episode_memories = []
+
+        # during roll out for gathering experience, they use positive advantage w/ cfg
+
+        highest_advantage_id = actor.num_advantage_tokens - 1
+
+        # mock env
+
+        for _ in range(num_episodes):
+
+            states = env.reset()
+
+            memories = []
+
+            for _ in range(steps):
+
+                sampled_actions, values = temp_batch_dim(actor)(
+                    *states,
+                    trajectory_length = trajectory_length,
+                    steps = flow_sampling_steps,
+                    critic = critic,
+                    advantage_ids = highest_advantage_id,
+                    cond_scale = cond_scale,
+                    **sampling_kwargs
+                )
+
+                next_states, reward, truncated, terminated = env.step(sampled_actions)
+
+                memories.append(to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu')))
+
+                states = next_states
+
+            stacked_memories = tuple(map(torch.stack, zip(*memories)))
+
+            all_episode_memories.append(stacked_memories)
+
+        self.accelerate.wait_for_everyone()
+
+        return all_episode_memories
 
 # fun
 

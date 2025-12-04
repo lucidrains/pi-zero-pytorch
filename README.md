@@ -1,6 +1,6 @@
 <img src="./fig3.png" width="400px"></img>
 
-## pi-zero-pytorch (wip)
+## pi-zero-pytorch
 
 Implementation of <a href="https://www.physicalintelligence.company/blog/pi0">π₀</a> the robotic foundation model architecture proposed by Physical Intelligence
 
@@ -50,7 +50,7 @@ loss.backward()
 sampled_actions = model(vision, commands, joint_state, trajectory_length = 32) # (1, 32, 6)
 ```
 
-To do online learning, just wrap the model with the `Agent` class
+To do online learning, just wrap the model with the `EFPO` class
 
 ```python
 from pi_zero_pytorch import π0, EFPO
@@ -62,11 +62,11 @@ mock_env = Env((256, 256), 2, 32, 1024, 12)
 
 # pass your agent and environment to EFPO for learning to be orchestrated
 
-epo = EFPO(model, mock_env)
+epo = EFPO(model)
 
 # gather memories from environment
 
-memories = epo.gather_experience_from_env(steps = 10)
+memories = epo.gather_experience_from_env(mock_env, steps = 10)
 
 # learn from memories
 

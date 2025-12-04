@@ -163,13 +163,10 @@ def test_flow_policy_optimization(
 
     epo = EFPO(
         agent,
-        mock_env,
-        accelerate_kwargs = dict(
-            cpu = True
-        )
+        cpu = True,
     )
 
-    memories = epo.gather_experience_from_env(steps = 4)
+    memories = epo.gather_experience_from_env(mock_env, steps = 4)
 
     epo.learn_agent(memories, batch_size = 2)
 
@@ -293,13 +290,45 @@ def test_value(
     assert loss.numel() == 1
 
 def test_pi_zero_six():
-    from pi_zero_pytorch.pi_zero import PiZeroSix
+    from pi_zero_pytorch import π0, PiZeroSix
+
+    from vit_pytorch import ViT
+    from vit_pytorch.extractor import Extractor
+
+    v = ViT(
+        image_size = 256,
+        patch_size = 32,
+        num_classes = 1000,
+        dim = 32,
+        depth = 1,
+        heads = 16,
+        dim_head = 16,
+        mlp_dim = 64,
+        dropout = 0.1,
+        emb_dropout = 0.1
+    )
+
+    v = Extractor(v, return_embeddings_only = True)
 
     model = π0(
+        vit = v,
+        vit_dim = 32,
         dim = 512,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000
+        num_tokens = 20_000,
+        num_advantage_tokens = 2
     )
 
-    model = PiZeroSix(model)
+    # you'll want to supply your own environment
+
+    from pi_zero_pytorch.mock_env import Env
+    mock_env = Env((256, 256), 2, 32, 1024, 12)
+
+    # pass your agent and environment to PiZeroSix for learning to be orchestrated
+
+    pi_zero_six = PiZeroSix(model)
+
+    # gather memories from environment
+
+    memories = pi_zero_six.gather_experience_from_env(mock_env, steps = 10)
