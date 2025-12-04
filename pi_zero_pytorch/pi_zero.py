@@ -2759,6 +2759,7 @@ class TaskConfig(BaseModel):
 
 class RecapConfig(BaseModel):
     tasks: dict[str, TaskConfig]
+    task_fail_penalty: float
 
 DEFAULT_RECAP_CONFIG = dict(
     tasks = dict(
@@ -2827,7 +2828,8 @@ DEFAULT_RECAP_CONFIG = dict(
                 percentile_cutoff = 60
             )
         )
-    )
+    ),
+    task_fail_penalty = -10  # they use a big negative constant for failures, when labeling the experiences - value network is bounded from -1. to 0 anyways so it works out
 )
 
 class PiZeroSix(Module):
@@ -2837,7 +2839,6 @@ class PiZeroSix(Module):
         config: dict | RecapConfig = DEFAULT_RECAP_CONFIG,
         cpu = False,
         accelerate_kwargs: dict = dict(),
-        fail_penalty = -10  # they use a big negative constant for failures, when labeling the experiences - value network is bounded from -1. to 0 anyways so it works out
     ):
         super().__init__()
 
@@ -2871,7 +2872,7 @@ class PiZeroSix(Module):
 
         # labeling
 
-        self.register_buffer('fail_penalty', tensor(fail_penalty))
+        self.register_buffer('task_fail_penalty', tensor(config.task_fail_penalty))
 
     @property
     def unwrapped_actor(self):
@@ -2882,7 +2883,14 @@ class PiZeroSix(Module):
         return self.accelerate.unwrap_model(self.agent.critic)
 
     @beartype
-    def set_episode_fail(
+    def calculate_advantages_(
+        self,
+        experiences: ReplayBuffer
+    ):
+        raise NotImplementedError
+
+    @beartype
+    def set_episode_fail_(
         self,
         experiences: ReplayBuffer,
         episode_id,
@@ -2897,7 +2905,7 @@ class PiZeroSix(Module):
             'reward',
             episode_id,
             timestep,
-            data = self.fail_penalty
+            data = self.task_fail_penalty
         )
 
         return experiences
@@ -2937,6 +2945,7 @@ class PiZeroSix(Module):
                 reward      = 'float',
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
+                advantages = 'float',
                 advantage_ids = ('int', actor.num_advantage_tokens)
             )
         )

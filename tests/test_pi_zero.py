@@ -335,4 +335,4 @@ def test_pi_zero_six():
 
     # labeling
 
-    pi_zero_six.set_episode_fail(experience_buffer, episode_id = 1)
+    pi_zero_six.set_episode_fail_(experience_buffer, episode_id = 1)
