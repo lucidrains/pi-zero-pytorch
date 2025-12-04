@@ -331,4 +331,8 @@ def test_pi_zero_six():
 
     # gather experiences from environment
 
-    experience_buffer = pi_zero_six.gather_experience_from_env(mock_env, steps = 10)
+    experience_buffer = pi_zero_six.gather_experience_from_env(mock_env, steps = 10, num_episodes = 3)
+
+    # labeling
+
+    pi_zero_six.set_episode_fail(experience_buffer, episode_id = 1)

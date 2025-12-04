@@ -2869,6 +2869,10 @@ class PiZeroSix(Module):
 
         agent.actor, agent.critic = self.accelerate.prepare(agent.actor, agent.critic)
 
+        # labeling
+
+        self.register_buffer('fail_penalty', tensor(fail_penalty))
+
     @property
     def unwrapped_actor(self):
         return self.accelerate.unwrap_model(self.agent.actor)
@@ -2876,6 +2880,27 @@ class PiZeroSix(Module):
     @property
     def unwrapped_critic(self):
         return self.accelerate.unwrap_model(self.agent.critic)
+
+    @beartype
+    def set_episode_fail(
+        self,
+        experiences: ReplayBuffer,
+        episode_id,
+        timestep = None
+    ):
+
+        if not exists(timestep):
+            max_len = self.episode_lens[episode_id]
+            timestep = max_len - 1
+
+        reward = experiences.store_datapoint(
+            'reward',
+            episode_id,
+            timestep,
+            data = self.fail_penalty
+        )
+
+        return experiences
 
     @torch.no_grad()
     def gather_experience_from_env(
