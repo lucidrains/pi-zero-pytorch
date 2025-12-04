@@ -329,6 +329,6 @@ def test_pi_zero_six():
 
     pi_zero_six = PiZeroSix(model)
 
-    # gather memories from environment
+    # gather experiences from environment
 
-    memories = pi_zero_six.gather_experience_from_env(mock_env, steps = 10)
+    experience_buffer = pi_zero_six.gather_experience_from_env(mock_env, steps = 10)

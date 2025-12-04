@@ -3,17 +3,25 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from random import random, randrange
+from pathlib import Path
 
 from beartype import beartype
+from beartype.door import is_bearable
 from beartype.typing import Callable, Literal
 
 from inspect import signature
+from contextlib import contextmanager
 from functools import partial, wraps
+from collections import namedtuple
 from itertools import count
+
+import numpy as np
+from numpy import ndarray
+from numpy.lib.format import open_memmap
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, cat, stack, tensor, is_tensor
+from torch import pi, nn, cat, stack, tensor, Tensor, is_tensor
 from torch.nn import Module, ModuleList
 from torch.distributions.beta import Beta
 
@@ -2474,7 +2482,7 @@ class EFPO(Module):
 
                 states = next_states
 
-            stacked_memories = tuple(map(torch.stack, zip(*memories)))
+            stacked_memories = tuple(map(stack, zip(*memories)))
 
             all_episode_memories.append(stacked_memories)
 
@@ -2501,7 +2509,7 @@ class EFPO(Module):
             terminated,
             actions,
             old_values
-        ) = map(torch.stack, zip(*memories))
+        ) = map(stack, zip(*memories))
 
         flow_timesteps = actions.shape[1]
 
@@ -2594,6 +2602,151 @@ class EFPO(Module):
 
 # offline
 
+class ReplayBuffer:
+
+    @beartype
+    def __init__(
+        self,
+        folder: str | Path,
+        max_episodes: int,
+        max_timesteps: int,
+        fields: dict[
+            str,
+            str | tuple[str, int | tuple[int, ...]]
+        ]
+    ):
+
+        # folder for data
+
+        if not isinstance(folder, Path):
+            folder = Path(folder)
+            folder.mkdir(exist_ok = True)
+
+        self.folder = folder
+        assert folder.is_dir()
+
+        # keeping track of episode length
+
+        episode_lens = folder / 'episode_lens.npy'
+
+        self.episode_index = 0
+        self.timestep_index = 0
+
+        self.max_episodes = max_episodes
+        self.max_timesteps= max_timesteps
+
+        self.episode_lens = open_memmap(str(episode_lens), mode = 'w+', dtype = np.int32, shape = (max_episodes,))
+
+        # create the memmap for individual data tracks
+
+        self.shapes = dict()
+        self.dtypes = dict()
+        self.memmaps = dict()
+        self.fieldnames = set(fields.keys())
+
+        for field_name, field_info in fields.items():
+
+            # some flexibility
+
+            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
+
+            dtype_str, shape = field_info
+            assert dtype_str in {'int', 'float', 'bool'}
+
+            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+
+            # memmap file
+
+            filepath = folder / f'{field_name}.data.npy'
+
+            if isinstance(shape, int):
+                shape = (shape,)
+
+            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
+
+            self.memmaps[field_name] = memmap
+            self.shapes[field_name] = shape
+            self.dtypes[field_name] = dtype
+
+        self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
+
+    def __len__(self):
+        return (self.episode_lens > 0).sum().item()
+
+    def reset_(self):
+        self.episode_lens[:] = 0
+        self.episode_index = 0
+        self.timestep_index = 0
+
+    def advance_episode(self):
+        self.episode_index = (self.episode_index + 1) % self.max_episodes
+        self.timestep_index = 0
+
+    def flush(self):
+        self.episode_lens[self.episode_index] = self.timestep_index
+
+        for memmap in self.memmaps.values():
+            memmap.flush()
+
+        self.episode_lens.flush()
+
+    @contextmanager
+    def one_episode(self):
+
+        yield
+
+        self.flush()
+        self.advance_episode()
+
+    @beartype
+    def store_datapoint(
+        self,
+        episode_index: int,
+        timestep_index: int,
+        name: str,
+        datapoint: Tensor | ndarray
+    ):
+        assert 0 <= episode_index < self.max_episodes
+        assert 0 <= timestep_index < self.max_timesteps
+
+        if is_tensor(datapoint):
+            datapoint = datapoint.detach().cpu().numpy()
+
+        assert name in self.fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+
+        assert datapoint.shape == self.shapes[name], f'invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
+
+        self.memmaps[name][self.episode_index, self.timestep_index] = datapoint
+
+    def store(
+        self,
+        **data
+    ):
+        assert is_bearable(data, dict[str, Tensor | ndarray])
+
+        assert not self.timestep_index >= self.max_timesteps, 'you exceeded the `max_timesteps` set on the replay buffer'
+
+        for name, datapoint in data.items():
+
+            self.store_datapoint(self.episode_index, self.timestep_index, name, datapoint)
+
+        self.timestep_index += 1
+
+        # determine what fields are missing and just default to nothing
+
+        missing_fields = self.fieldnames - set(data.keys())
+
+        for missing_field in missing_fields:
+            dtype = self.dtypes[missing_field]
+            shape = self.shapes[missing_field]
+            data.update(**{missing_field: np.zeros(shape, dtype = dtype)})
+
+        # store
+
+        return self.memory_namedtuple(**data)
+
+# 0.6 related hyperparameters
+
 class TrainConfig(BaseModel):
     advantage_lookahead: int = Field(..., description = "-1 for full episode.")
     positive_data_fraction: float = Field(..., ge = 0.0, le = 1.0)
@@ -2683,7 +2836,8 @@ class PiZeroSix(Module):
         agent_or_model: PiZero | Agent,
         config: dict | RecapConfig = DEFAULT_RECAP_CONFIG,
         cpu = False,
-        accelerate_kwargs: dict = dict()
+        accelerate_kwargs: dict = dict(),
+        fail_penalty = -10  # they use a big negative constant for failures, when labeling the experiences - value network is bounded from -1. to 0 anyways so it works out
     ):
         super().__init__()
 
@@ -2731,9 +2885,13 @@ class PiZeroSix(Module):
         num_episodes = 1,
         trajectory_length = 16,
         flow_sampling_steps = 4,
+        max_timesteps = 64,
         cond_scale = 1.,
-        **sampling_kwargs
-    ):
+        experience_path = './experiences',
+       **sampling_kwargs
+
+    ) -> ReplayBuffer:
+
         assert cond_scale > 0., f'classifier free guidance scaling must be enabled for proposed pi0.6'
 
         self.agent.eval()
@@ -2741,7 +2899,22 @@ class PiZeroSix(Module):
         actor = self.unwrapped_actor
         critic = self.unwrapped_critic
 
-        all_episode_memories = []
+        # replay buffer
+
+        experience_buffer = ReplayBuffer(
+            experience_path,
+            max_episodes = num_episodes,
+            max_timesteps = steps,
+            fields = dict(
+                images      = ('float', (3, env.num_images, *env.image_shape)),
+                text        = ('int', (env.max_text_len,)),
+                internal    = ('float', (env.joint_dim,)),
+                reward      = 'float',
+                actions     = ('float', (trajectory_length, actor.dim_action_input)),
+                terminated  = 'bool',
+                advantage_ids = ('int', actor.num_advantage_tokens)
+            )
+        )
 
         # during roll out for gathering experience, they use positive advantage w/ cfg
 
@@ -2753,33 +2926,39 @@ class PiZeroSix(Module):
 
             states = env.reset()
 
-            memories = []
+            with experience_buffer.one_episode():
 
-            for _ in range(steps):
+                for _ in range(steps):
 
-                sampled_actions, values = temp_batch_dim(actor)(
-                    *states,
-                    trajectory_length = trajectory_length,
-                    steps = flow_sampling_steps,
-                    critic = critic,
-                    advantage_ids = highest_advantage_id,
-                    cond_scale = cond_scale,
-                    **sampling_kwargs
-                )
+                    sampled_actions, values = temp_batch_dim(actor)(
+                        *states,
+                        trajectory_length = trajectory_length,
+                        steps = flow_sampling_steps,
+                        critic = critic,
+                        advantage_ids = highest_advantage_id,
+                        cond_scale = cond_scale,
+                        **sampling_kwargs
+                    )
 
-                next_states, reward, truncated, terminated = env.step(sampled_actions)
+                    next_states, reward, truncated, terminated = env.step(sampled_actions)
 
-                memories.append(to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu')))
+                    images, text, internal, reward, terminated, actions, values = to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu'))
 
-                states = next_states
+                    states = next_states
 
-            stacked_memories = tuple(map(torch.stack, zip(*memories)))
+                    experience_buffer.store(
+                        images = images,
+                        text = text,
+                        internal = internal,
+                        reward = reward,
+                        actions = sampled_actions,
+                        terminated = terminated,
+                    )
 
-            all_episode_memories.append(stacked_memories)
 
         self.accelerate.wait_for_everyone()
 
-        return all_episode_memories
+        return experience_buffer
 
 # fun
 
