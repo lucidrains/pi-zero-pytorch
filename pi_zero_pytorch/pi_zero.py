@@ -2890,7 +2890,7 @@ class PiZeroSix(Module):
     ):
 
         if not exists(timestep):
-            max_len = self.episode_lens[episode_id]
+            max_len = experiences.episode_lens[episode_id]
             timestep = max_len - 1
 
         reward = experiences.store_datapoint(
