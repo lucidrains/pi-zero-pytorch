@@ -2632,7 +2632,8 @@ class ReplayBuffer:
         fields: dict[
             str,
             str | tuple[str, int | tuple[int, ...]]
-        ]
+        ],
+        circular = True,
     ):
 
         # folder for data
@@ -2690,6 +2691,10 @@ class ReplayBuffer:
 
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
 
+        # whether the buffer should loop back around - for online policy opt related
+
+        self.circular = circular
+
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
 
@@ -2700,6 +2705,8 @@ class ReplayBuffer:
         self.timestep_index = 0
 
     def advance_episode(self):
+        assert self.circular or self.num_episodes < self.max_episodes
+
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0
 
@@ -2716,6 +2723,7 @@ class ReplayBuffer:
 
     @contextmanager
     def one_episode(self):
+        assert self.circular or self.num_episodes < self.max_episodes
 
         yield
 
