@@ -317,7 +317,8 @@ def test_pi_zero_six():
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 20_000,
-        num_advantage_tokens = 2
+        num_advantage_tokens = 2,
+        num_tasks = 10
     )
 
     # you'll want to supply your own environment
@@ -331,7 +332,7 @@ def test_pi_zero_six():
 
     # gather experiences from environment
 
-    experience_buffer = pi_zero_six.gather_experience_from_env(mock_env, steps = 10, num_episodes = 3)
+    experience_buffer = pi_zero_six.gather_experience_from_env(mock_env, steps = 10, num_episodes = 3, task_id = 2)
 
     # labeling
 

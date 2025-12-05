@@ -21,7 +21,7 @@ from numpy.lib.format import open_memmap
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, cat, stack, tensor, Tensor, is_tensor
+from torch import pi, nn, cat, stack, tensor, Tensor, is_tensor, full
 from torch.nn import Module, ModuleList
 from torch.distributions.beta import Beta
 
@@ -281,8 +281,8 @@ def default_sample_times(
 ):
     """ they propose to sample times from Beta distribution - last part of appendix part B """
 
-    alpha = torch.full(shape, alpha, device = device)
-    beta = torch.full(shape, beta, device = device)
+    alpha = full(shape, alpha, device = device)
+    beta = full(shape, beta, device = device)
     sampled = Beta(alpha, beta).sample()
     return (1. - sampled) * s
 
@@ -1019,6 +1019,7 @@ class PiZero(Module):
         dim_latent = None,
         action_dit_norm_all_linears = True,  # Cheang et al. https://arxiv.org/abs/2507.15493v1 - in GR-3, Bytedance shares the finding that aggressive normalization of the action diffusion transformer (one after each linear), stabilizes training and greatly improves results
         predict_task_status_head = False,    # Cheang et al. https://arxiv.org/abs/2507.15493v1 - an important detail in the paper where they add a prediction head for task status; they generate negative pairs of language - action samples and force the network to predict "invalid" label. this made the robot follow the language significantly better.
+        num_tasks = None,
         num_task_status = 3,
         task_status_is_invalid = 2,          # the index for which the task status is invalid - `-1` in paper, but we'll do 2 here
         task_status_loss_weight = 1.,
@@ -1163,6 +1164,13 @@ class PiZero(Module):
         # unembedding
 
         self.state_to_logits = LinearNoBias(dim, num_tokens)
+
+        # explicit task conditioning without prompt
+
+        self.num_tasks = num_tasks
+        self.has_task_cond = exists(num_tasks) and num_tasks > 0
+
+        self.task_emb = nn.Embedding(num_tasks, dim) if self.has_task_cond else None
 
         # to task status prediction
 
@@ -1793,6 +1801,7 @@ class PiZero(Module):
         external_states: tuple[Float['b ...']] | None = None,
         record_and_return_memory_tokens = False,
         past_recurrent_memory_tokens: Float['b {self._nm} d'] | None = None,
+        task_id: Int['b'] | int | None = None,
         task_status: Int['b'] | None = None,
         advantage_ids: Int['b'] | int | None = None,
         return_actions_flow = False,
@@ -1957,7 +1966,7 @@ class PiZero(Module):
                 assert self.can_advantage_token_cond
 
                 if isinstance(advantage_ids, int):
-                    advantage_ids = torch.full((batch,), advantage_ids, device = self.device)
+                    advantage_ids = full((batch,), advantage_ids, device = self.device)
 
                 advantage_tokens = self.advantage_embed(advantage_ids)
             else:
@@ -1966,10 +1975,20 @@ class PiZero(Module):
             # maybe dropout reward or advantage tokens for cfg
 
             if self.training and sample(self.reward_tokens_dropout_prob):
-                reward_tokens = reward_tokens[:, 0:0]
+                reward_tokens = empty_token
 
             if self.training and sample(self.advantage_tokens_dropout_prob):
-                advantage_tokens = advantage_tokens[:, 0:0]
+                advantage_tokens = empty_token
+
+            # maybe task token
+
+            task_token = empty_token
+
+            if self.has_task_cond and exists(task_id):
+                if isinstance(task_id, int):
+                    task_id = full((batch,), task_id, device = self.device)
+
+                task_token = self.task_emb(task_id)
 
             # additional external states
 
@@ -1987,7 +2006,8 @@ class PiZero(Module):
                 visual_tokens,
                 language_tokens,
                 reward_tokens,
-                advantage_tokens
+                advantage_tokens,
+                task_token
             ], 'b * d')
 
         # take care of masking for variable lengthed states, starting with the language tokens
@@ -2472,7 +2492,6 @@ class EFPO(Module):
                     trajectory_length = trajectory_length,
                     steps = flow_sampling_steps,
                     critic = critic,
-
                     **sampling_kwargs
                 )
 
@@ -2921,6 +2940,7 @@ class PiZeroSix(Module):
         max_timesteps = 64,
         cond_scale = 1.,
         experience_path = './experiences',
+        task_id = -1,
        **sampling_kwargs
 
     ) -> ReplayBuffer:
@@ -2945,7 +2965,8 @@ class PiZeroSix(Module):
                 reward      = 'float',
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
-                advantages = 'float',
+                task_id     = 'int',
+                advantages  = 'float',
                 advantage_ids = ('int', actor.num_advantage_tokens)
             )
         )
@@ -2971,6 +2992,7 @@ class PiZeroSix(Module):
                         critic = critic,
                         advantage_ids = highest_advantage_id,
                         cond_scale = cond_scale,
+                        task_id = task_id,
                         **sampling_kwargs
                     )
 
@@ -2987,6 +3009,7 @@ class PiZeroSix(Module):
                         reward = reward,
                         actions = sampled_actions,
                         terminated = terminated,
+                        task_id = tensor(task_id)
                     )
 
 
