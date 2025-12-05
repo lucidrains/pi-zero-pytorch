@@ -2340,7 +2340,7 @@ def calc_generalized_advantage_estimate(
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
     values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[:, :-1], values[:, 1:]
+    values, values_next = values[..., :-1], values[..., 1:]
 
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
@@ -2648,6 +2648,7 @@ class ReplayBuffer:
 
         episode_lens = folder / 'episode_lens.npy'
 
+        self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
 
@@ -2660,7 +2661,7 @@ class ReplayBuffer:
 
         self.shapes = dict()
         self.dtypes = dict()
-        self.memmaps = dict()
+        self.data = dict()
         self.fieldnames = set(fields.keys())
 
         for field_name, field_info in fields.items():
@@ -2683,7 +2684,7 @@ class ReplayBuffer:
 
             memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
 
-            self.memmaps[field_name] = memmap
+            self.data[field_name] = memmap
             self.shapes[field_name] = shape
             self.dtypes[field_name] = dtype
 
@@ -2694,6 +2695,7 @@ class ReplayBuffer:
 
     def reset_(self):
         self.episode_lens[:] = 0
+        self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
 
@@ -2701,10 +2703,13 @@ class ReplayBuffer:
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0
 
+        self.num_episodes += 1
+        self.num_episodes = min(self.max_episodes, self.num_episodes)
+
     def flush(self):
         self.episode_lens[self.episode_index] = self.timestep_index
 
-        for memmap in self.memmaps.values():
+        for memmap in self.data.values():
             memmap.flush()
 
         self.episode_lens.flush()
@@ -2735,7 +2740,7 @@ class ReplayBuffer:
 
         assert datapoint.shape == self.shapes[name], f'invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
 
-        self.memmaps[name][self.episode_index, self.timestep_index] = datapoint
+        self.data[name][self.episode_index, self.timestep_index] = datapoint
 
     def store(
         self,
@@ -2904,9 +2909,45 @@ class PiZeroSix(Module):
     @beartype
     def calculate_advantages_(
         self,
-        experiences: ReplayBuffer
+        experiences: ReplayBuffer,
+        gamma = 0.99,
+        lam = 0.95,
+        use_accelerated = None
     ):
-        raise NotImplementedError
+
+        buffer = experiences
+
+        # todo - batch it, but given robotics is low data, doesn't matter
+
+        for episode_id in range(buffer.num_episodes):
+
+            episode_len = buffer.episode_lens[episode_id].item()
+
+            values = buffer.data['value'][episode_id, :episode_len]
+            rewards = buffer.data['reward'][episode_id, :episode_len]
+            terminated = buffer.data['terminated'][episode_id, :episode_len]
+
+            # extra insurance
+
+            terminated[episode_len - 1] = True
+
+            # todo - continue to reduce complexity for numpy to torch and back and move to lib
+
+            rewards, values, terminated = map(torch.from_numpy, (rewards, values, terminated))
+
+            advantages = calc_generalized_advantage_estimate(
+                rewards = rewards,
+                values = values,
+                masks = terminated,
+                gamma = gamma,
+                lam = lam,
+                use_accelerated = use_accelerated
+            )
+
+            # store advantages
+
+            buffer.data['advantages'][episode_id, :episode_len] = advantages.cpu().numpy()
+            buffer.flush()
 
     @beartype
     def set_episode_fail_(
@@ -2966,6 +3007,7 @@ class PiZeroSix(Module):
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
                 task_id     = 'int',
+                value       = 'float',
                 advantages  = 'float',
                 advantage_ids = ('int', actor.num_advantage_tokens)
             )
@@ -2985,7 +3027,7 @@ class PiZeroSix(Module):
 
                 for _ in range(steps):
 
-                    sampled_actions, values = temp_batch_dim(actor)(
+                    sampled_actions, value = temp_batch_dim(actor)(
                         *states,
                         trajectory_length = trajectory_length,
                         steps = flow_sampling_steps,
@@ -2998,7 +3040,7 @@ class PiZeroSix(Module):
 
                     next_states, reward, truncated, terminated = env.step(sampled_actions)
 
-                    images, text, internal, reward, terminated, actions, values = to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu'))
+                    images, text, internal, reward, terminated, actions, value = to_device([*states, reward, terminated, sampled_actions, value], torch.device('cpu'))
 
                     states = next_states
 
@@ -3009,7 +3051,8 @@ class PiZeroSix(Module):
                         reward = reward,
                         actions = sampled_actions,
                         terminated = terminated,
-                        task_id = tensor(task_id)
+                        task_id = tensor(task_id),
+                        value = value
                     )
 
 
