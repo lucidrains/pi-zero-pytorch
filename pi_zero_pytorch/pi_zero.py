@@ -2621,6 +2621,11 @@ class EFPO(Module):
 
 # offline
 
+FIELD_TYPE = dict[
+    str,
+    str | tuple[Literal['int', 'float', 'bool'], int | tuple[int, ...]]
+]
+
 class ReplayBuffer:
 
     @beartype
@@ -2629,10 +2634,8 @@ class ReplayBuffer:
         folder: str | Path,
         max_episodes: int,
         max_timesteps: int,
-        fields: dict[
-            str,
-            str | tuple[str, int | tuple[int, ...]]
-        ],
+        fields: FIELD_TYPE,
+        meta_fields: FIELD_TYPE = dict(),
         circular = True,
     ):
 
@@ -2658,6 +2661,14 @@ class ReplayBuffer:
 
         self.episode_lens = open_memmap(str(episode_lens), mode = 'w+', dtype = np.int32, shape = (max_episodes,))
 
+        def field_info_to_shape_dtype(field_info):
+            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
+
+            dtype_str, shape = field_info
+
+            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+            return shape, dtype
+
         # create the memmap for individual data tracks
 
         self.shapes = dict()
@@ -2667,14 +2678,7 @@ class ReplayBuffer:
 
         for field_name, field_info in fields.items():
 
-            # some flexibility
-
-            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
-
-            dtype_str, shape = field_info
-            assert dtype_str in {'int', 'float', 'bool'}
-
-            dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
+            shape, dtype = field_info_to_shape_dtype(field_info)
 
             # memmap file
 
@@ -2690,6 +2694,30 @@ class ReplayBuffer:
             self.dtypes[field_name] = dtype
 
         self.memory_namedtuple = namedtuple('Memory', list(fields.keys()))
+
+        # meta data
+
+        self.meta_shapes = dict()
+        self.meta_dtypes = dict()
+        self.meta_data = dict()
+        self.meta_fieldnames = set(meta_fields.keys())
+
+        for field_name, field_info in meta_fields.items():
+
+            shape, dtype = field_info_to_shape_dtype(field_info)
+
+            # memmap file
+
+            filepath = folder / f'{field_name}.meta.data.npy'
+
+            if isinstance(shape, int):
+                shape = (shape,)
+
+            memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, *shape))
+
+            self.meta_data[field_name] = memmap
+            self.meta_shapes[field_name] = shape
+            self.meta_dtypes[field_name] = dtype
 
         # whether the buffer should loop back around - for online policy opt related
 
@@ -2722,8 +2750,14 @@ class ReplayBuffer:
         self.episode_lens.flush()
 
     @contextmanager
-    def one_episode(self):
+    def one_episode(
+        self,
+        **meta_data
+    ):
         assert self.circular or self.num_episodes < self.max_episodes
+
+        for name, metadata in meta_data.items():
+            self.store_meta_datapoint(self.episode_index, name, metadata)
 
         yield
 
@@ -2749,6 +2783,24 @@ class ReplayBuffer:
         assert datapoint.shape == self.shapes[name], f'invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
 
         self.data[name][self.episode_index, self.timestep_index] = datapoint
+
+    @beartype
+    def store_meta_datapoint(
+        self,
+        episode_index: int,
+        name: str,
+        datapoint: Tensor | ndarray
+    ):
+        assert 0 <= episode_index < self.max_episodes
+
+        if is_tensor(datapoint):
+            datapoint = datapoint.detach().cpu().numpy()
+
+        assert name in self.meta_fieldnames, f'invalid field name {name} - must be one of {self.fieldnames}'
+
+        assert datapoint.shape == self.meta_shapes[name], f'invalid shape {datapoint.shape} - shape must be {self.shapes[name]}'
+
+        self.meta_data[name][self.episode_index] = datapoint
 
     def store(
         self,
@@ -2935,7 +2987,7 @@ class PiZeroSix(Module):
             rewards = buffer.data['reward'][episode_id, :episode_len]
             terminated = buffer.data['terminated'][episode_id, :episode_len]
 
-            # extra insurance
+            # extra insurance once moved to batched
 
             terminated[episode_len - 1] = True
 
@@ -2956,6 +3008,13 @@ class PiZeroSix(Module):
 
             buffer.data['advantages'][episode_id, :episode_len] = advantages.cpu().numpy()
             buffer.flush()
+
+    @beartype
+    def set_advantage_token_id_(
+        self,
+        experiences: ReplayBuffer
+    ):
+        raise NotImplementedError
 
     @beartype
     def set_episode_fail_(
@@ -3007,6 +3066,9 @@ class PiZeroSix(Module):
             experience_path,
             max_episodes = num_episodes,
             max_timesteps = steps,
+            meta_fields = dict(
+                task_id     = 'int'
+            ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),
                 text        = ('int', (env.max_text_len,)),
@@ -3014,7 +3076,6 @@ class PiZeroSix(Module):
                 reward      = 'float',
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
-                task_id     = 'int',
                 value       = 'float',
                 advantages  = 'float',
                 advantage_ids = ('int', actor.num_advantage_tokens)
@@ -3031,7 +3092,9 @@ class PiZeroSix(Module):
 
             states = env.reset()
 
-            with experience_buffer.one_episode():
+            with experience_buffer.one_episode(
+                task_id = tensor(task_id),
+            ):
 
                 for _ in range(steps):
 
@@ -3059,7 +3122,6 @@ class PiZeroSix(Module):
                         reward = reward,
                         actions = sampled_actions,
                         terminated = terminated,
-                        task_id = tensor(task_id),
                         value = value
                     )
 
