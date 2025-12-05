@@ -21,7 +21,7 @@ from numpy.lib.format import open_memmap
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, cat, stack, tensor, Tensor, is_tensor, full
+from torch import pi, nn, arange, cat, stack, tensor, Tensor, is_tensor, full, from_numpy
 from torch.nn import Module, ModuleList
 from torch.distributions.beta import Beta
 
@@ -291,7 +291,7 @@ def noise_assignment(data, noise):
     data, noise = tuple(rearrange(t, 'b ... -> b (...)') for t in (data, noise))
     dist = torch.cdist(data, noise)
     _, assign = linear_sum_assignment(dist.cpu())
-    return torch.from_numpy(assign).to(device)
+    return from_numpy(assign).to(device)
 
 # inpainting softmask, for real-time action chunking
 # https://arxiv.org/abs/2506.07339 - eq (5)
@@ -2650,7 +2650,6 @@ class ReplayBuffer:
 
         # keeping track of episode length
 
-        episode_lens = folder / 'episode_lens.npy'
 
         self.num_episodes = 0
         self.episode_index = 0
@@ -2659,7 +2658,9 @@ class ReplayBuffer:
         self.max_episodes = max_episodes
         self.max_timesteps= max_timesteps
 
-        self.episode_lens = open_memmap(str(episode_lens), mode = 'w+', dtype = np.int32, shape = (max_episodes,))
+        assert 'episode_lens' not in meta_fields
+
+        meta_fields.update(episode_lens = 'int')
 
         def field_info_to_shape_dtype(field_info):
             field_info = (field_info, ()) if isinstance(field_info, str) else field_info
@@ -2722,6 +2723,10 @@ class ReplayBuffer:
         # whether the buffer should loop back around - for online policy opt related
 
         self.circular = circular
+
+    @property
+    def episode_lens(self):
+        return self.meta_data['episode_lens']
 
     def __len__(self):
         return (self.episode_lens > 0).sum().item()
@@ -2937,6 +2942,10 @@ class PiZeroSix(Module):
 
         self.config = config
 
+        # task ids for now are implicitly the order of the keys
+
+        self.task_strings = list(config.tasks.keys())
+
         # agent
 
         if isinstance(agent_or_model, PiZero):
@@ -2993,7 +3002,7 @@ class PiZeroSix(Module):
 
             # todo - continue to reduce complexity for numpy to torch and back and move to lib
 
-            rewards, values, terminated = map(torch.from_numpy, (rewards, values, terminated))
+            rewards, values, terminated = map(from_numpy, (rewards, values, terminated))
 
             advantages = calc_generalized_advantage_estimate(
                 rewards = rewards,
@@ -3012,9 +3021,69 @@ class PiZeroSix(Module):
     @beartype
     def set_advantage_token_id_(
         self,
-        experiences: ReplayBuffer
+        experiences: ReplayBuffer,
+        num_advantages_sample = 10_000,
     ):
-        raise NotImplementedError
+        buffer = experiences
+        num_episodes = buffer.num_episodes
+        max_episodes = buffer.max_episodes
+        max_timesteps = buffer.max_timesteps
+
+        all_task_ids = from_numpy(buffer.meta_data['task_id'][:num_episodes])
+        episode_lens = from_numpy(buffer.meta_data['episode_lens'])
+
+        pos_advantage_token_id = self.unwrapped_actor.num_advantage_tokens - 1
+
+        for task_id in all_task_ids.unique().tolist():
+
+            task_str = self.task_strings[task_id]
+            task_config = self.config.tasks[task_str]
+
+            percentile_cutoff = task_config.finetune.percentile_cutoff
+
+            # sample and get the percentile cutoff for whether to set advantage to "positive" label
+
+            task_mask = all_task_ids == task_id
+
+            episode_ids = arange(max_episodes)
+
+            task_episode_ids = episode_ids[task_mask]
+
+            task_episode_ids = rearrange(task_episode_ids, 'e -> e 1')
+
+            timesteps = arange(max_timesteps)
+
+            indices_mask = einx.less('j, i -> i j', timesteps, episode_lens[task_mask])
+
+            timesteps = rearrange(timesteps, 't -> 1 t')
+
+            task_episode_ids, timesteps = torch.broadcast_tensors(task_episode_ids, timesteps)
+
+            indices = stack((task_episode_ids, timesteps), dim = -1)
+
+            indices = indices[indices_mask]
+
+            # maybe sample from all advantages
+
+            total_samples = indices.shape[0]
+
+            if total_samples > num_advantages_sample:
+                sampled_indices = indices
+            else:
+                randperm_indices = torch.randperm(total_samples)[:num_advantages_sample]
+                sampled_indices = indices[randperm_indices]
+
+            advantages = einx.get_at('[e t], b [2] -> b', buffer.data['advantages'], sampled_indices)
+
+            # determine the advantage at designated percentile per task
+
+            advantage_cutoff = torch.quantile(advantages, percentile_cutoff / 100)
+
+            advantage_token_ids = (advantages >= advantage_cutoff).int() # binary for now
+
+            # set it back
+
+            einx.set_at('[e t], b [2], b', buffer.data['advantage_ids'], sampled_indices, advantage_token_ids)
 
     @beartype
     def set_episode_fail_(
@@ -3078,7 +3147,7 @@ class PiZeroSix(Module):
                 terminated  = 'bool',
                 value       = 'float',
                 advantages  = 'float',
-                advantage_ids = ('int', actor.num_advantage_tokens),
+                advantage_ids = 'int',
                 task_id     = 'int'
             )
         )

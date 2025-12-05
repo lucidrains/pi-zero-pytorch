@@ -332,8 +332,12 @@ def test_pi_zero_six():
 
     # gather experiences from environment
 
-    experience_buffer = pi_zero_six.gather_experience_from_env(mock_env, steps = 10, num_episodes = 3, task_id = 2)
+    experience = pi_zero_six.gather_experience_from_env(mock_env, steps = 10, num_episodes = 3, task_id = 2)
 
     # labeling
 
-    pi_zero_six.set_episode_fail_(experience_buffer, episode_id = 1)
+    pi_zero_six.set_episode_fail_(experience, episode_id = 1)
+
+    pi_zero_six.calculate_advantages_(experience)
+
+    pi_zero_six.set_advantage_token_id_(experience)
