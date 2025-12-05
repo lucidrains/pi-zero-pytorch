@@ -3078,7 +3078,8 @@ class PiZeroSix(Module):
                 terminated  = 'bool',
                 value       = 'float',
                 advantages  = 'float',
-                advantage_ids = ('int', actor.num_advantage_tokens)
+                advantage_ids = ('int', actor.num_advantage_tokens),
+                task_id     = 'int'
             )
         )
 
@@ -3122,7 +3123,8 @@ class PiZeroSix(Module):
                         reward = reward,
                         actions = sampled_actions,
                         terminated = terminated,
-                        value = value
+                        value = value,
+                        task_id = tensor(task_id)
                     )
 
 
