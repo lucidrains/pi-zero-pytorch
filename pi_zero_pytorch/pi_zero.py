@@ -82,6 +82,8 @@ from pydantic import BaseModel, Field, model_validator
 # w - image width
 # f - image frames
 # s - residual streams (hyper connections paper)
+# e - episodes
+# t - time steps
 
 # token layout for transformer
 # vision and language tokens are autoregressive causal mask, actions, interal states + joint bidirectional amongst own tokens, but still autoregressive with respect to other tokens
@@ -2842,7 +2844,7 @@ class TrainConfig(BaseModel):
     percentile_cutoff: int = Field(..., ge = 0, le = 100)
 
 class TaskConfig(BaseModel):
-    max_episode_length_seconds: int
+    max_episode_length: int
     pretrain: TrainConfig
     finetune: TrainConfig
 
@@ -2853,7 +2855,7 @@ class RecapConfig(BaseModel):
 DEFAULT_RECAP_CONFIG = dict(
     tasks = dict(
         laundry_tshirt_shorts = dict(
-            max_episode_length_seconds = 200,
+            max_episode_length = 200,
             pretrain = dict(
                 advantage_lookahead = -1,
                 positive_data_fraction = 0.30,
@@ -2866,7 +2868,7 @@ DEFAULT_RECAP_CONFIG = dict(
             )
         ),
         laundry_diverse = dict(
-            max_episode_length_seconds = 500,
+            max_episode_length = 500,
             pretrain = dict(
                 advantage_lookahead = -1,
                 positive_data_fraction = 0.30,
@@ -2879,7 +2881,7 @@ DEFAULT_RECAP_CONFIG = dict(
             )
         ),
         cafe_espresso = dict(
-            max_episode_length_seconds = 200,
+            max_episode_length = 200,
             pretrain = dict(
                 advantage_lookahead = -1,
                 positive_data_fraction = 0.30,
@@ -2892,7 +2894,7 @@ DEFAULT_RECAP_CONFIG = dict(
             )
         ),
         box_assembly = dict(
-            max_episode_length_seconds = 600,
+            max_episode_length = 600,
             pretrain = dict(
                 advantage_lookahead = -1,
                 positive_data_fraction = 0.30,
@@ -2905,7 +2907,7 @@ DEFAULT_RECAP_CONFIG = dict(
             )
         ),
         laundry_failure_removal_ablation = dict(
-            max_episode_length_seconds = 200,
+            max_episode_length = 200,
             pretrain = dict(
                 advantage_lookahead = -1,
                 positive_data_fraction = 0.30,
@@ -2976,13 +2978,32 @@ class PiZeroSix(Module):
         return self.accelerate.unwrap_model(self.agent.critic)
 
     @beartype
+    def normalize_rewards_(
+        self,
+        experiences: ReplayBuffer
+    ):
+        # the rewards are normalized to -1 to 0, so just divide by the max length of the episode
+
+        buffer = experiences
+
+        has_task = buffer.meta_data['task_id'] >= 0
+        rewards = buffer.data['reward'][has_task]
+        episode_lens = buffer.episode_lens[has_task]
+
+        buffer.data['reward'][has_task] = einx.divide('e t, e', rewards, episode_lens)
+
+    @beartype
     def calculate_advantages_(
         self,
         experiences: ReplayBuffer,
         gamma = 0.99,
         lam = 0.95,
-        use_accelerated = None
+        use_accelerated = None,
+        normalize_rewards_by_task_max_len = True
     ):
+
+        if normalize_rewards_by_task_max_len:
+            self.normalize_rewards_(experiences)
 
         buffer = experiences
 
@@ -3110,8 +3131,8 @@ class PiZeroSix(Module):
     def gather_experience_from_env(
         self,
         env,
-        steps,
         num_episodes = 1,
+        steps = None,
         trajectory_length = 16,
         flow_sampling_steps = 4,
         max_timesteps = 64,
@@ -3124,10 +3145,21 @@ class PiZeroSix(Module):
 
         assert cond_scale > 0., f'classifier free guidance scaling must be enabled for proposed pi0.6'
 
+        assert exists(steps) ^ task_id > 0, 'either `steps` or `task_id` must be defined, but not both - each task has its own specified max length for normalizing the rewards'
+
         self.agent.eval()
 
         actor = self.unwrapped_actor
         critic = self.unwrapped_critic
+
+        # get the max length of each task from the config
+
+        if not exists(steps):
+            task_str = self.task_strings[task_id]
+
+            task_config = self.config.tasks[task_str]
+
+            steps = task_config.max_episode_length
 
         # replay buffer
 

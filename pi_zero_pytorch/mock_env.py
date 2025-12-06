@@ -51,7 +51,7 @@ class Env(Module):
         actions,
     ):
         state = self.get_random_state()
-        reward = randint(-100, 100, ()).float()
+        reward = tensor(-1.)
 
         if self._step > self.can_terminate_after:
             truncated = tensor(choice((True, False)))
