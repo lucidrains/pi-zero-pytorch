@@ -122,7 +122,7 @@ def create_pizero_attn_mask(
             query_index >= prefix_causal_length
         )
 
-        return (key_mask and causal_mask) or bidirectional_action_mask
+        return (key_mask & causal_mask) | bidirectional_action_mask
 
     return mask_fn
 
@@ -2652,7 +2652,6 @@ class ReplayBuffer:
 
         # keeping track of episode length
 
-
         self.num_episodes = 0
         self.episode_index = 0
         self.timestep_index = 0
@@ -3044,6 +3043,7 @@ class PiZeroSix(Module):
         self,
         experiences: ReplayBuffer,
         num_advantages_sample = 10_000,
+        mode: Literal['pretrain', 'finetune'] = 'finetune'
     ):
         buffer = experiences
         num_episodes = buffer.num_episodes
@@ -3060,7 +3060,7 @@ class PiZeroSix(Module):
             task_str = self.task_strings[task_id]
             task_config = self.config.tasks[task_str]
 
-            percentile_cutoff = task_config.finetune.percentile_cutoff
+            threshold = 1. - getattr(task_config, mode).positive_data_fraction
 
             # sample and get the percentile cutoff for whether to set advantage to "positive" label
 
@@ -3098,7 +3098,7 @@ class PiZeroSix(Module):
 
             # determine the advantage at designated percentile per task
 
-            advantage_cutoff = torch.quantile(advantages, percentile_cutoff / 100)
+            advantage_cutoff = torch.quantile(advantages, threshold)
 
             advantage_token_ids = (advantages >= advantage_cutoff).int() # binary for now
 
