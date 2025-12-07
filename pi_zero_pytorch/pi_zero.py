@@ -2623,9 +2623,15 @@ class EFPO(Module):
 
 # offline
 
+TYPE_STR = Literal['int', 'float', 'bool']
+
 FIELD_TYPE = dict[
     str,
-    str | tuple[Literal['int', 'float', 'bool'], int | tuple[int, ...]]
+    (
+        str |
+        tuple[TYPE_STR, int | tuple[int, ...]] |
+        tuple[TYPE_STR, int | tuple[int, ...], int | float | bool]
+    )
 ]
 
 class ReplayBuffer:
@@ -2664,12 +2670,17 @@ class ReplayBuffer:
         meta_fields.update(episode_lens = 'int')
 
         def field_info_to_shape_dtype(field_info):
-            field_info = (field_info, ()) if isinstance(field_info, str) else field_info
+            if isinstance(field_info, str):
+                field_info = (field_info, (), None)
 
-            dtype_str, shape = field_info
+            elif is_bearable(field_info, tuple[TYPE_STR, int | tuple[int, ...]]):
+                field_info = (*field_info, None)
+
+            dtype_str, shape, default_value = field_info
 
             dtype = dict(int = np.int32, float = np.float32, bool = np.bool_)[dtype_str]
-            return shape, dtype
+
+            return shape, dtype, default_value
 
         # create the memmap for individual data tracks
 
@@ -2680,7 +2691,7 @@ class ReplayBuffer:
 
         for field_name, field_info in fields.items():
 
-            shape, dtype = field_info_to_shape_dtype(field_info)
+            shape, dtype, default_value = field_info_to_shape_dtype(field_info)
 
             # memmap file
 
@@ -2690,6 +2701,9 @@ class ReplayBuffer:
                 shape = (shape,)
 
             memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
+
+            if exists(default_value):
+                memmap[:] = default_value
 
             self.data[field_name] = memmap
             self.shapes[field_name] = shape
@@ -2706,7 +2720,7 @@ class ReplayBuffer:
 
         for field_name, field_info in meta_fields.items():
 
-            shape, dtype = field_info_to_shape_dtype(field_info)
+            shape, dtype, default_value = field_info_to_shape_dtype(field_info)
 
             # memmap file
 
@@ -2716,6 +2730,9 @@ class ReplayBuffer:
                 shape = (shape,)
 
             memmap = open_memmap(str(filepath), mode = 'w+', dtype = dtype, shape = (max_episodes, *shape))
+
+            if exists(default_value):
+                memmap[:] = default_value
 
             self.meta_data[field_name] = memmap
             self.meta_shapes[field_name] = shape
@@ -2992,6 +3009,14 @@ class PiZeroSix(Module):
         buffer.data['reward'][has_task] = einx.divide('e t, e', rewards, episode_lens)
 
     @beartype
+    def invalidate_(
+        self,
+        experiences: ReplayBuffer,
+        episode_id
+    ):
+        experiences.meta_data['invalidate'] = True
+
+    @beartype
     def calculate_advantages_(
         self,
         experiences: ReplayBuffer,
@@ -3168,7 +3193,8 @@ class PiZeroSix(Module):
             max_episodes = num_episodes,
             max_timesteps = steps,
             meta_fields = dict(
-                task_id     = 'int'
+                task_id     = ('int', (), -1),
+                invalidate  = ('bool', (), False)
             ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),
@@ -3180,7 +3206,7 @@ class PiZeroSix(Module):
                 value       = 'float',
                 advantages  = 'float',
                 advantage_ids = 'int',
-                task_id     = 'int'
+                task_id     = 'int',
             )
         )
 
