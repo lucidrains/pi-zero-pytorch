@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from random import random, randrange
+from shutil import rmtree
 from pathlib import Path
 
 from beartype import beartype
@@ -21,13 +22,13 @@ from numpy.lib.format import open_memmap
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, arange, cat, stack, tensor, Tensor, is_tensor, full, from_numpy
+from torch import pi, nn, arange, cat, stack, tensor, Tensor, broadcast_tensors, is_tensor, full, from_numpy
 from torch.nn import Module, ModuleList
 from torch.distributions.beta import Beta
 
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 
 from torchdiffeq import odeint
 
@@ -2296,7 +2297,7 @@ class PiZero(Module):
 
             language_loss = F.cross_entropy(
                 rearrange(language_logits[:, :-1], 'b n l -> b l n'),
-                labels,
+                labels.long(),
                 ignore_index = self.lm_pad_id
             )
 
@@ -2636,7 +2637,6 @@ FIELD_TYPE = dict[
     )
 ]
 
-
 class ReplayBuffer:
 
     @beartype
@@ -2759,8 +2759,11 @@ class ReplayBuffer:
         self.timestep_index = 0
 
     def advance_episode(self):
+
         assert self.circular or self.num_episodes < self.max_episodes
 
+        self.episode_lens[self.episode_index] = self.timestep_index
+        
         self.episode_index = (self.episode_index + 1) % self.max_episodes
         self.timestep_index = 0
 
@@ -2768,12 +2771,12 @@ class ReplayBuffer:
         self.num_episodes = min(self.max_episodes, self.num_episodes)
 
     def flush(self):
-        self.episode_lens[self.episode_index] = self.timestep_index
 
         for memmap in self.data.values():
             memmap.flush()
 
-        self.episode_lens.flush()
+        for memmap in self.meta_data.values():
+            memmap.flush()
 
     @contextmanager
     def one_episode(
@@ -2787,8 +2790,8 @@ class ReplayBuffer:
 
         yield
 
-        self.flush()
         self.advance_episode()
+        self.flush()
 
     @beartype
     def store_datapoint(
@@ -2860,6 +2863,53 @@ class ReplayBuffer:
         # store
 
         return self.memory_namedtuple(**data)
+
+class ReplayDataset(Dataset):
+    def __init__(
+        self,
+        experiences: ReplayBuffer,
+        fieldname_map: dict[str, str] = dict()
+    ):
+        self.experiences = experiences
+
+        episode_ids = arange(experiences.max_episodes)
+        episode_lens = from_numpy(experiences.episode_lens)
+
+        max_episode_len = episode_lens.amax().item()
+
+        valid_mask = (experiences.episode_lens > 0) & ~experiences.meta_data['invalidated']
+
+        valid_episodes = episode_ids[valid_mask]
+        valid_episode_lens = episode_lens[valid_mask]
+
+        timesteps = arange(max_episode_len)
+
+        episode_timesteps = stack(broadcast_tensors(
+            rearrange(valid_episodes, 'e -> e 1'),
+            rearrange(timesteps, 't -> 1 t')
+        ), dim = -1)
+
+        valid_timesteps = einx.less('j, i -> i j', timesteps, valid_episode_lens)
+
+        self.timepoints = episode_timesteps[valid_timesteps]
+
+        self.fieldname_map = fieldname_map
+
+    def __len__(self):
+        return len(self.timepoints)
+
+    def __getitem__(self, idx):
+        episode_id, timestep_index = self.timepoints[idx].unbind(dim = -1)
+
+        step_data = dict()
+
+        for field, data in self.experiences.data.items():
+
+            model_kwarg_name = self.fieldname_map.get(field, field)
+
+            step_data[model_kwarg_name] = data[episode_id, timestep_index]
+
+        return step_data
 
 # 0.6 related hyperparameters
 
@@ -3002,6 +3052,28 @@ class PiZeroSix(Module):
     def unwrapped_critic(self):
         return self.accelerate.unwrap_model(self.agent.critic)
 
+    def dataloader(
+        self,
+        experiences: ReplayBuffer,
+        batch_size = 8,
+        **dl_kwargs
+
+    ) -> DataLoader:
+
+        dataset = ReplayDataset(
+            experiences,
+            fieldname_map = dict(
+                text = 'token_ids',
+                internal = 'joint_state',
+            )
+        )
+
+        assert len(dataset) > 0, 'no experiences to learn from'
+
+        dataloader = DataLoader(dataset, batch_size = batch_size, **dl_kwargs)
+
+        return dataloader
+
     @beartype
     def normalize_rewards_(
         self,
@@ -3016,14 +3088,19 @@ class PiZeroSix(Module):
         episode_lens = buffer.episode_lens[has_task]
 
         buffer.data['reward'][has_task] = einx.divide('e t, e', rewards, episode_lens)
+        buffer.flush()
 
     @beartype
     def invalidate_(
         self,
         experiences: ReplayBuffer,
-        episode_id
+        episode_id: int
     ):
-        experiences.meta_data['invalidate'] = True
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'invalidated',
+            datapoint = True
+        )
 
     @beartype
     def calculate_advantages_(
@@ -3140,6 +3217,8 @@ class PiZeroSix(Module):
 
             einx.set_at('[e t], b [2], b', buffer.data['advantage_ids'], sampled_indices, advantage_token_ids)
 
+        buffer.flush()
+
     @beartype
     def set_episode_fail_(
         self,
@@ -3210,7 +3289,7 @@ class PiZeroSix(Module):
             meta_fields = dict(
                 task_id     = ('int', (), -1),
                 fail        = 'bool',
-                invalidate  = 'bool'
+                invalidated = 'bool'
             ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),

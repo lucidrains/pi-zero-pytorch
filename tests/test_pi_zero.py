@@ -1,3 +1,5 @@
+from shutil import rmtree
+
 import pytest
 param = pytest.mark.parametrize
 
@@ -332,7 +334,7 @@ def test_pi_zero_six():
 
     # gather experiences from environment
 
-    experience = pi_zero_six.gather_experience_from_env(mock_env, steps = 10, num_episodes = 3, task_id = 2)
+    experience = pi_zero_six.gather_experience_from_env(mock_env, steps = 4, num_episodes = 3, task_id = 2)
 
     # labeling
 
@@ -343,3 +345,13 @@ def test_pi_zero_six():
     pi_zero_six.set_advantage_token_id_(experience)
 
     pi_zero_six.invalidate_(experience, 1)
+
+    # now learn from the experience
+
+    model = model.cpu() # some error with mps
+
+    for batch in pi_zero_six.dataloader(experience):
+        loss, *_ = model(**batch)
+        loss.backward()
+
+    # repeat
