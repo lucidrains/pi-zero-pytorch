@@ -2623,16 +2623,19 @@ class EFPO(Module):
 
 # offline
 
-TYPE_STR = Literal['int', 'float', 'bool']
+PRIMITIVE_TYPES = int | float | bool
+
+PRIMITIVE_TYPE_STR = Literal['int', 'float', 'bool']
 
 FIELD_TYPE = dict[
     str,
     (
         str |
-        tuple[TYPE_STR, int | tuple[int, ...]] |
-        tuple[TYPE_STR, int | tuple[int, ...], int | float | bool]
+        tuple[PRIMITIVE_TYPE_STR, int | tuple[int, ...]] |
+        tuple[PRIMITIVE_TYPE_STR, int | tuple[int, ...], int | float | bool]
     )
 ]
+
 
 class ReplayBuffer:
 
@@ -2673,7 +2676,7 @@ class ReplayBuffer:
             if isinstance(field_info, str):
                 field_info = (field_info, (), None)
 
-            elif is_bearable(field_info, tuple[TYPE_STR, int | tuple[int, ...]]):
+            elif is_bearable(field_info, tuple[PRIMITIVE_TYPE_STR, int | tuple[int, ...]]):
                 field_info = (*field_info, None)
 
             dtype_str, shape, default_value = field_info
@@ -2793,10 +2796,13 @@ class ReplayBuffer:
         episode_index: int,
         timestep_index: int,
         name: str,
-        datapoint: Tensor | ndarray
+        datapoint: Tensor | ndarray | PRIMITIVE_TYPES
     ):
         assert 0 <= episode_index < self.max_episodes
         assert 0 <= timestep_index < self.max_timesteps
+
+        if is_bearable(datapoint, PRIMITIVE_TYPES):
+            datapoint = tensor(datapoint)
 
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
@@ -2812,9 +2818,12 @@ class ReplayBuffer:
         self,
         episode_index: int,
         name: str,
-        datapoint: Tensor | ndarray
+        datapoint: Tensor | ndarray | PRIMITIVE_TYPES
     ):
         assert 0 <= episode_index < self.max_episodes
+
+        if is_bearable(datapoint, PRIMITIVE_TYPES):
+            datapoint = tensor(datapoint)
 
         if is_tensor(datapoint):
             datapoint = datapoint.detach().cpu().numpy()
