@@ -3150,6 +3150,12 @@ class PiZeroSix(Module):
             datapoint = self.task_fail_penalty
         )
 
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'fail',
+            datapoint = True
+        )
+
         return experiences
 
     @torch.no_grad()
@@ -3194,7 +3200,8 @@ class PiZeroSix(Module):
             max_timesteps = steps,
             meta_fields = dict(
                 task_id     = ('int', (), -1),
-                invalidate  = ('bool', (), False)
+                fail        = 'bool',
+                invalidate  = 'bool'
             ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),
