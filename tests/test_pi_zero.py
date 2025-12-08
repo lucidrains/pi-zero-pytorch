@@ -342,4 +342,4 @@ def test_pi_zero_six():
 
     pi_zero_six.set_advantage_token_id_(experience)
 
-    pi_zero_six.set_episode_fail_(experience, 1)
+    pi_zero_six.invalidate_(experience, 1)
