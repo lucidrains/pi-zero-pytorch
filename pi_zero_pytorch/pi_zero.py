@@ -2868,6 +2868,7 @@ class ReplayDataset(Dataset):
     def __init__(
         self,
         experiences: ReplayBuffer,
+        fields: list[str] | None = None,
         fieldname_map: dict[str, str] = dict()
     ):
         self.experiences = experiences
@@ -2893,6 +2894,8 @@ class ReplayDataset(Dataset):
 
         self.timepoints = episode_timesteps[valid_timesteps]
 
+        self.fields = default(fields, list(experiences.fieldnames))
+
         self.fieldname_map = fieldname_map
 
     def __len__(self):
@@ -2903,7 +2906,8 @@ class ReplayDataset(Dataset):
 
         step_data = dict()
 
-        for field, data in self.experiences.data.items():
+        for field in self.fields:
+            data = self.experiences.data[field]
 
             model_kwarg_name = self.fieldname_map.get(field, field)
 
