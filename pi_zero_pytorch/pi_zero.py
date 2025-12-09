@@ -219,6 +219,30 @@ def softclamp(t, value):
 
     return (t / value).tanh() * value
 
+def append_dims(t, dims):
+    shape = t.shape
+    ones = ((1,) * dims)
+    return t.reshape(*shape, *ones)
+
+def lens_to_mask(lens, max_len):
+    seq = torch.arange(max_len, device = lens.device)
+    return einx.less('j, i -> i j', seq, lens)
+
+def maybe_and_masks(*masks):
+    masks = [*filter(exists, masks)]
+
+    if len(masks) == 0:
+        return None
+    elif len(masks) == 1:
+        return masks[0]
+
+    mask, *rest_mask = masks
+
+    for rest_mask in rest_masks:
+        mask = mask & rest_mask
+
+    return mask
+
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
@@ -954,6 +978,7 @@ class AdaptiveRMSNorm(Module):
         normed = self.norm(actions)
         gamma = self.to_gamma(cond)
         beta = self.to_beta(cond)
+
         return normed * gamma + beta
 
 class AdaptiveLayerscale(Module):
@@ -1012,6 +1037,8 @@ class PiZero(Module):
         immiscible_flow = False,             # https://arxiv.org/abs/2406.12303
         sample_times_fn = default_sample_times,
         rtc_guidance = None,                 # use the guidance proposed in https://arxiv.org/abs/2506.07339, which in turn is inspired by training-free guidance paper, which in turn from pseudo-inverse paper.
+        train_time_rtc = True,
+        train_time_rtc_max_delay = None,
         sample_guidance_beta = 5.,           # corresponds to the beta max guidance term in the RTC paper
         sample_soft_mask_lens: tuple[int, int, int] | None = None, # (condition, transition, generation) lengths - default to frozen action seq dimension 'nfa' above for condition len with 0 transition, but can be overridden
         reward_tokens_dropout_prob = 0.,
@@ -1253,6 +1280,13 @@ class PiZero(Module):
         rtc_guidance = default(rtc_guidance, model_predict_output == 'flow')
         self.rtc_guidance = RTCGuidance(sample_guidance_beta) if rtc_guidance else None
 
+        # train time RTC related - https://arxiv.org/abs/2512.05964
+
+        self.train_time_rtc = train_time_rtc
+
+        assert not train_time_rtc or exists(train_time_rtc_max_delay)
+        self.train_time_rtc_max_delay = train_time_rtc_max_delay
+
         # loss related
 
         self.lm_loss_weight = lm_loss_weight
@@ -1422,12 +1456,18 @@ class PiZero(Module):
             # take care of inpainting if needed
 
             if inpaint_actions:
-                denoised_actions = soft_mask_inpainter(frozen_actions_for_inpaint, denoised_actions)
 
-                if exists(self.rtc_guidance):
-                    # the denoised actions must have grad enabled to calculate the vjp
+                if self.train_time_rtc:
+                    time_mask = arange(trajectory_length, device = self.device) < frozen_action_input_len
+                    timestep = einx.where('na,,', time_mask, 1., timestep)
+                    timestep = repeat(timestep, 'na -> b na', b = batch_size)
+                else:
+                    denoised_actions = soft_mask_inpainter(frozen_actions_for_inpaint, denoised_actions)
 
-                    denoised_actions.requires_grad_()
+                    if exists(self.rtc_guidance):
+                        # the denoised actions must have grad enabled to calculate the vjp
+
+                        denoised_actions.requires_grad_()
 
             input_args = (
                 images,
@@ -1435,6 +1475,7 @@ class PiZero(Module):
                 joint_states,
                 denoised_actions
             )
+
 
             input_kwargs = dict(
                 times = timestep,
@@ -1460,9 +1501,12 @@ class PiZero(Module):
             if inpaint_actions and exists(self.rtc_guidance):
                 assert self.model_predict_output == 'flow' # handle this eventually
 
-                pred_actions = denoised_actions + flow * (1. - timestep)
+                padded_timestep = append_dims(timestep, flow.ndim - 1)
 
-                guidance_term = self.rtc_guidance(denoised_actions, pred_actions, frozen_actions_for_inpaint, timestep, soft_mask_inpainter.soft_mask)
+                pred_actions = denoised_actions + flow * (1. - padded_timestep)
+
+                if not self.train_time_rtc:
+                    guidance_term = self.rtc_guidance(denoised_actions, pred_actions, frozen_actions_for_inpaint, timestep, soft_mask_inpainter.soft_mask)
 
             # handle probabilistic
 
@@ -1821,7 +1865,7 @@ class PiZero(Module):
         if not exists(actions) and not self.is_critic:
             return self.sample_actions(images, token_ids, joint_state, **kwargs)
 
-        batch, device = token_ids.shape[0], token_ids.device
+        batch, orig_actions, device = token_ids.shape[0], actions, token_ids.device
 
         # noising the action for flow matching
 
@@ -1841,6 +1885,8 @@ class PiZero(Module):
 
         # if not returning the actions predicted flow, assume training and noise the actions for loss
 
+        action_prefix_mask = None
+
         if not return_actions_flow and not self.is_critic:
             noise = default(noise, torch.randn_like(actions))
 
@@ -1852,6 +1898,18 @@ class PiZero(Module):
             padded_times = rearrange(times, 'b -> b 1 1')
 
             actions = noise.lerp(actions, padded_times)
+
+            # if doing training time rtc, train with a random fixed prefix and set times to 1.
+            # actually not as simple as the paper makes it seem, as time conditioning is expanded a dimension
+
+            if self.train_time_rtc:
+                action_len = actions.shape[-2]
+
+                rand_prefix_len = torch.randint(0, self.train_time_rtc_max_delay, (batch,), device = device)
+                action_prefix_mask = lens_to_mask(rand_prefix_len, action_len)
+
+                actions = einx.where('b na, b na d, b na d', action_prefix_mask, orig_actions, actions)
+                times = einx.where('b na, , b', action_prefix_mask, 1., times)
 
         # take care of model output maybe needing a transformation from x0 to flow
 
@@ -1920,6 +1978,12 @@ class PiZero(Module):
         ], 'b * d')
 
         action_with_registers_length = action_tokens.shape[-2]
+
+        # take care of padding time conditioning if doing training rtc
+
+        if time_cond.ndim == 3:
+            orig_action_len = orig_actions.shape[-2]
+            time_cond = pad_at_dim(time_cond, (action_with_registers_length - orig_action_len, 0), dim = -2)
 
         state_tokens = None
 
@@ -2274,13 +2338,23 @@ class PiZero(Module):
 
         if return_action_flow_loss:
             flow_loss = self.loss_fn(pred_actions_flow, flow)
-            flow_loss = reduce(flow_loss, 'b ... -> b ...', 'mean')
 
-            # maybe mask out the loss for invalid task labels from GR-3 paper for improved language following
+            flow_loss = reduce(flow_loss, 'b ... d -> b ...', 'mean')
 
+            # maybe mask out
+            # for 1. the loss for invalid task labels from GR-3 paper for improved language following
+            # for 2. the train time rtc
+
+            is_not_invalid_mask = None
             if exists(task_status):
                 is_not_invalid_mask = task_status != self.task_status_is_invalid
-                flow_loss = flow_loss[is_not_invalid_mask]
+
+            mask = maybe_and_masks(is_not_invalid_mask, action_prefix_mask)
+
+            # mask out
+
+            if exists(mask):
+                flow_loss = flow_loss[mask]
 
             # average
 

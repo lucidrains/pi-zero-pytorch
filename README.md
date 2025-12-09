@@ -322,4 +322,16 @@ That's it
 }
 ```
 
+```bibtex
+@misc{black2025trainingtimeactionconditioningefficient,
+    title   = {Training-Time Action Conditioning for Efficient Real-Time Chunking}, 
+    author  = {Kevin Black and Allen Z. Ren and Michael Equi and Sergey Levine},
+    year    = {2025},
+    eprint  = {2512.05964},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2512.05964}, 
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
