@@ -3187,7 +3187,8 @@ class PiZeroSix(Module):
         gamma = 0.99,
         lam = 0.95,
         use_accelerated = None,
-        normalize_rewards_by_task_max_len = True
+        normalize_rewards_by_task_max_len = True,
+        mode: Literal['pretrain', 'finetune'] = 'finetune'
     ):
 
         if normalize_rewards_by_task_max_len:
@@ -3213,14 +3214,40 @@ class PiZeroSix(Module):
 
             rewards, values, terminated = map(from_numpy, (rewards, values, terminated))
 
+            # get lookahead for task
+
+            lookahead = -1
+
+            if exists(self.config):
+                task_id = buffer.meta_data['task_id'][episode_id]
+                task_str = self.task_strings[task_id]
+                task_config = self.config.tasks[task_str]
+                lookahead = getattr(task_config, mode).advantage_lookahead
+
+            # calculate advantage depending on lookahead
+
+            has_lookahead = lookahead > 0
+
             advantages = calc_generalized_advantage_estimate(
                 rewards = rewards,
                 values = values,
                 masks = terminated,
                 gamma = gamma,
-                lam = lam,
+                lam = 1. if has_lookahead else lam,
                 use_accelerated = use_accelerated
             )
+
+            # if lookahead is greater than 0, then we need to subtract the discounted future advantage
+
+            if has_lookahead:
+
+                lookahead = min(lookahead, advantages.shape[-1])
+
+                gamma_nth_step = gamma ** lookahead
+
+                future_advantages = F.pad(advantages, (-lookahead, lookahead), value = 0.)
+
+                advantages = advantages - gamma_nth_step * future_advantages
 
             # store advantages
 
@@ -3426,7 +3453,6 @@ class PiZeroSix(Module):
                         value = value,
                         task_id = tensor(task_id)
                     )
-
 
         self.accelerate.wait_for_everyone()
 
