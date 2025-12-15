@@ -2955,6 +2955,7 @@ class ReplayDataset(Dataset):
         self,
         experiences: ReplayBuffer,
         recap_step: int | None = None,
+        task_id: int | None = None,
         fields: list[str] | None = None,
         fieldname_map: dict[str, str] = dict()
     ):
@@ -2973,6 +2974,12 @@ class ReplayDataset(Dataset):
             episode_recap_steps = experiences.meta_data['recap_step']
             is_recap_step = episode_recap_steps == recap_step
             valid_mask = valid_mask & is_recap_step
+
+        # filter by task id
+
+        if exists(task_id):
+            is_task_id = experiences.meta_data['task_id'] == task_id
+            valid_mask = valid_mask & is_task_id
 
         valid_episodes = episode_ids[valid_mask]
         valid_episode_lens = episode_lens[valid_mask]
@@ -3142,6 +3149,9 @@ class PiZeroSix(Module):
 
         self.register_buffer('task_fail_penalty', tensor(config.task_fail_penalty))
 
+    def print(self, *args, **kwargs):
+        return self.accelerate.print(*args, **kwargs)
+
     @property
     def unwrapped_actor(self):
         return self.accelerate.unwrap_model(self.agent.actor)
@@ -3154,6 +3164,7 @@ class PiZeroSix(Module):
         self,
         experiences: ReplayBuffer,
         batch_size = 8,
+        task_id: int | none = None,
         fields: list[str] | None = None,
         **dl_kwargs
 
@@ -3162,6 +3173,7 @@ class PiZeroSix(Module):
         dataset = ReplayDataset(
             experiences,
             fields = fields,
+            task_id = task_id,
             fieldname_map = dict(
                 text = 'token_ids',
                 internal = 'joint_state',
@@ -3179,6 +3191,7 @@ class PiZeroSix(Module):
         experience: ReplayBuffer,
         num_train_steps: int,
         optim_klass = AdamAtan2,
+        task_id: int | None = None,
         batch_size = 8,
         lr = 3e-4,
         weight_decay = 1e-2,
@@ -3192,6 +3205,7 @@ class PiZeroSix(Module):
         dataloader = self.dataloader(
             experience,
             batch_size = batch_size,
+            task_id = task_id,
             fields = [
                 'images',
                 'text',
@@ -3210,11 +3224,12 @@ class PiZeroSix(Module):
         dl_iter = cycle(dataloader)
 
         for _ in range(num_train_steps):
-            batch = next(dl_iter)
 
-            returns = batch.pop('returns')
+            batch_dict = next(dl_iter)
 
-            pred_value, logits = model(**batch)
+            returns = batch_dict.pop('returns')
+
+            pred_value, logits = model(task_id = task_id, **batch_dict)
 
             cross_entropy_loss = critic_loss_fn(logits, returns, reduction = 'mean')
 
@@ -3222,12 +3237,12 @@ class PiZeroSix(Module):
 
             self.accelerate.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-            print(f'value loss: {cross_entropy_loss.item():.3f}')
+            self.print(f'value loss: {cross_entropy_loss.item():.3f}')
 
             optim.step()
             optim.zero_grad()
 
-        print('value network training complete')
+        self.print('value network training complete')
 
     @beartype
     def normalize_rewards_(
