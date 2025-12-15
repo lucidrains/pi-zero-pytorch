@@ -2949,6 +2949,7 @@ class ReplayDataset(Dataset):
     def __init__(
         self,
         experiences: ReplayBuffer,
+        recap_step: int | None = None,
         fields: list[str] | None = None,
         fieldname_map: dict[str, str] = dict()
     ):
@@ -2960,6 +2961,13 @@ class ReplayDataset(Dataset):
         max_episode_len = episode_lens.amax().item()
 
         valid_mask = (experiences.episode_lens > 0) & ~experiences.meta_data['invalidated']
+
+        # allow for filtering by recap step - todo: allow for set of ids
+
+        if exists(recap_step):
+            episode_recap_steps = experiences.meta_data['recap_step']
+            is_recap_step = episode_recap_steps == recap_step
+            valid_mask = valid_mask & is_recap_step
 
         valid_episodes = episode_ids[valid_mask]
         valid_episode_lens = episode_lens[valid_mask]
@@ -3377,6 +3385,7 @@ class PiZeroSix(Module):
         cond_scale = 1.,
         experience_path = './experiences',
         task_id = -1,
+        recap_step = 0, # starts at 0, in which case the logic will be the SFT step, before the proper binary advantage conditioning
        **sampling_kwargs
 
     ) -> ReplayBuffer:
@@ -3408,7 +3417,8 @@ class PiZeroSix(Module):
             meta_fields = dict(
                 task_id     = ('int', (), -1),
                 fail        = 'bool',
-                invalidated = 'bool'
+                invalidated = 'bool',
+                recap_step  = ('int', (), -1) # -1 stands for base pretraining dataset
             ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),
@@ -3437,6 +3447,7 @@ class PiZeroSix(Module):
 
             with experience_buffer.one_episode(
                 task_id = tensor(task_id),
+                recap_step = tensor(recap_step)
             ):
 
                 for _ in range(steps):
