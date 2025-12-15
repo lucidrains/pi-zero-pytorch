@@ -3235,10 +3235,10 @@ class PiZeroSix(Module):
 
             has_lookahead = lookahead > 0
 
-            advantages, returns = calc_generalized_advantage_estimate(
+            advantages, _ = calc_generalized_advantage_estimate(
                 rewards = rewards,
                 values = values,
-                masks = terminated,
+                masks = ~terminated,
                 gamma = gamma,
                 lam = 1. if has_lookahead else lam,
                 use_accelerated = use_accelerated
@@ -3252,13 +3252,20 @@ class PiZeroSix(Module):
 
                 gamma_nth_step = gamma ** lookahead
 
-                future_advantages = F.pad(advantages, (-lookahead, lookahead), value = 0.)
+                future_advantages = F.pad(advantages, (0, lookahead), value = 0.)[lookahead:]
 
                 advantages = advantages - gamma_nth_step * future_advantages
 
             # store advantages
 
             buffer.data['advantages'][episode_id, :episode_len] = advantages.cpu().numpy()
+
+            # store the returns
+
+            buffer.data['returns'][episode_id, :episode_len] = (advantages + values).cpu().numpy()
+
+            # flush
+
             buffer.flush()
 
     @beartype
@@ -3412,6 +3419,7 @@ class PiZeroSix(Module):
                 terminated  = 'bool',
                 value       = 'float',
                 advantages  = 'float',
+                returns     = 'float',
                 advantage_ids = 'int',
                 task_id     = 'int',
             )
