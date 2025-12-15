@@ -2405,6 +2405,8 @@ class PiZero(Module):
 
 # generalized advantage estimate
 
+GAEReturn = namedtuple('GAEReturn', ('advantages', 'returns'))
+
 @torch.no_grad()
 def calc_generalized_advantage_estimate(
     rewards,
@@ -2416,15 +2418,20 @@ def calc_generalized_advantage_estimate(
 ):
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[..., :-1], values[..., 1:]
+    padded_values = F.pad(values, (0, 1), value = 0.)
+
+    values, values_next = padded_values[..., :-1], padded_values[..., 1:]
 
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
 
     scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
 
-    return scan(gates, delta)
+    advantages = scan(gates, delta)
+
+    returns = advantages + values
+
+    return GAEReturn(advantages, returns)
 
 # agent
 
@@ -2613,7 +2620,7 @@ class EFPO(Module):
 
         boundaries = terminated
 
-        advantages = calc_generalized_advantage_estimate(rewards, old_values, boundaries, use_accelerated = False).detach()
+        advantages, returns = calc_generalized_advantage_estimate(rewards, old_values, boundaries, use_accelerated = False).detach()
 
         data_tensors = (
             images,
@@ -3184,7 +3191,7 @@ class PiZeroSix(Module):
     def calculate_advantages_(
         self,
         experiences: ReplayBuffer,
-        gamma = 0.99,
+        gamma = 1., # they do no discount, so value network is predicting its distance from task completion (with a negative sign from -1 to 0)
         lam = 0.95,
         use_accelerated = None,
         normalize_rewards_by_task_max_len = True,
@@ -3228,7 +3235,7 @@ class PiZeroSix(Module):
 
             has_lookahead = lookahead > 0
 
-            advantages = calc_generalized_advantage_estimate(
+            advantages, returns = calc_generalized_advantage_estimate(
                 rewards = rewards,
                 values = values,
                 masks = terminated,
