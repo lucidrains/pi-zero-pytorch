@@ -202,6 +202,11 @@ def temp_batch_dim(fn):
 
     return inner
 
+def cycle(it):
+    while True:
+        for batch in it:
+            yield batch
+
 # tensor helpers
 
 def log(t, eps = 1e-20):
@@ -3149,12 +3154,14 @@ class PiZeroSix(Module):
         self,
         experiences: ReplayBuffer,
         batch_size = 8,
+        fields: list[str] | None = None,
         **dl_kwargs
 
     ) -> DataLoader:
 
         dataset = ReplayDataset(
             experiences,
+            fields = fields,
             fieldname_map = dict(
                 text = 'token_ids',
                 internal = 'joint_state',
@@ -3166,6 +3173,61 @@ class PiZeroSix(Module):
         dataloader = DataLoader(dataset, batch_size = batch_size, **dl_kwargs)
 
         return dataloader
+
+    def train_value_network(
+        self,
+        experience: ReplayBuffer,
+        num_train_steps: int,
+        optim_klass = AdamAtan2,
+        batch_size = 8,
+        lr = 3e-4,
+        weight_decay = 1e-2,
+        max_grad_norm = 0.5,
+        dl_kwargs: dict = dict(),
+        optim_kwargs: dict = dict()
+    ):
+
+        optim = optim_klass(self.unwrapped_critic.parameters(), lr = lr, weight_decay = weight_decay, **optim_kwargs)
+
+        dataloader = self.dataloader(
+            experience,
+            batch_size = batch_size,
+            fields = [
+                'images',
+                'text',
+                'internal',
+                'actions',
+                'returns'
+            ],
+            **dl_kwargs
+        )
+
+        model = self.agent.critic
+        critic_loss_fn = model.to_critic_value.loss_fn
+
+        dataloader, optim = self.accelerate.prepare(dataloader, optim)
+
+        dl_iter = cycle(dataloader)
+
+        for _ in range(num_train_steps):
+            batch = next(dl_iter)
+
+            returns = batch.pop('returns')
+
+            pred_value, logits = model(**batch)
+
+            cross_entropy_loss = critic_loss_fn(logits, returns, reduction = 'mean')
+
+            self.accelerate.backward(cross_entropy_loss)
+
+            self.accelerate.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+            print(f'value loss: {cross_entropy_loss.item():.3f}')
+
+            optim.step()
+            optim.zero_grad()
+
+        print('value network training complete')
 
     @beartype
     def normalize_rewards_(
@@ -3357,6 +3419,8 @@ class PiZeroSix(Module):
         if not exists(timestep):
             max_len = experiences.episode_lens[episode_id]
             timestep = int(max_len - 1)
+        else:
+            experiences.episode_lens[episode_id] = timestep
 
         reward = experiences.store_datapoint(
             episode_id,
@@ -3369,6 +3433,35 @@ class PiZeroSix(Module):
             episode_id,
             name = 'fail',
             datapoint = True
+        )
+
+        return experiences
+
+    @beartype
+    def set_episode_success_(
+        self,
+        experiences: ReplayBuffer,
+        episode_id,
+        timestep = None
+    ):
+
+        if not exists(timestep):
+            max_len = experiences.episode_lens[episode_id]
+            timestep = int(max_len - 1)
+        else:
+            experiences.episode_lens[episode_id] = timestep
+
+        reward = experiences.store_datapoint(
+            episode_id,
+            timestep,
+            name = 'reward',
+            datapoint = tensor(0)
+        )
+
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'fail',
+            datapoint = False
         )
 
         return experiences
@@ -3475,10 +3568,12 @@ class PiZeroSix(Module):
                         internal = internal,
                         reward = reward,
                         actions = sampled_actions,
-                        terminated = terminated,
                         value = value,
                         task_id = tensor(task_id)
                     )
+
+                    if truncated or terminated:
+                        break
 
         self.accelerate.wait_for_everyone()
 

@@ -291,7 +291,10 @@ def test_value(
 
     assert loss.numel() == 1
 
-def test_pi_zero_six():
+@param('manual_training', (False, True))
+def test_pi_zero_six(
+    manual_training
+):
     from pi_zero_pytorch import π0, PiZeroSix
 
     from vit_pytorch import ViT
@@ -330,7 +333,7 @@ def test_pi_zero_six():
 
     # pass your agent and environment to PiZeroSix for learning to be orchestrated
 
-    pi_zero_six = PiZeroSix(model)
+    pi_zero_six = PiZeroSix(model, cpu = True)
 
     # gather experiences from environment
 
@@ -339,6 +342,7 @@ def test_pi_zero_six():
     # labeling
 
     pi_zero_six.set_episode_fail_(experience, episode_id = 1)
+    pi_zero_six.set_episode_success_(experience, episode_id = 2)
 
     pi_zero_six.calculate_advantages_(experience)
 
@@ -346,15 +350,14 @@ def test_pi_zero_six():
 
     pi_zero_six.invalidate_(experience, 1)
 
-    # now learn from the experience
+    if manual_training:
+        # now learn from the experience
 
-    model = model.cpu() # some error with mps
-
-    for batch in pi_zero_six.dataloader(experience):
-        loss, *_ = model(**batch)
-        loss.backward()
-
-    # repeat
+        for batch in pi_zero_six.dataloader(experience):
+            loss, *_ = model(**batch)
+            loss.backward()
+    else:
+        pi_zero_six.train_value_network(experience, num_train_steps = 4)
 
 def test_train_time_rtc():
     from pi_zero_pytorch import π0
