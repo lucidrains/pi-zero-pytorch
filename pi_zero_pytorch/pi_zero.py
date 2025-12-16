@@ -3109,6 +3109,7 @@ class PiZeroSix(Module):
         agent_or_model: PiZero | Agent,
         config: dict | RecapConfig = DEFAULT_RECAP_CONFIG,
         cpu = False,
+        workspace_folder = './workspace',
         accelerate_kwargs: dict = dict(),
     ):
         super().__init__()
@@ -3149,6 +3150,14 @@ class PiZeroSix(Module):
 
         self.register_buffer('task_fail_penalty', tensor(config.task_fail_penalty))
 
+        # a folder that keeps track of the pretrained model, and for the fine tuning states of all the tasks (which iteration it is on, with 0th being the SFT stage where advantage is fixed to positive)
+
+        self.workspace_folder = Path(workspace_folder)
+        self.workspace_folder.mkdir(exist_ok = True, parents = True)
+
+        self.pretrained_actor_path = self.workspace_folder / 'pretrained-actor.pt'
+        self.pretrained_critic_path = self.workspace_folder / 'pretrained-critic.pt'
+
     def print(self, *args, **kwargs):
         return self.accelerate.print(*args, **kwargs)
 
@@ -3159,6 +3168,34 @@ class PiZeroSix(Module):
     @property
     def unwrapped_critic(self):
         return self.accelerate.unwrap_model(self.agent.critic)
+
+    @property
+    def is_main(self):
+        return self.accelerate.is_main_process
+
+    def save_pretrained(self, overwrite = True):
+        actor, critic = self.unwrapped_actor, self.unwrapped_critic
+
+        if not self.is_main:
+            return
+
+        assert overwrite or not self.pretrained_actor_path.exists()
+        assert overwrite or not self.pretrained_critic_path.exists()
+
+        torch.save(str(self.pretrained_actor_path), actor.state_dict())
+        torch.save(str(self.pretrained_critic_path), critic.state_dict())
+
+    def load_pretrained(self):
+        actor, critic = self.unwrapped_actor, self.unwrapped_critic
+
+        assert self.pretrained_actor_path.exists(), 'pretrained actor does not exist in the workspace'
+        assert self.pretrained_critic_path.exists(), 'pretrained criticdoes not exist in the workspace'
+
+        actor_weights = torch.load(str(self.pretrained_actor_path), weights_only = True)
+        critic_weights = torch.load(str(self.pretrained_critic_path), weights_only = True)
+
+        actor.load_state_dict(actor_weights)
+        critic.load_state_dict(critic_weights)
 
     def dataloader(
         self,
@@ -3267,7 +3304,7 @@ class PiZeroSix(Module):
             'actions',
         ]
 
-        if exists(advantage_ids):
+        if exists(advantage_id):
             fields.append('advantage_ids')
 
         dataloader = self.dataloader(
@@ -3288,7 +3325,7 @@ class PiZeroSix(Module):
 
             batch_dict = next(dl_iter)
 
-            if exists(advantage_ids):
+            if exists(advantage_id):
                 batch_dict['advantage_ids'] = advantage_id
 
             loss, *_ = model(task_id = task_id, **batch_dict)
