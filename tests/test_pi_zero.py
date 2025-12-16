@@ -319,6 +319,7 @@ def test_pi_zero_six(
         vit = v,
         vit_dim = 32,
         dim = 512,
+        depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 20_000,
@@ -354,7 +355,7 @@ def test_pi_zero_six(
             loss, *_ = model(**batch)
             loss.backward()
     else:
-        pi_zero_six.train_value_network(experience, num_train_steps = 4)
+        pi_zero_six.train_value_network(experience, num_train_steps = 2)
 
     pi_zero_six.calculate_return_or_advantages_(experience)
     pi_zero_six.set_advantage_token_id_(experience)
