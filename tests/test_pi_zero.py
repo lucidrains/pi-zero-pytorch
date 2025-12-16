@@ -115,7 +115,7 @@ def test_flow_policy_optimization(
         EFPO,
     )
 
-    from pi_zero_pytorch.mock_env import Env
+    from pi_zero_pytorch.mock import Env
 
     v = ViT(
         image_size = 256,
@@ -182,7 +182,7 @@ def test_evo_strat():
         Agent
     )
 
-    from pi_zero_pytorch.mock_env import Env
+    from pi_zero_pytorch.mock import Env
 
     v = ViT(
         image_size = 256,
@@ -329,7 +329,7 @@ def test_pi_zero_six(
 
     # you'll want to supply your own environment
 
-    from pi_zero_pytorch.mock_env import Env
+    from pi_zero_pytorch.mock import Env
     mock_env = Env((256, 256), 2, 32, 1024, 12)
 
     # pass your agent and environment to PiZeroSix for learning to be orchestrated
@@ -387,3 +387,155 @@ def test_train_time_rtc():
     sampled_actions = model(vision, commands, joint_state, frozen_actions = actions[:, -3:], trajectory_length = 32) # (1, 32, 6)
 
     assert sampled_actions.shape == (1, 32 - 3, 6)
+
+@pytest.fixture
+def pi_zero_six_workspace():
+    from pathlib import Path
+    workspace = Path('./test_workspace_pretrain')
+    replay_folder = Path('./test_replay_buffer_pretrain')
+
+    if workspace.exists():
+        rmtree(workspace)
+    if replay_folder.exists():
+        rmtree(replay_folder)
+
+    yield workspace, replay_folder
+
+    if workspace.exists():
+        rmtree(workspace)
+    if replay_folder.exists():
+        rmtree(replay_folder)
+
+def test_pi_zero_six_pretrain(pi_zero_six_workspace):
+    from pi_zero_pytorch import PiZeroSix
+    from pi_zero_pytorch.mock import create_mock_replay_buffer
+    from vit_pytorch import ViT
+    from vit_pytorch.extractor import Extractor
+
+    workspace, replay_folder = pi_zero_six_workspace
+
+    # mocks
+    v = ViT(
+        image_size = 256,
+        patch_size = 32,
+        num_classes = 1000,
+        dim = 32,
+        depth = 1,
+        heads = 4,
+        dim_head = 8,
+        mlp_dim = 64
+    )
+    
+    v = Extractor(v, return_embeddings_only = True)
+    
+    model = π0(
+        vit = v,
+        vit_dim = 32,
+        dim = 64, # small dim for speed
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 100,
+        num_advantage_tokens = 2,
+        num_tasks = 2
+    )
+    
+    # pi_zero_six
+    
+    pi_zero_six = PiZeroSix(
+        model,
+        cpu = True,
+        workspace_folder = str(workspace)
+    )
+    
+    # mock buffer
+    
+    buffer = create_mock_replay_buffer(
+        folder = replay_folder,
+        max_episodes = 5,
+        max_timesteps = 10,
+        num_episodes = 2,
+        max_task_id = 1,
+        dim_action_input = 6,
+        joint_dim = 12
+    )
+    
+    # run pretrain
+    
+    pi_zero_six.pretrain(
+        buffer,
+        num_train_steps_actor = 1, # minimum steps
+        num_train_steps_critic = 1,
+        batch_size = 2
+    )
+    
+    # check assertions
+    
+    assert (workspace / 'pretrained-actor.pt').exists()
+    assert (workspace / 'pretrained-critic.pt').exists()
+
+def test_pi_zero_six_finetune(pi_zero_six_workspace):
+    from pi_zero_pytorch import PiZeroSix
+    from pi_zero_pytorch.mock import create_mock_replay_buffer
+    from vit_pytorch import ViT
+    from vit_pytorch.extractor import Extractor
+
+    workspace, replay_folder = pi_zero_six_workspace
+
+    # mocks
+    v = ViT(
+        image_size = 256,
+        patch_size = 32,
+        num_classes = 1000,
+        dim = 32,
+        depth = 1,
+        heads = 4,
+        dim_head = 8,
+        mlp_dim = 64
+    )
+    
+    v = Extractor(v, return_embeddings_only = True)
+    
+    model = π0(
+        vit = v,
+        vit_dim = 32,
+        dim = 64, # small dim for speed
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 100,
+        num_advantage_tokens = 2,
+        num_tasks = 2
+    )
+    
+    # pi_zero_six
+    
+    pi_zero_six = PiZeroSix(
+        model,
+        cpu = True,
+        workspace_folder = str(workspace)
+    )
+    
+    # mock buffer
+    
+    buffer = create_mock_replay_buffer(
+        folder = replay_folder,
+        max_episodes = 5,
+        max_timesteps = 10,
+        num_episodes = 2,
+        max_task_id = 1,
+        dim_action_input = 6,
+        joint_dim = 12
+    )
+
+    # run pretrain to generate artifacts
+
+    pi_zero_six.pretrain(
+        buffer,
+        num_train_steps_actor = 1, # minimum steps
+        num_train_steps_critic = 1,
+        batch_size = 2
+    )
+
+    # run finetune and expect NotImplementedError
+
+    with pytest.raises(NotImplementedError):
+        pi_zero_six.finetune(buffer)
