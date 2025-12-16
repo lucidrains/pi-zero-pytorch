@@ -3250,6 +3250,7 @@ class PiZeroSix(Module):
         num_train_steps: int,
         optim_klass = AdamAtan2,
         task_id: int | None = None,
+        advantage_id: int | None = None, # for step 2 (SFT stage) - (or the 0th iteration of the finetuning loop) they fix the advantage token to be always positive
         batch_size = 8,
         lr = 3e-4,
         weight_decay = 1e-2,
@@ -3259,17 +3260,21 @@ class PiZeroSix(Module):
     ):
         optim = optim_klass(self.unwrapped_actor.parameters(), lr = lr, weight_decay = weight_decay, **optim_kwargs)
 
+        fields = [
+            'images',
+            'text',
+            'internal',
+            'actions',
+        ]
+
+        if exists(advantage_ids):
+            fields.append('advantage_ids')
+
         dataloader = self.dataloader(
             experience,
             batch_size = batch_size,
             task_id = task_id,
-            fields = [
-                'images',
-                'text',
-                'internal',
-                'actions',
-                'advantage_ids'
-            ],
+            fields = fields,
             **dl_kwargs
         )
 
@@ -3282,6 +3287,9 @@ class PiZeroSix(Module):
         for _ in range(num_train_steps):
 
             batch_dict = next(dl_iter)
+
+            if exists(advantage_ids):
+                batch_dict['advantage_ids'] = advantage_id
 
             loss, *_ = model(task_id = task_id, **batch_dict)
 
