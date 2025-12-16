@@ -343,12 +343,9 @@ def test_pi_zero_six(
 
     pi_zero_six.set_episode_fail_(experience, episode_id = 1)
     pi_zero_six.set_episode_success_(experience, episode_id = 2)
-
-    pi_zero_six.calculate_advantages_(experience)
-
-    pi_zero_six.set_advantage_token_id_(experience)
-
     pi_zero_six.invalidate_(experience, 1)
+
+    pi_zero_six.calculate_return_or_advantages_(experience)
 
     if manual_training:
         # now learn from the experience
@@ -358,6 +355,11 @@ def test_pi_zero_six(
             loss.backward()
     else:
         pi_zero_six.train_value_network(experience, num_train_steps = 4)
+
+    pi_zero_six.calculate_return_or_advantages_(experience)
+    pi_zero_six.set_advantage_token_id_(experience)
+
+    pi_zero_six.train_policy_network(experience, num_train_steps = 2)
 
 def test_train_time_rtc():
     from pi_zero_pytorch import π0

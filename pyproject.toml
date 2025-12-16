@@ -1,6 +1,6 @@
 [project]
 name = "pi-zero-pytorch"
-version = "0.4.37"
+version = "0.4.38"
 description = "π0 in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

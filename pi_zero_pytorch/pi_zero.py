@@ -3244,21 +3244,55 @@ class PiZeroSix(Module):
 
         self.print('value network training complete')
 
-    @beartype
-    def normalize_rewards_(
+    def train_policy_network(
         self,
-        experiences: ReplayBuffer
+        experience: ReplayBuffer,
+        num_train_steps: int,
+        optim_klass = AdamAtan2,
+        task_id: int | None = None,
+        batch_size = 8,
+        lr = 3e-4,
+        weight_decay = 1e-2,
+        max_grad_norm = 0.5,
+        dl_kwargs: dict = dict(),
+        optim_kwargs: dict = dict()
     ):
-        # the rewards are normalized to -1 to 0, so just divide by the max length of the episode
+        optim = optim_klass(self.unwrapped_actor.parameters(), lr = lr, weight_decay = weight_decay, **optim_kwargs)
 
-        buffer = experiences
+        dataloader = self.dataloader(
+            experience,
+            batch_size = batch_size,
+            task_id = task_id,
+            fields = [
+                'images',
+                'text',
+                'internal',
+                'actions',
+                'advantage_ids'
+            ],
+            **dl_kwargs
+        )
 
-        has_task = buffer.meta_data['task_id'] >= 0
-        rewards = buffer.data['reward'][has_task]
-        episode_lens = buffer.episode_lens[has_task]
+        model = self.agent.actor
 
-        buffer.data['reward'][has_task] = einx.divide('e t, e', rewards, episode_lens)
-        buffer.flush()
+        dataloader, optim = self.accelerate.prepare(dataloader, optim)
+
+        dl_iter = cycle(dataloader)
+
+        for _ in range(num_train_steps):
+
+            batch_dict = next(dl_iter)
+
+            loss, *_ = model(task_id = task_id, **batch_dict)
+
+            self.accelerate.backward(loss)
+
+            self.accelerate.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+            optim.step()
+            optim.zero_grad()
+
+        self.print('policy network training complete')
 
     @beartype
     def invalidate_(
@@ -3273,18 +3307,15 @@ class PiZeroSix(Module):
         )
 
     @beartype
-    def calculate_advantages_(
+    def calculate_return_or_advantages_(
         self,
         experiences: ReplayBuffer,
-        gamma = 1., # they do no discount, so value network is predicting its distance from task completion (with a negative sign from -1 to 0)
+        type: Literal['returns', 'advantages', 'returns_and_advantages'] = 'returns_and_advantages',
+        gamma = 1.,
         lam = 0.95,
+        mode: Literal['pretrain', 'finetune'] = 'finetune',
         use_accelerated = None,
-        normalize_rewards_by_task_max_len = True,
-        mode: Literal['pretrain', 'finetune'] = 'finetune'
     ):
-
-        if normalize_rewards_by_task_max_len:
-            self.normalize_rewards_(experiences)
 
         buffer = experiences
 
@@ -3341,13 +3372,17 @@ class PiZeroSix(Module):
 
                 advantages = advantages - gamma_nth_step * future_advantages
 
-            # store advantages
+            # maybe store advantages
 
-            buffer.data['advantages'][episode_id, :episode_len] = advantages.cpu().numpy()
+            if type in {'advantages', 'returns_and_advantages'}:
 
-            # store the returns
+                buffer.data['advantages'][episode_id, :episode_len] = advantages.cpu().numpy()
 
-            buffer.data['returns'][episode_id, :episode_len] = (advantages + values).cpu().numpy()
+            # maybe store the returns
+
+            if type in {'returns', 'returns_and_advantages'}:
+
+                buffer.data['returns'][episode_id, :episode_len] = (advantages + values).cpu().numpy()
 
             # flush
 
@@ -3493,10 +3528,14 @@ class PiZeroSix(Module):
         cond_scale = 1.,
         experience_path = './experiences',
         task_id = -1,
+        normalize_reward_by_steps = None,
         recap_step = 0, # starts at 0, in which case the logic will be the SFT step, before the proper binary advantage conditioning
        **sampling_kwargs
 
     ) -> ReplayBuffer:
+
+        has_task = task_id >= 0
+        normalize_reward_by_steps = default(normalize_reward_by_steps, has_task)
 
         assert cond_scale > 0., f'classifier free guidance scaling must be enabled for proposed pi0.6'
 
@@ -3510,6 +3549,8 @@ class PiZeroSix(Module):
         # get the max length of each task from the config
 
         if not exists(steps):
+            assert has_task
+
             task_str = self.task_strings[task_id]
 
             task_config = self.config.tasks[task_str]
@@ -3576,6 +3617,9 @@ class PiZeroSix(Module):
                     images, text, internal, reward, terminated, actions, value = to_device([*states, reward, terminated, sampled_actions, value], torch.device('cpu'))
 
                     states = next_states
+
+                    if normalize_reward_by_steps:
+                        reward /= steps # normalize reward by the max task length defined in the config
 
                     experience_buffer.store(
                         images = images,
