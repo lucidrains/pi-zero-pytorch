@@ -28,6 +28,7 @@ def create_mock_replay_buffer(
     max_text_len = 32,
     joint_dim = 12,
     dim_action_input = 6,
+    trajectory_length = 16,
     cleanup_if_exists = True
 ):
     if cleanup_if_exists and Path(folder).exists():
@@ -56,7 +57,7 @@ def create_mock_replay_buffer(
             text        = ('int', (max_text_len,)),
             internal    = ('float', (joint_dim,)),
             reward      = 'float',
-            actions     = ('float', (max_timesteps, dim_action_input)),
+            actions     = ('float', (trajectory_length, dim_action_input)),
             terminated  = 'bool',
             value       = 'float',
             advantages  = 'float',
@@ -81,7 +82,7 @@ def create_mock_replay_buffer(
                 text = randint(0, num_text_tokens, (max_text_len,))
                 internal = randn(joint_dim)
                 reward = randn(())
-                actions = randn(max_timesteps, dim_action_input)
+                actions = randn(trajectory_length, dim_action_input)
                 terminated = (step == episode_len - 1)
                 value = randn(())
                 advantages = randn(())

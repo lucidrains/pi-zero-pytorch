@@ -511,3 +511,14 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
     experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, task_id = task_id)
 
     assert (workspace / task_name / "0" / "data.1").exists()
+
+    # complete one iteration of recap
+
+    pi_zero_six.recap_finetune(
+        task_id,
+        num_train_steps_actor = 1, # minimum steps
+        num_train_steps_critic = 1,
+        batch_size = 2
+    )
+
+    assert (workspace / task_name / "1" / "actor.pt").exists()

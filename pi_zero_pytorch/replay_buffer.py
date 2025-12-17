@@ -1,4 +1,5 @@
 from __future__ import annotations
+import pickle
 
 from pathlib import Path
 from collections import namedtuple
@@ -54,8 +55,23 @@ class ReplayBuffer:
         max_timesteps: int,
         fields: FIELD_TYPE,
         meta_fields: FIELD_TYPE = dict(),
-        circular = True,
+        circular = False,
     ):
+
+        # save the hyperparameters, so it can be rehydrated from a json file
+
+        config_path = folder / 'data.pkl'
+
+        if not config_path.exists():
+            config = dict(
+                max_episodes = max_episodes,
+                max_timesteps = max_timesteps,
+                fields = fields,
+                meta_fields = meta_fields
+            )
+
+            with open(str(config_path), 'wb') as data:
+                pickle.dump(config, data)
 
         # folder for data
 
@@ -72,8 +88,15 @@ class ReplayBuffer:
         self.episode_index = 0
         self.timestep_index = 0
 
+        # auto infer the max episodes and max timesteps by grabbing a random data memmap file
+
+        if not exists(max_episodes) or not exists(max_timesteps):
+            field_name, field_info = next(iter(fields.items()))
+            filepath = folder / f'{file_name}.data.npy'
+            assert filepath.exists(), f'if not instantiating buffer from existing folder'
+
         self.max_episodes = max_episodes
-        self.max_timesteps= max_timesteps
+        self.max_timesteps = max_timesteps
 
         assert 'episode_lens' not in meta_fields
 
@@ -153,6 +176,16 @@ class ReplayBuffer:
         # whether the buffer should loop back around - for online policy opt related
 
         self.circular = circular
+
+    @classmethod
+    def from_config(cls, folder, config_name = 'data.pkl'):
+        filepath = folder / config_name
+        assert filepath.exists()
+
+        with open(str(filepath), 'rb') as data:
+            config = pickle.load(data)
+
+        return cls(folder, **config)
 
     @property
     def episode_lens(self):

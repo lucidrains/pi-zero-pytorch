@@ -29,7 +29,7 @@ from torch.distributions.beta import Beta
 
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 
-from torch.utils.data import TensorDataset, DataLoader, Dataset
+from torch.utils.data import TensorDataset, ConcatDataset, DataLoader, Dataset
 
 from torchdiffeq import odeint
 
@@ -2974,6 +2974,17 @@ class PiZeroSix(Module):
         actor.load_state_dict(actor_state_dict)
         critic.load_state_dict(critic_state_dict)
 
+    def get_last_task_finetune_folder(self, task_id):
+        task_workspace = self.task_workspaces[task_id]
+
+        finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/')]
+
+        assert len(finetune_ids) > 0, 'you need to run `.sft` first to generate the finetuned specialist (pretrain data filtered by task) before initiating rollouts with environment for recap algorithm'
+
+        finetune_id = max(finetune_ids)
+
+        return task_workspace / str(finetune_id)
+
     def pretrain(
         self,
         num_train_steps_actor = 100,
@@ -2999,7 +3010,8 @@ class PiZeroSix(Module):
         task_id_or_name: int | str,
         num_train_steps_actor = 100,
         num_train_steps_critic = 100,
-        batch_size = 4
+        batch_size = 4,
+        recalculate_advantages_with_finetuned_critic = False
     ):
 
         if isinstance(task_id_or_name, int):
@@ -3029,6 +3041,9 @@ class PiZeroSix(Module):
 
         self.train_value_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
+        if recalculate_advantages_with_finetuned_critic:
+            self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'finetune')
+
         self.train_policy_network(replay_buffer, advantage_id = self.positive_advantage_id, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
 
         self.save(sft_workspace)
@@ -3036,7 +3051,6 @@ class PiZeroSix(Module):
     def recap_finetune(
         self,
         task_id_or_name: int | str,
-        replay_buffer: ReplayBuffer,
         num_train_steps_actor = 100,
         num_train_steps_critic = 100,
         batch_size = 4
@@ -3051,13 +3065,74 @@ class PiZeroSix(Module):
             assert task_name in self.task_name_id
             task_id = self.task_name_id[task_name]
 
-        self.load_pretrained()
+        task_workspace = self.task_workspaces[task_id]
 
-        raise NotImplementedError('finetuning logic is not yet implemented')
+        pretrain_data = self.pretrain_data
+
+        all_data_folders = [*task_workspace.glob('*/data.*/')]
+        assert len(all_data_folders) > 0, f'no experiences generated yet through rollouts with environment'
+
+        all_rollout_data = [ReplayBuffer.from_config(data_dir) for data_dir in all_data_folders]
+
+        all_data = [pretrain_data, *all_rollout_data]
+
+        all_datasets = [
+            self.dataset(pretrain_data, task_id = task_id),
+            *[self.dataset(data) for data in all_rollout_data]
+        ]
+
+        # concat all the datasets for finetuning the next iteration
+
+        concatted_dataset = ConcatDataset(all_datasets)
+
+        # now finetune and save the next version of the actor / critic
+        # todo - make a copy of the filtered pretrained dataset (by task id) into the task subfolder
+
+        for replay_buffer in all_rollout_data:
+            self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'finetune')
+
+        self.train_value_network(concatted_dataset, num_train_steps = num_train_steps_critic, batch_size = batch_size)
+
+        for replay_buffer in all_rollout_data:
+            self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'finetune')
+            self.set_advantage_token_id_(replay_buffer, mode = 'finetune')
+
+        self.train_policy_network(concatted_dataset, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+
+        # save to the next fine tune folder for the next recap iteration
+
+        task_workspace = self.task_workspaces[task_id]
+        finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/')]
+        finetune_id = max(finetune_ids)
+        next_recap_iter_id = finetune_id + 1
+
+        self.save(task_workspace / str(next_recap_iter_id))
+
+    def dataset(
+        self,
+        experiences: ReplayBuffer,
+        task_id: int | None = None, 
+        fields: list[str] | None = None
+    ):
+        return ReplayDataset(
+            experiences,
+            fields = default(fields, [
+                'images',
+                'text',
+                'internal',
+                'actions',
+                'returns'
+            ]),
+            task_id = task_id,
+            fieldname_map = dict(
+                text = 'token_ids',
+                internal = 'joint_state',
+            )
+        )
 
     def dataloader(
         self,
-        experiences: ReplayBuffer,
+        experiences: ReplayBuffer | Dataset,
         batch_size = 8,
         task_id: int | none = None,
         fields: list[str] | None = None,
@@ -3065,15 +3140,10 @@ class PiZeroSix(Module):
 
     ) -> DataLoader:
 
-        dataset = ReplayDataset(
-            experiences,
-            fields = fields,
-            task_id = task_id,
-            fieldname_map = dict(
-                text = 'token_ids',
-                internal = 'joint_state',
-            )
-        )
+        if not isinstance(experiences, Dataset):
+            dataset = self.dataset(experiences, task_id = task_id, fields = fields)
+        else:
+            dataset = experiences
 
         assert len(dataset) > 0, 'no experiences to learn from'
 
@@ -3101,13 +3171,6 @@ class PiZeroSix(Module):
             experience,
             batch_size = batch_size,
             task_id = task_id,
-            fields = [
-                'images',
-                'text',
-                'internal',
-                'actions',
-                'returns'
-            ],
             **dl_kwargs
         )
 
@@ -3141,7 +3204,7 @@ class PiZeroSix(Module):
 
     def train_policy_network(
         self,
-        experience: ReplayBuffer,
+        experience: ReplayBuffer | Dataset,
         num_train_steps: int,
         optim_klass = AdamAtan2,
         task_id: int | None = None,
@@ -3456,17 +3519,7 @@ class PiZeroSix(Module):
             task_str = self.task_strings[task_id]
             task_config = self.config.tasks[task_str]
 
-            task_workspace = self.task_workspaces[task_id]
-
-            finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/')]
-
-            assert len(finetune_ids) > 0, 'you need to run `.sft` first to generate the finetuned specialist (pretrain data filtered by task) before initiating rollouts with environment for recap algorithm'
-
-            finetune_id = max(finetune_ids)
-
-            # load the correct actor critic
-
-            task_finetune_folder = task_workspace / str(finetune_id)
+            task_finetune_folder = self.get_last_task_finetune_folder(task_id)
 
             self.load(task_finetune_folder)
 
