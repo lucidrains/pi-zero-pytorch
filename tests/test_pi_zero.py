@@ -494,3 +494,20 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
 
     assert (workspace / task_name / "0" / "actor.pt").exists()
     assert (workspace / task_name / "0" / "critic.pt").exists()
+
+    # rollout
+
+    from pi_zero_pytorch.mock import Env
+    mock_env = Env((256, 256), 2, 32, 1024, 12)
+
+    experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, task_id = task_id)
+
+    # make sure experience is saved
+
+    assert (workspace / task_name / "0" / "data.0").exists()
+
+    # make sure can gather consecutive experiences
+
+    experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, task_id = task_id)
+
+    assert (workspace / task_name / "0" / "data.1").exists()

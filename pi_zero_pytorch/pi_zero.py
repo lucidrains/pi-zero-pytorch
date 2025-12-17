@@ -2950,6 +2950,30 @@ class PiZeroSix(Module):
         torch.save(actor.state_dict(), str(actor_path))
         torch.save(critic.state_dict(), str(critic_path))
 
+    def load(
+        self,
+        folder: str | Path,
+        overwrite = True
+    ):
+        actor, critic = self.unwrapped_actor, self.unwrapped_critic
+
+        if isinstance(folder, str):
+            folder = Path(folder)
+
+        folder.mkdir(exist_ok = True, parents = True)
+
+        actor_path = folder / 'actor.pt'
+        critic_path = folder / 'critic.pt'
+
+        assert overwrite or not actor_path.exists()
+        assert overwrite or not critic_path.exists()
+
+        actor_state_dict = torch.load(str(actor_path), weights_only = True)
+        critic_state_dict = torch.load(str(critic_path), weights_only = True)
+
+        actor.load_state_dict(actor_state_dict)
+        critic.load_state_dict(critic_state_dict)
+
     def pretrain(
         self,
         num_train_steps_actor = 100,
@@ -3009,7 +3033,7 @@ class PiZeroSix(Module):
 
         self.save(sft_workspace)
 
-    def finetune(
+    def recap_finetune(
         self,
         task_id_or_name: int | str,
         replay_buffer: ReplayBuffer,
@@ -3405,7 +3429,7 @@ class PiZeroSix(Module):
         flow_sampling_steps = 4,
         max_timesteps = 64,
         cond_scale = 1.,
-        experience_path = './experiences',
+        experience_store_path = None,
         task_id = -1,
         normalize_reward_by_steps = None,
         recap_step = 0, # starts at 0, in which case the logic will be the SFT step, before the proper binary advantage conditioning
@@ -3418,7 +3442,7 @@ class PiZeroSix(Module):
 
         assert cond_scale > 0., f'classifier free guidance scaling must be enabled for proposed pi0.6'
 
-        assert exists(steps) ^ task_id > 0, 'either `steps` or `task_id` must be defined, but not both - each task has its own specified max length for normalizing the rewards'
+        assert exists(steps) ^ has_task, 'either `steps` or `task_id` must be defined, but not both - each task has its own specified max length for normalizing the rewards'
 
         self.agent.eval()
 
@@ -3426,20 +3450,52 @@ class PiZeroSix(Module):
         critic = self.unwrapped_critic
 
         # get the max length of each task from the config
+        # also determine the last finetuned actor / critic and load
+
+        if has_task:
+            task_str = self.task_strings[task_id]
+            task_config = self.config.tasks[task_str]
+
+            task_workspace = self.task_workspaces[task_id]
+
+            finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/')]
+
+            assert len(finetune_ids) > 0, 'you need to run `.sft` first to generate the finetuned specialist (pretrain data filtered by task) before initiating rollouts with environment for recap algorithm'
+
+            finetune_id = max(finetune_ids)
+
+            # load the correct actor critic
+
+            task_finetune_folder = task_workspace / str(finetune_id)
+
+            self.load(task_finetune_folder)
+
+        # default some task specific config
+        # (1) the max episode length per task for normalizing the rewards
 
         if not exists(steps):
             assert has_task
-
-            task_str = self.task_strings[task_id]
-
-            task_config = self.config.tasks[task_str]
-
             steps = task_config.max_episode_length
 
-        # replay buffer
+        # (2) the task workspace path, where data is stored with folder names data.0, data.1, etc. for consecutive rollouts
+
+        if has_task:
+            assert not exists(experience_store_path)
+
+            past_data = [int(str(file).split('.')[-1]) for file in task_finetune_folder.glob("data.*/")]
+
+            last_rollout_id = max(past_data) if len(past_data) > 0 else -1
+            next_rollout_id = last_rollout_id + 1
+
+            experience_store_path = task_finetune_folder / f"data.{next_rollout_id}"
+            experience_store_path.mkdir()
+        else:
+            experience_store_path = './experiences'
+
+        # create the buffer for storing the data
 
         experience_buffer = ReplayBuffer(
-            experience_path,
+            experience_store_path,
             max_episodes = num_episodes,
             max_timesteps = steps,
             meta_fields = dict(
