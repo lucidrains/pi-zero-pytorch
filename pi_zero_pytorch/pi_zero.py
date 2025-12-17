@@ -3280,6 +3280,23 @@ class PiZeroSix(Module):
         )
 
     @beartype
+    def invalidate_by_value_threshold_(
+        self,
+        experiences: ReplayBuffer,
+        threshold: float,
+        task_id = None,
+        value_field = 'value',
+    ):
+        assert 'invalidated' in experiences.data
+
+        should_invalidate = experiences.data[value_field] <= threshold
+
+        if exists(task_id):
+            should_invalidate = should_invalidate & experiences.data['task_id'] == task_id
+
+        experiences.data['invalidated'][:] = should_invalidate
+
+    @beartype
     def calculate_return_or_advantages_(
         self,
         experiences: ReplayBuffer,
@@ -3577,6 +3594,7 @@ class PiZeroSix(Module):
                 returns     = 'float',
                 advantage_ids = 'int',
                 task_id     = 'int',
+                invalidated = 'bool'
             )
         )
 

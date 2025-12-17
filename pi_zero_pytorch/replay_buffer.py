@@ -310,7 +310,6 @@ class ReplayDataset(Dataset):
     def __init__(
         self,
         experiences: ReplayBuffer,
-        recap_step: int | None = None,
         task_id: int | None = None,
         fields: list[str] | None = None,
         fieldname_map: dict[str, str] = dict()
@@ -323,13 +322,6 @@ class ReplayDataset(Dataset):
         max_episode_len = episode_lens.amax().item()
 
         valid_mask = (experiences.episode_lens > 0) & ~experiences.meta_data['invalidated']
-
-        # allow for filtering by recap step - todo: allow for set of ids
-
-        if exists(recap_step):
-            episode_recap_steps = experiences.meta_data['recap_step']
-            is_recap_step = episode_recap_steps == recap_step
-            valid_mask = valid_mask & is_recap_step
 
         # filter by task id
 
@@ -348,6 +340,13 @@ class ReplayDataset(Dataset):
         ), dim = -1)
 
         valid_timesteps = einx.less('j, i -> i j', timesteps, valid_episode_lens)
+
+        # filter by invalidated - bytedance's filtered BC method
+
+        if 'invalidated' in experiences.data:
+            timestep_invalidated = experiences.data['invalidated'][valid_episodes, :max_episode_len]
+
+            valid_timesteps = valid_timesteps & ~timestep_invalidated
 
         self.timepoints = episode_timesteps[valid_timesteps]
 

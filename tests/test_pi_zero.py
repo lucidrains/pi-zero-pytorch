@@ -346,6 +346,8 @@ def test_pi_zero_six(
     pi_zero_six.set_episode_success_(experience, episode_id = 2)
     pi_zero_six.invalidate_(experience, 1)
 
+    pi_zero_six.invalidate_by_value_threshold_(experience, -100.)
+
     pi_zero_six.calculate_return_or_advantages_(experience)
 
     if manual_training:
