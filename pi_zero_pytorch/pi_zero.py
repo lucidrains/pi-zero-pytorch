@@ -2850,6 +2850,10 @@ class PiZeroSix(Module):
 
         agent.actor, agent.critic = self.accelerate.prepare(agent.actor, agent.critic)
 
+        # positive advantage id
+
+        self.positive_advantage_id = agent.actor.num_advantage_tokens - 1 # assume the last advantage token is the highest positive, if there is gradation
+
         # labeling
 
         self.register_buffer('task_fail_penalty', tensor(config.task_fail_penalty))
@@ -3001,7 +3005,7 @@ class PiZeroSix(Module):
 
         self.train_value_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
-        self.train_policy_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+        self.train_policy_network(replay_buffer, advantage_id = self.positive_advantage_id, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
 
         self.save(sft_workspace)
 
@@ -3023,8 +3027,8 @@ class PiZeroSix(Module):
             assert task_name in self.task_name_id
             task_id = self.task_name_id[task_name]
 
-
         self.load_pretrained()
+
         raise NotImplementedError('finetuning logic is not yet implemented')
 
     def dataloader(
