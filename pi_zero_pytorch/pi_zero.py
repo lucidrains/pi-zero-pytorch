@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Any
 
 import math
 from copy import deepcopy
@@ -2805,6 +2806,7 @@ class PiZeroSix(Module):
     def __init__(
         self,
         agent_or_model: PiZero | Agent,
+        pretrain_data: ReplayBuffer,
         config: dict | RecapConfig = DEFAULT_RECAP_CONFIG,
         cpu = False,
         workspace_folder = './workspace',
@@ -2848,6 +2850,10 @@ class PiZeroSix(Module):
 
         self.register_buffer('task_fail_penalty', tensor(config.task_fail_penalty))
 
+        # pretrain data
+
+        self.pretrain_data = pretrain_data
+
         # a folder that keeps track of the pretrained model, and for the fine tuning states of all the tasks (which iteration it is on, with 0th being the SFT stage where advantage is fixed to positive)
 
         self.workspace_folder = Path(workspace_folder)
@@ -2887,7 +2893,7 @@ class PiZeroSix(Module):
         actor, critic = self.unwrapped_actor, self.unwrapped_critic
 
         assert self.pretrained_actor_path.exists(), 'pretrained actor does not exist in the workspace'
-        assert self.pretrained_critic_path.exists(), 'pretrained criticdoes not exist in the workspace'
+        assert self.pretrained_critic_path.exists(), 'pretrained critic does not exist in the workspace'
 
         actor_weights = torch.load(str(self.pretrained_actor_path), weights_only = True)
         critic_weights = torch.load(str(self.pretrained_critic_path), weights_only = True)
@@ -2897,11 +2903,12 @@ class PiZeroSix(Module):
 
     def pretrain(
         self,
-        replay_buffer: ReplayBuffer,
         num_train_steps_actor = 100,
         num_train_steps_critic = 100,
         batch_size = 4
     ):
+        replay_buffer = self.pretrain_data
+
         self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'pretrain')
 
         self.train_value_network(replay_buffer, num_train_steps = num_train_steps_critic, batch_size = batch_size)

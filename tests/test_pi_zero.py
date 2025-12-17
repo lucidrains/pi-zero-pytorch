@@ -391,22 +391,27 @@ def test_train_time_rtc():
 @pytest.fixture
 def pi_zero_six_workspace():
     from pathlib import Path
-    workspace = Path('./test_workspace_pretrain')
-    replay_folder = Path('./test_replay_buffer_pretrain')
+    workspace = Path('./test/workspace_pretrain')
+    replay_folder = Path('./test/replay_buffer_pretrain')
 
     if workspace.exists():
-        rmtree(workspace)
+        rmtree(workspace, ignore_error = True)
+
     if replay_folder.exists():
-        rmtree(replay_folder)
+        rmtree(replay_folder, ignore_error = True)
+
+    workspace.mkdir(exist_ok = True, parents = True)
+    replay_folder.mkdir(exist_ok = True, parents = True)
 
     yield workspace, replay_folder
 
     if workspace.exists():
         rmtree(workspace)
+
     if replay_folder.exists():
         rmtree(replay_folder)
 
-def test_pi_zero_six_pretrain(pi_zero_six_workspace):
+def test_pi_zero_six_recap(pi_zero_six_workspace):
     from pi_zero_pytorch import PiZeroSix
     from pi_zero_pytorch.mock import create_mock_replay_buffer
     from vit_pytorch import ViT
@@ -439,17 +444,9 @@ def test_pi_zero_six_pretrain(pi_zero_six_workspace):
         num_tasks = 2
     )
     
-    # pi_zero_six
-    
-    pi_zero_six = PiZeroSix(
-        model,
-        cpu = True,
-        workspace_folder = str(workspace)
-    )
-    
     # mock buffer
     
-    buffer = create_mock_replay_buffer(
+    mock_pretrain = create_mock_replay_buffer(
         folder = replay_folder,
         max_episodes = 5,
         max_timesteps = 10,
@@ -458,84 +455,25 @@ def test_pi_zero_six_pretrain(pi_zero_six_workspace):
         dim_action_input = 6,
         joint_dim = 12
     )
+
+    # pi_zero_six
     
-    # run pretrain
+    pi_zero_six = PiZeroSix(
+        model,
+        pretrain_data = mock_pretrain,
+        cpu = True,
+        workspace_folder = str(workspace)
+    )
     
+    # run pretrain for generalist
+
     pi_zero_six.pretrain(
-        buffer,
         num_train_steps_actor = 1, # minimum steps
         num_train_steps_critic = 1,
         batch_size = 2
     )
-    
+
     # check assertions
     
     assert (workspace / 'pretrained-actor.pt').exists()
     assert (workspace / 'pretrained-critic.pt').exists()
-
-def test_pi_zero_six_finetune(pi_zero_six_workspace):
-    from pi_zero_pytorch import PiZeroSix
-    from pi_zero_pytorch.mock import create_mock_replay_buffer
-    from vit_pytorch import ViT
-    from vit_pytorch.extractor import Extractor
-
-    workspace, replay_folder = pi_zero_six_workspace
-
-    # mocks
-    v = ViT(
-        image_size = 256,
-        patch_size = 32,
-        num_classes = 1000,
-        dim = 32,
-        depth = 1,
-        heads = 4,
-        dim_head = 8,
-        mlp_dim = 64
-    )
-    
-    v = Extractor(v, return_embeddings_only = True)
-    
-    model = π0(
-        vit = v,
-        vit_dim = 32,
-        dim = 64, # small dim for speed
-        dim_action_input = 6,
-        dim_joint_state = 12,
-        num_tokens = 100,
-        num_advantage_tokens = 2,
-        num_tasks = 2
-    )
-    
-    # pi_zero_six
-    
-    pi_zero_six = PiZeroSix(
-        model,
-        cpu = True,
-        workspace_folder = str(workspace)
-    )
-    
-    # mock buffer
-    
-    buffer = create_mock_replay_buffer(
-        folder = replay_folder,
-        max_episodes = 5,
-        max_timesteps = 10,
-        num_episodes = 2,
-        max_task_id = 1,
-        dim_action_input = 6,
-        joint_dim = 12
-    )
-
-    # run pretrain to generate artifacts
-
-    pi_zero_six.pretrain(
-        buffer,
-        num_train_steps_actor = 1, # minimum steps
-        num_train_steps_critic = 1,
-        batch_size = 2
-    )
-
-    # run finetune and expect NotImplementedError
-
-    with pytest.raises(NotImplementedError):
-        pi_zero_six.finetune(buffer)
