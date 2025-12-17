@@ -2825,6 +2825,10 @@ class PiZeroSix(Module):
 
         self.config = config
 
+        # pretrain data
+
+        self.pretrain_data = pretrain_data
+
         # task ids for now are implicitly the order of the keys
 
         self.task_strings = list(config.tasks.keys())
@@ -2850,10 +2854,6 @@ class PiZeroSix(Module):
 
         self.register_buffer('task_fail_penalty', tensor(config.task_fail_penalty))
 
-        # pretrain data
-
-        self.pretrain_data = pretrain_data
-
         # a folder that keeps track of the pretrained model, and for the fine tuning states of all the tasks (which iteration it is on, with 0th being the SFT stage where advantage is fixed to positive)
 
         self.workspace_folder = Path(workspace_folder)
@@ -2861,6 +2861,27 @@ class PiZeroSix(Module):
 
         self.pretrained_actor_path = self.workspace_folder / 'pretrained-actor.pt'
         self.pretrained_critic_path = self.workspace_folder / 'pretrained-critic.pt'
+
+        # very simply, each specialized task will have a subfolder within the workspace folder
+        # this will contain folders enumerated from 0 to K times, where K is the improvement iteration for the RECAP algorithm in pi0.6
+
+        num_episodes = pretrain_data.num_episodes
+        task_ids = np.unique(pretrain_data.meta_data['task_id'][:num_episodes]).tolist()
+
+        assert all([0 <= task_id < len(self.task_strings) for task_id in task_ids]), 'invalid task_id discovered in replay buffer'
+
+        self.task_id_name = {task_id: self.task_strings[task_id] for task_id in task_ids}
+        self.task_name_id = {task_name: task_id for task_id, task_name in self.task_id_name.items()}
+
+        # create all folders if not exist
+
+        self.task_workspaces = dict()
+
+        for task_id, task_name in self.task_id_name.items():
+            task_workspace_folder = self.workspace_folder / task_name
+            task_workspace_folder.mkdir(exist_ok = True)
+
+            self.task_workspaces[task_id] = task_workspace_folder
 
     def print(self, *args, **kwargs):
         return self.accelerate.print(*args, **kwargs)
@@ -2901,6 +2922,30 @@ class PiZeroSix(Module):
         actor.load_state_dict(actor_weights)
         critic.load_state_dict(critic_weights)
 
+    def save(
+        self,
+        folder: str | Path,
+        overwrite = True
+    ):
+        actor, critic = self.unwrapped_actor, self.unwrapped_critic
+
+        if isinstance(folder, str):
+            folder = Path(folder)
+
+        folder.mkdir(exist_ok = True, parents = True)
+
+        if not self.is_main:
+            return
+
+        actor_path = folder / 'actor.pt'
+        critic_path = folder / 'critic.pt'
+
+        assert overwrite or not actor_path.exists()
+        assert overwrite or not critic_path.exists()
+
+        torch.save(actor.state_dict(), str(actor_path))
+        torch.save(critic.state_dict(), str(critic_path))
+
     def pretrain(
         self,
         num_train_steps_actor = 100,
@@ -2921,11 +2966,64 @@ class PiZeroSix(Module):
 
         self.save_pretrained()
 
-    def finetune(
+    def sft(
         self,
-        replay_buffer: ReplayBuffer,
+        task_id_or_name: int | str,
+        num_train_steps_actor = 100,
+        num_train_steps_critic = 100,
         batch_size = 4
     ):
+
+        if isinstance(task_id_or_name, int):
+            task_id = task_id_or_name
+            assert task_id in self.task_id_name
+            task_name = self.task_id_name[task_id]
+        else:
+            task_name = task_id_or_name
+            assert task_name in self.task_name_id
+            task_id = self.task_name_id[task_name]
+
+        task_workspace = self.task_workspaces[task_id]
+
+        # makes sure it does not already exist
+
+        sft_workspace = task_workspace / "0"
+
+        assert not sft_workspace.exists()
+
+        # starts from pretrained
+
+        self.load_pretrained()
+
+        # sft only for the task
+
+        replay_buffer = self.pretrain_data
+
+        self.train_value_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_critic, batch_size = batch_size)
+
+        self.train_policy_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+
+        self.save(sft_workspace)
+
+    def finetune(
+        self,
+        task_id_or_name: int | str,
+        replay_buffer: ReplayBuffer,
+        num_train_steps_actor = 100,
+        num_train_steps_critic = 100,
+        batch_size = 4
+    ):
+
+        if isinstance(task_id_or_name, int):
+            task_id = task_id_or_name
+            assert task_id in self.task_id_name
+            task_name = self.task_id_name[task_id]
+        else:
+            task_name = task_id_or_name
+            assert task_name in self.task_name_id
+            task_id = self.task_name_id[task_name]
+
+
         self.load_pretrained()
         raise NotImplementedError('finetuning logic is not yet implemented')
 

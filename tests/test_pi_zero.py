@@ -477,3 +477,20 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
     
     assert (workspace / 'pretrained-actor.pt').exists()
     assert (workspace / 'pretrained-critic.pt').exists()
+
+    # sft stage
+
+    task_id = next(iter(pi_zero_six.task_id_name))
+    task_name = pi_zero_six.task_id_name[task_id]
+
+    pi_zero_six.sft(
+        task_id,
+        num_train_steps_actor = 1, # minimum steps
+        num_train_steps_critic = 1,
+        batch_size = 2
+    )
+
+    # assert the finetuned actor critic from step 2 exists
+
+    assert (workspace / task_name / "0" / "actor.pt").exists()
+    assert (workspace / task_name / "0" / "critic.pt").exists()
