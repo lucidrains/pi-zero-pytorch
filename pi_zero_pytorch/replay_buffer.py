@@ -56,7 +56,16 @@ class ReplayBuffer:
         fields: FIELD_TYPE,
         meta_fields: FIELD_TYPE = dict(),
         circular = False,
+        overwrite = False
     ):
+        # folder for data
+
+        if not isinstance(folder, Path):
+            folder = Path(folder)
+            folder.mkdir(exist_ok = True)
+
+        self.folder = folder
+        assert folder.is_dir()
 
         # save the hyperparameters, so it can be rehydrated from a json file
 
@@ -72,15 +81,6 @@ class ReplayBuffer:
 
             with open(str(config_path), 'wb') as data:
                 pickle.dump(config, data)
-
-        # folder for data
-
-        if not isinstance(folder, Path):
-            folder = Path(folder)
-            folder.mkdir(exist_ok = True)
-
-        self.folder = folder
-        assert folder.is_dir()
 
         # keeping track of episode length
 
@@ -133,7 +133,7 @@ class ReplayBuffer:
             if isinstance(shape, int):
                 shape = (shape,)
 
-            mode = 'r+' if filepath.exists() else 'w+'
+            mode = 'r+' if filepath.exists() and not overwrite else 'w+'
             memmap = open_memmap(str(filepath), mode = mode, dtype = dtype, shape = (max_episodes, max_timesteps, *shape))
 
             if exists(default_value):

@@ -338,7 +338,7 @@ def test_pi_zero_six(
 
     # gather experiences from environment
 
-    experience = pi_zero_six.gather_experience_from_env(mock_env, steps = 4, num_episodes = 3, task_id = 2)
+    experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, steps = 4)
 
     # labeling
 

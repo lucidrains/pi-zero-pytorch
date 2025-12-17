@@ -2806,7 +2806,7 @@ class PiZeroSix(Module):
     def __init__(
         self,
         agent_or_model: PiZero | Agent,
-        pretrain_data: ReplayBuffer,
+        pretrain_data: ReplayBuffer | None = None,
         config: dict | RecapConfig = DEFAULT_RECAP_CONFIG,
         cpu = False,
         workspace_folder = './workspace',
@@ -2866,11 +2866,14 @@ class PiZeroSix(Module):
         self.pretrained_actor_path = self.workspace_folder / 'pretrained-actor.pt'
         self.pretrained_critic_path = self.workspace_folder / 'pretrained-critic.pt'
 
+        if exists(self.pretrain_data):
+            num_episodes = pretrain_data.num_episodes
+            task_ids = np.unique(pretrain_data.meta_data['task_id'][:num_episodes]).tolist()
+        else:
+            task_ids = list(range(len(self.task_strings)))
+
         # very simply, each specialized task will have a subfolder within the workspace folder
         # this will contain folders enumerated from 0 to K times, where K is the improvement iteration for the RECAP algorithm in pi0.6
-
-        num_episodes = pretrain_data.num_episodes
-        task_ids = np.unique(pretrain_data.meta_data['task_id'][:num_episodes]).tolist()
 
         assert all([0 <= task_id < len(self.task_strings) for task_id in task_ids]), 'invalid task_id discovered in replay buffer'
 
@@ -2991,6 +2994,8 @@ class PiZeroSix(Module):
         num_train_steps_critic = 100,
         batch_size = 4
     ):
+        assert exists(self.pretrain_data)
+
         replay_buffer = self.pretrain_data
 
         self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'pretrain')
@@ -3013,6 +3018,7 @@ class PiZeroSix(Module):
         batch_size = 4,
         recalculate_advantages_with_finetuned_critic = False
     ):
+        assert exists(self.pretrain_data)
 
         if isinstance(task_id_or_name, int):
             task_id = task_id_or_name
@@ -3055,6 +3061,7 @@ class PiZeroSix(Module):
         num_train_steps_critic = 100,
         batch_size = 4
     ):
+        assert exists(self.pretrain_data)
 
         if isinstance(task_id_or_name, int):
             task_id = task_id_or_name
@@ -3551,6 +3558,7 @@ class PiZeroSix(Module):
             experience_store_path,
             max_episodes = num_episodes,
             max_timesteps = steps,
+            overwrite = True,
             meta_fields = dict(
                 task_id     = ('int', (), -1),
                 fail        = 'bool',
