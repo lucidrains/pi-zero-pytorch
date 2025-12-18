@@ -3002,6 +3002,8 @@ class PiZeroSix(Module):
 
         self.train_value_network(replay_buffer, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
+        self.update_buffer_values_(replay_buffer, batch_size = batch_size)
+
         self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'pretrain')
 
         self.set_advantage_token_id_(replay_buffer, mode = 'pretrain')
@@ -3048,6 +3050,7 @@ class PiZeroSix(Module):
         self.train_value_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
         if recalculate_advantages_with_finetuned_critic:
+            self.update_buffer_values_(replay_buffer, batch_size = batch_size, task_id = task_id)
             self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'finetune')
 
         self.train_policy_network(replay_buffer, advantage_id = self.positive_advantage_id, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
@@ -3101,7 +3104,8 @@ class PiZeroSix(Module):
         self.train_value_network(concatted_dataset, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
         for replay_buffer in all_rollout_data:
-            self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'finetune')
+            self.update_buffer_values_(replay_buffer, batch_size = batch_size)
+            self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'finetune')
             self.set_advantage_token_id_(replay_buffer, mode = 'finetune')
 
         self.train_policy_network(concatted_dataset, num_train_steps = num_train_steps_actor, batch_size = batch_size)
@@ -3119,7 +3123,8 @@ class PiZeroSix(Module):
         self,
         experiences: ReplayBuffer,
         task_id: int | None = None, 
-        fields: list[str] | None = None
+        fields: list[str] | None = None,
+        return_indices = False
     ):
         return ReplayDataset(
             experiences,
@@ -3131,6 +3136,7 @@ class PiZeroSix(Module):
                 'returns'
             ]),
             task_id = task_id,
+            return_indices = return_indices,
             fieldname_map = dict(
                 text = 'token_ids',
                 internal = 'joint_state',
@@ -3141,14 +3147,15 @@ class PiZeroSix(Module):
         self,
         experiences: ReplayBuffer | Dataset,
         batch_size = 8,
-        task_id: int | none = None,
+        task_id: int | None = None,
         fields: list[str] | None = None,
+        return_indices = False,
         **dl_kwargs
 
     ) -> DataLoader:
 
         if not isinstance(experiences, Dataset):
-            dataset = self.dataset(experiences, task_id = task_id, fields = fields)
+            dataset = self.dataset(experiences, task_id = task_id, fields = fields, return_indices = return_indices)
         else:
             dataset = experiences
 
@@ -3266,6 +3273,44 @@ class PiZeroSix(Module):
             optim.zero_grad()
 
         self.print('policy network training complete')
+
+    @beartype
+    @torch.no_grad()
+    def update_buffer_values_(
+        self,
+        experiences: ReplayBuffer,
+        batch_size = 16,
+        task_id: int | None = None
+    ):
+        self.agent.eval()
+        critic = self.agent.critic
+        device = critic.device
+
+        dataloader = self.dataloader(
+            experiences,
+            batch_size = batch_size,
+            task_id = task_id,
+            fields = ['images', 'text', 'internal', 'actions'],
+            return_indices = True,
+            shuffle = False
+        )
+
+        dataloader = self.accelerate.prepare(dataloader)
+
+        for batch in dataloader:
+            indices = batch.pop('indices')
+            batch_size = indices.shape[0]
+
+            batch = tree_map_tensor(batch, lambda t: t.to(device))
+
+            batch['times'] = torch.ones((batch_size,), device = device)
+
+            values, _ = critic(task_id = task_id, **batch)
+
+            for i, (episode_id, timestep_index) in enumerate(indices):
+                experiences.data['value'][episode_id.item(), timestep_index.item()] = values[i].item()
+
+        experiences.flush()
 
     @beartype
     def invalidate_(
@@ -3429,22 +3474,25 @@ class PiZeroSix(Module):
             total_samples = indices.shape[0]
 
             if total_samples > num_advantages_sample:
-                sampled_indices = indices
-            else:
                 randperm_indices = torch.randperm(total_samples)[:num_advantages_sample]
                 sampled_indices = indices[randperm_indices]
+            else:
+                sampled_indices = indices
 
             advantages = einx.get_at('[e t], b [2] -> b', buffer.data['advantages'], sampled_indices)
 
             # determine the advantage at designated percentile per task
-
+            
             advantage_cutoff = torch.quantile(advantages, threshold)
 
-            advantage_token_ids = (advantages >= advantage_cutoff).int() # binary for now
+            # calculate labels for all task indices using this cutoff
 
-            # set it back
+            all_advantages = einx.get_at('[e t], b [2] -> b', buffer.data['advantages'], indices)
+            advantage_token_ids = (all_advantages >= advantage_cutoff).int()
 
-            einx.set_at('[e t], b [2], b', buffer.data['advantage_ids'], sampled_indices, advantage_token_ids)
+            # set it back for all indices
+
+            einx.set_at('[e t], b [2], b', buffer.data['advantage_ids'], indices, advantage_token_ids)
 
         buffer.flush()
 

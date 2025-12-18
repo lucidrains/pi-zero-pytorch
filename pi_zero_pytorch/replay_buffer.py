@@ -312,9 +312,11 @@ class ReplayDataset(Dataset):
         experiences: ReplayBuffer,
         task_id: int | None = None,
         fields: list[str] | None = None,
-        fieldname_map: dict[str, str] = dict()
+        fieldname_map: dict[str, str] = dict(),
+        return_indices = False
     ):
         self.experiences = experiences
+        self.return_indices = return_indices
 
         episode_ids = arange(experiences.max_episodes)
         episode_lens = from_numpy(experiences.episode_lens)
@@ -368,5 +370,8 @@ class ReplayDataset(Dataset):
             model_kwarg_name = self.fieldname_map.get(field, field)
 
             step_data[model_kwarg_name] = data[episode_id, timestep_index]
+
+        if self.return_indices:
+            step_data['indices'] = self.timepoints[idx]
 
         return step_data
