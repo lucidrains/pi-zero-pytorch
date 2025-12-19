@@ -62,7 +62,7 @@ from x_evolution import EvoStrategy
 
 import tqdm
 
-from pi_zero_pytorch.replay_buffer import ReplayBuffer, ReplayDataset
+from pi_zero_pytorch.replay_buffer import ReplayBuffer, ReplayDataset, JoinedReplayDataset
 
 from accelerate import Accelerator
 
@@ -2980,7 +2980,7 @@ class PiZeroSix(Module):
     def get_last_task_finetune_folder(self, task_id):
         task_workspace = self.task_workspaces[task_id]
 
-        finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/')]
+        finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/') if folder.name.isdigit()]
 
         assert len(finetune_ids) > 0, 'you need to run `.sft` first to generate the finetuned specialist (pretrain data filtered by task) before initiating rollouts with environment for recap algorithm'
 
@@ -2996,19 +2996,44 @@ class PiZeroSix(Module):
     ):
         assert exists(self.pretrain_data)
 
-        replay_buffer = self.pretrain_data
+        pretrain_data = self.pretrain_data
+        
+        # Create temporary meta-buffer for pretraining
+        
+        values_and_advantages = ReplayBuffer(
+            self.workspace_folder / 'pretrain_values_and_advantages',
+            max_episodes = pretrain_data.num_episodes,
+            max_timesteps = pretrain_data.max_timesteps,
+            fields = dict(
+                value = 'float',
+                advantages = 'float',
+                returns = 'float',
+                advantage_ids = 'int'
+            ),
+            meta_fields = dict(
+                task_id = 'int'
+            ),
+            overwrite = True
+        )
+        
+        values_and_advantages.meta_data['task_id'][:] = pretrain_data.meta_data['task_id'][:pretrain_data.num_episodes]
+        values_and_advantages.meta_data['episode_lens'][:] = pretrain_data.meta_data['episode_lens'][:pretrain_data.num_episodes]
+        values_and_advantages.num_episodes = pretrain_data.num_episodes
 
-        self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'pretrain')
+        dataset = self.dataset(pretrain_data)
+        joined_dataset = JoinedReplayDataset([dataset], values_and_advantages)
 
-        self.train_value_network(replay_buffer, num_train_steps = num_train_steps_critic, batch_size = batch_size)
+        self.calculate_return_or_advantages_(dataset, type = 'returns', mode = 'pretrain', destination_buffer = values_and_advantages)
 
-        self.update_buffer_values_(replay_buffer, batch_size = batch_size)
+        self.train_value_network(joined_dataset, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
-        self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'pretrain')
+        self.update_buffer_values_(dataset, batch_size = batch_size, destination_buffer = values_and_advantages)
 
-        self.set_advantage_token_id_(replay_buffer, mode = 'pretrain')
+        self.calculate_return_or_advantages_(dataset, type = 'advantages', mode = 'pretrain', destination_buffer = values_and_advantages)
 
-        self.train_policy_network(replay_buffer, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+        self.set_advantage_token_id_(values_and_advantages, mode = 'pretrain')
+
+        self.train_policy_network(joined_dataset, num_train_steps = num_train_steps_actor, batch_size = batch_size)
 
         self.save_pretrained()
 
@@ -3045,15 +3070,46 @@ class PiZeroSix(Module):
 
         # sft only for the task
 
-        replay_buffer = self.pretrain_data
+        pretrain_data = self.pretrain_data
+        dataset = self.dataset(pretrain_data, task_id = task_id)
+        
+        # Create temporary meta-buffer for SFT
+        
+        num_episodes = len(dataset.valid_episodes)
+        
+        values_and_advantages = ReplayBuffer(
+            task_workspace.parent / f'.{task_id}_sft_values_and_advantages',
+            max_episodes = num_episodes,
+            max_timesteps = pretrain_data.max_timesteps,
+            fields = dict(
+                value = 'float',
+                advantages = 'float',
+                returns = 'float',
+                advantage_ids = 'int'
+            ),
+            meta_fields = dict(
+                task_id = 'int'
+            ),
+            overwrite = True
+        )
+        
+        values_and_advantages.meta_data['task_id'][:] = pretrain_data.meta_data['task_id'][dataset.valid_episodes]
+        values_and_advantages.meta_data['episode_lens'][:] = pretrain_data.meta_data['episode_lens'][dataset.valid_episodes]
+        values_and_advantages.num_episodes = num_episodes
 
-        self.train_value_network(replay_buffer, task_id = task_id, num_train_steps = num_train_steps_critic, batch_size = batch_size)
+        joined_dataset = JoinedReplayDataset([dataset], values_and_advantages)
+
+        # Initial returns (likely still using pre-trained critic values stored in meta-buffer if we were 1:1, but here we calculate fresh)
+        self.calculate_return_or_advantages_(dataset, type = 'returns', mode = 'pretrain', destination_buffer = values_and_advantages)
+
+        self.train_value_network(joined_dataset, task_id = task_id, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
         if recalculate_advantages_with_finetuned_critic:
-            self.update_buffer_values_(replay_buffer, batch_size = batch_size, task_id = task_id)
-            self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'finetune')
+            self.update_buffer_values_(dataset, batch_size = batch_size, task_id = task_id, destination_buffer = values_and_advantages)
+            self.calculate_return_or_advantages_(dataset, type = 'advantages', mode = 'finetune', destination_buffer = values_and_advantages)
+            self.set_advantage_token_id_(values_and_advantages, mode = 'finetune')
 
-        self.train_policy_network(replay_buffer, advantage_id = self.positive_advantage_id, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+        self.train_policy_network(joined_dataset, advantage_id = self.positive_advantage_id, task_id = task_id, num_train_steps = num_train_steps_actor, batch_size = batch_size)
 
         self.save(sft_workspace)
 
@@ -3084,36 +3140,69 @@ class PiZeroSix(Module):
 
         all_rollout_data = [ReplayBuffer.from_config(data_dir) for data_dir in all_data_folders]
 
-        all_data = [pretrain_data, *all_rollout_data]
-
         all_datasets = [
             self.dataset(pretrain_data, task_id = task_id),
             *[self.dataset(data) for data in all_rollout_data]
         ]
 
-        # concat all the datasets for finetuning the next iteration
+        num_meta_episodes = sum(len(d.valid_episodes) for d in all_datasets)
+        max_timesteps = max([d.experiences.max_timesteps for d in all_datasets])
 
-        concatted_dataset = ConcatDataset(all_datasets)
+        # 2. Create/Prepare values_and_advantages buffer
+        meta_buffer_path = task_workspace / 'values_and_advantages'
+        
+        values_and_advantages = ReplayBuffer(
+            meta_buffer_path,
+            max_episodes = num_meta_episodes,
+            max_timesteps = max_timesteps,
+            fields = dict(
+                value = 'float',
+                advantages = 'float',
+                returns = 'float',
+                advantage_ids = 'int'
+            ),
+            meta_fields = dict(
+                task_id = 'int'
+            ),
+            overwrite = True
+        )
 
-        # now finetune and save the next version of the actor / critic
-        # todo - make a copy of the filtered pretrained dataset (by task id) into the task subfolder
+        values_and_advantages.num_episodes = num_meta_episodes
 
-        for replay_buffer in all_rollout_data:
-            self.calculate_return_or_advantages_(replay_buffer, type = 'returns', mode = 'finetune')
+        # Populate meta data in values_and_advantages
+        offset = 0
+        for d in all_datasets:
+            num_episodes = len(d.valid_episodes)
+            values_and_advantages.meta_data['task_id'][offset:offset+num_episodes] = d.experiences.meta_data['task_id'][d.valid_episodes]
+            values_and_advantages.meta_data['episode_lens'][offset:offset+num_episodes] = d.experiences.meta_data['episode_lens'][d.valid_episodes]
+            offset += num_episodes
 
-        self.train_value_network(concatted_dataset, num_train_steps = num_train_steps_critic, batch_size = batch_size)
+        # 3. Step 1: Calculate initial returns based on current critic
+        offset = 0
+        for d in all_datasets:
+            self.update_buffer_values_(d, destination_buffer = values_and_advantages, destination_episode_offset = offset)
+            self.calculate_return_or_advantages_(d, type = 'returns', mode = 'finetune', destination_buffer = values_and_advantages, destination_episode_offset = offset)
+            offset += len(d.valid_episodes)
 
-        for replay_buffer in all_rollout_data:
-            self.update_buffer_values_(replay_buffer, batch_size = batch_size)
-            self.calculate_return_or_advantages_(replay_buffer, type = 'advantages', mode = 'finetune')
-            self.set_advantage_token_id_(replay_buffer, mode = 'finetune')
+        # 4. Step 2: Train critic using JoinedReplayDataset
+        joined_dataset = JoinedReplayDataset(all_datasets, values_and_advantages)
+        self.train_value_network(joined_dataset, num_train_steps = num_train_steps_critic, batch_size = batch_size)
 
-        self.train_policy_network(concatted_dataset, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+        # 5. Step 3: Update values and advantages with NEW critic
+        offset = 0
+        for d in all_datasets:
+            self.update_buffer_values_(d, destination_buffer = values_and_advantages, destination_episode_offset = offset)
+            self.calculate_return_or_advantages_(d, type = 'advantages', mode = 'finetune', destination_buffer = values_and_advantages, destination_episode_offset = offset)
+            offset += len(d.valid_episodes)
 
-        # save to the next fine tune folder for the next recap iteration
+        # 6. Step 4: Calculate the percentile cutoff and set advantage token ids
+        self.set_advantage_token_id_(values_and_advantages, mode = 'finetune')
 
-        task_workspace = self.task_workspaces[task_id]
-        finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/')]
+        # 7. Step 5: Train actor
+        self.train_policy_network(joined_dataset, num_train_steps = num_train_steps_actor, batch_size = batch_size)
+
+        # 8. Save next version
+        finetune_ids = [int(folder.name) for folder in task_workspace.glob('*/') if folder.name.isdigit()]
         finetune_id = max(finetune_ids)
         next_recap_iter_id = finetune_id + 1
 
@@ -3132,8 +3221,7 @@ class PiZeroSix(Module):
                 'images',
                 'text',
                 'internal',
-                'actions',
-                'returns'
+                'actions'
             ]),
             task_id = task_id,
             return_indices = return_indices,
@@ -3158,6 +3246,9 @@ class PiZeroSix(Module):
             dataset = self.dataset(experiences, task_id = task_id, fields = fields, return_indices = return_indices)
         else:
             dataset = experiences
+
+            if return_indices and hasattr(dataset, 'return_indices'):
+                dataset.return_indices = return_indices
 
         assert len(dataset) > 0, 'no experiences to learn from'
 
@@ -3278,9 +3369,11 @@ class PiZeroSix(Module):
     @torch.no_grad()
     def update_buffer_values_(
         self,
-        experiences: ReplayBuffer,
+        experiences: ReplayBuffer | ReplayDataset,
         batch_size = 16,
-        task_id: int | None = None
+        task_id: int | None = None,
+        destination_buffer: ReplayBuffer | None = None,
+        destination_episode_offset: int = 0
     ):
         self.agent.eval()
         critic = self.agent.critic
@@ -3297,6 +3390,8 @@ class PiZeroSix(Module):
 
         dataloader = self.accelerate.prepare(dataloader)
 
+        dest_buffer = default(destination_buffer, experiences if isinstance(experiences, ReplayBuffer) else experiences.experiences)
+
         for batch in dataloader:
             indices = batch.pop('indices')
             batch_size = indices.shape[0]
@@ -3308,9 +3403,19 @@ class PiZeroSix(Module):
             values, _ = critic(task_id = task_id, **batch)
 
             for i, (episode_id, timestep_index) in enumerate(indices):
-                experiences.data['value'][episode_id.item(), timestep_index.item()] = values[i].item()
 
-        experiences.flush()
+                if exists(destination_buffer):
+                    if isinstance(experiences, ReplayDataset):
+                        relative_episode_idx = torch.searchsorted(experiences.valid_episodes, episode_id)
+                        dest_episode_id = destination_episode_offset + relative_episode_idx
+                    else:
+                        dest_episode_id = destination_episode_offset + episode_id
+                else:
+                    dest_episode_id = episode_id
+
+                dest_buffer.data['value'][dest_episode_id.item(), timestep_index.item()] = values[i].item()
+
+        dest_buffer.flush()
 
     @beartype
     def invalidate_(
@@ -3331,10 +3436,24 @@ class PiZeroSix(Module):
         threshold: float,
         task_id = None,
         value_field = 'value',
+        value_buffer: ReplayBuffer | None = None,
+        value_episode_offset: int = 0
     ):
         assert 'invalidated' in experiences.data
 
-        should_invalidate = experiences.data[value_field] <= threshold
+        read_buffer = default(value_buffer, experiences)
+        read_episode_offset = value_episode_offset if exists(value_buffer) else 0
+
+        # we need to map the episodes from the source buffer to the value buffer if an offset is provided
+        # for now, assume they are 1:1 if no offset, or offset is applied to all
+
+        values = read_buffer.data[value_field]
+
+        if read_episode_offset > 0:
+            num_episodes = experiences.num_episodes
+            values = values[read_episode_offset:read_episode_offset + num_episodes]
+
+        should_invalidate = values <= threshold
 
         if exists(task_id):
             should_invalidate = should_invalidate & experiences.data['task_id'] == task_id
@@ -3344,23 +3463,29 @@ class PiZeroSix(Module):
     @beartype
     def calculate_return_or_advantages_(
         self,
-        experiences: ReplayBuffer,
+        experiences: ReplayBuffer | ReplayDataset,
         type: Literal['returns', 'advantages', 'returns_and_advantages'] = 'returns_and_advantages',
         gamma = 1.,
         lam = 0.95,
         mode: Literal['pretrain', 'finetune'] = 'finetune',
         use_accelerated = None,
+        destination_buffer: ReplayBuffer | None = None,
+        destination_episode_offset: int = 0
     ):
 
-        buffer = experiences
+        buffer = experiences.experiences if isinstance(experiences, ReplayDataset) else experiences
+        dest_buffer = default(destination_buffer, buffer)
 
-        # todo - batch it, but given robotics is low data, doesn't matter
+        episode_ids = experiences.valid_episodes if isinstance(experiences, ReplayDataset) else range(buffer.num_episodes)
 
-        for episode_id in range(buffer.num_episodes):
+        for i, episode_id in enumerate(episode_ids):
 
             episode_len = buffer.episode_lens[episode_id].item()
 
-            values = buffer.data['value'][episode_id, :episode_len]
+            dest_episode_id = destination_episode_offset + i if exists(destination_buffer) else episode_id
+
+
+            values = dest_buffer.data['value'][dest_episode_id, :episode_len]
             rewards = buffer.data['reward'][episode_id, :episode_len]
             terminated = buffer.data['terminated'][episode_id, :episode_len]
 
@@ -3410,35 +3535,39 @@ class PiZeroSix(Module):
             # maybe store advantages
 
             if type in {'advantages', 'returns_and_advantages'}:
-
-                buffer.data['advantages'][episode_id, :episode_len] = advantages.cpu().numpy()
+                dest_buffer.data['advantages'][dest_episode_id, :episode_len] = advantages.cpu().numpy()
 
             # maybe store the returns
 
             if type in {'returns', 'returns_and_advantages'}:
+                dest_buffer.data['returns'][dest_episode_id, :episode_len] = (advantages + values).cpu().numpy()
 
-                buffer.data['returns'][episode_id, :episode_len] = (advantages + values).cpu().numpy()
-
-            # flush
-
-            buffer.flush()
+        dest_buffer.flush()
 
     @beartype
     def set_advantage_token_id_(
         self,
-        experiences: ReplayBuffer,
+        experiences: ReplayBuffer | ReplayDataset,
         num_advantages_sample = 10_000,
-        mode: Literal['pretrain', 'finetune'] = 'finetune'
+        mode: Literal['pretrain', 'finetune'] = 'finetune',
+        destination_buffer: ReplayBuffer | None = None,
+        destination_episode_offset: int = 0
     ):
-        buffer = experiences
-        num_episodes = buffer.num_episodes
-        max_episodes = buffer.max_episodes
+        buffer = experiences.experiences if isinstance(experiences, ReplayDataset) else experiences
+        dest_buffer = default(destination_buffer, buffer)
+
+        if isinstance(experiences, ReplayDataset):
+            num_episodes = len(experiences.valid_episodes)
+            all_task_ids = from_numpy(buffer.meta_data['task_id'][experiences.valid_episodes])
+            episode_lens = from_numpy(buffer.meta_data['episode_lens'][experiences.valid_episodes])
+            episode_ids = experiences.valid_episodes
+        else:
+            num_episodes = buffer.num_episodes
+            all_task_ids = from_numpy(buffer.meta_data['task_id'][:num_episodes])
+            episode_lens = from_numpy(buffer.meta_data['episode_lens'][:num_episodes])
+            episode_ids = arange(num_episodes)
+
         max_timesteps = buffer.max_timesteps
-
-        all_task_ids = from_numpy(buffer.meta_data['task_id'][:num_episodes])
-        episode_lens = from_numpy(buffer.meta_data['episode_lens'][:num_episodes])
-
-        pos_advantage_token_id = self.unwrapped_actor.num_advantage_tokens - 1
 
         for task_id in all_task_ids.unique().tolist():
 
@@ -3451,8 +3580,7 @@ class PiZeroSix(Module):
 
             task_mask = all_task_ids == task_id
 
-            episode_ids = arange(num_episodes)
-
+            task_episode_indices = torch.where(task_mask)[0]
             task_episode_ids = episode_ids[task_mask]
 
             task_episode_ids = rearrange(task_episode_ids, 'e -> e 1')
@@ -3461,40 +3589,51 @@ class PiZeroSix(Module):
 
             indices_mask = einx.less('j, i -> i j', timesteps, episode_lens[task_mask])
 
-            timesteps = rearrange(timesteps, 't -> 1 t')
+            timesteps_broadcast = rearrange(timesteps, 't -> 1 t')
 
-            task_episode_ids, timesteps = torch.broadcast_tensors(task_episode_ids, timesteps)
+            task_episode_ids_broadcast, timesteps_broadcast = torch.broadcast_tensors(task_episode_ids, timesteps_broadcast)
 
-            indices = stack((task_episode_ids, timesteps), dim = -1)
-
+            indices = stack((task_episode_ids_broadcast, timesteps_broadcast), dim = -1)
             indices = indices[indices_mask]
 
-            # maybe sample from all advantages
+            # determine destination indices
+            if exists(destination_buffer):
+                dest_task_episode_ids = destination_episode_offset + task_episode_indices
+                dest_task_episode_ids = rearrange(dest_task_episode_ids, 'e -> e 1')
+                dest_task_episode_ids_broadcast, _ = torch.broadcast_tensors(dest_task_episode_ids, rearrange(timesteps, 't -> 1 t'))
+                dest_indices = stack((dest_task_episode_ids_broadcast, timesteps_broadcast), dim = -1)
+                dest_indices = dest_indices[indices_mask]
+            else:
+                dest_indices = indices
 
+            # maybe sample from all advantages
             total_samples = indices.shape[0]
 
             if total_samples > num_advantages_sample:
                 randperm_indices = torch.randperm(total_samples)[:num_advantages_sample]
-                sampled_indices = indices[randperm_indices]
+                sampled_source_indices = indices[randperm_indices]
+                sampled_dest_indices = dest_indices[randperm_indices]
             else:
-                sampled_indices = indices
+                sampled_source_indices = indices
+                sampled_dest_indices = dest_indices
 
-            advantages = einx.get_at('[e t], b [2] -> b', buffer.data['advantages'], sampled_indices)
+            # if destination buffer is used, advantages might be stored there
+            read_buffer = dest_buffer if exists(destination_buffer) else buffer
+            read_indices = sampled_dest_indices if exists(destination_buffer) else sampled_source_indices
+
+            advantages = einx.get_at('[e t], b [2] -> b', read_buffer.data['advantages'], read_indices)
 
             # determine the advantage at designated percentile per task
-            
             advantage_cutoff = torch.quantile(advantages, threshold)
 
             # calculate labels for all task indices using this cutoff
-
-            all_advantages = einx.get_at('[e t], b [2] -> b', buffer.data['advantages'], indices)
+            all_advantages = einx.get_at('[e t], b [2] -> b', read_buffer.data['advantages'], dest_indices)
             advantage_token_ids = (all_advantages >= advantage_cutoff).int()
 
             # set it back for all indices
+            einx.set_at('[e t], b [2], b', dest_buffer.data['advantage_ids'], dest_indices, advantage_token_ids)
 
-            einx.set_at('[e t], b [2], b', buffer.data['advantage_ids'], indices, advantage_token_ids)
-
-        buffer.flush()
+        dest_buffer.flush()
 
     @beartype
     def set_episode_fail_(
@@ -3568,7 +3707,7 @@ class PiZeroSix(Module):
         task_id = -1,
         normalize_reward_by_steps = None,
         recap_step = 0, # starts at 0, in which case the logic will be the SFT step, before the proper binary advantage conditioning
-       **sampling_kwargs
+        **sampling_kwargs
 
     ) -> ReplayBuffer:
 
@@ -3637,10 +3776,6 @@ class PiZeroSix(Module):
                 reward      = 'float',
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
-                value       = 'float',
-                advantages  = 'float',
-                returns     = 'float',
-                advantage_ids = 'int',
                 task_id     = 'int',
                 invalidated = 'bool'
             )
@@ -3663,7 +3798,7 @@ class PiZeroSix(Module):
 
                 for _ in range(steps):
 
-                    sampled_actions, value = temp_batch_dim(actor)(
+                    sampled_actions, _ = temp_batch_dim(actor)(
                         *states,
                         trajectory_length = trajectory_length,
                         steps = flow_sampling_steps,
@@ -3676,7 +3811,7 @@ class PiZeroSix(Module):
 
                     next_states, reward, truncated, terminated = env.step(sampled_actions)
 
-                    images, text, internal, reward, terminated, actions, value = to_device([*states, reward, terminated, sampled_actions, value], torch.device('cpu'))
+                    images, text, internal, reward, terminated, actions = to_device([*states, reward, terminated, sampled_actions], torch.device('cpu'))
 
                     states = next_states
 
@@ -3689,7 +3824,6 @@ class PiZeroSix(Module):
                         internal = internal,
                         reward = reward,
                         actions = sampled_actions,
-                        value = value,
                         task_id = tensor(task_id)
                     )
 

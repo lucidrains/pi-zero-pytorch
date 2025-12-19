@@ -5,3 +5,8 @@ from pi_zero_pytorch.pi_zero import (
     EFPO,
     PiZeroSix
 )
+
+from pi_zero_pytorch.replay_buffer import (
+    ReplayBuffer,
+    JoinedReplayDataset
+)

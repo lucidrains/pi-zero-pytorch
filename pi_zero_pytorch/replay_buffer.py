@@ -7,7 +7,8 @@ from contextlib import contextmanager
 
 from beartype import beartype
 from beartype.door import is_bearable
-from beartype.typing import Literal, Dict, Tuple, Union, Optional
+from beartype.typing import Literal, Dict, Tuple, Union, Optional, List
+import bisect
 
 import numpy as np
 from numpy import ndarray
@@ -62,7 +63,8 @@ class ReplayBuffer:
 
         if not isinstance(folder, Path):
             folder = Path(folder)
-            folder.mkdir(exist_ok = True)
+
+        folder.mkdir(exist_ok = True, parents = True)
 
         self.folder = folder
         assert folder.is_dir()
@@ -332,6 +334,7 @@ class ReplayDataset(Dataset):
             valid_mask = valid_mask & is_task_id
 
         valid_episodes = episode_ids[valid_mask]
+        self.valid_episodes = valid_episodes
         valid_episode_lens = episode_lens[valid_mask]
 
         timesteps = arange(max_episode_len)
@@ -375,3 +378,51 @@ class ReplayDataset(Dataset):
             step_data['indices'] = self.timepoints[idx]
 
         return step_data
+
+class JoinedReplayDataset(Dataset):
+    def __init__(
+        self,
+        datasets: list[ReplayDataset],
+        meta_buffer: ReplayBuffer
+    ):
+        super().__init__()
+        self.datasets = datasets
+        self.meta_buffer = meta_buffer
+
+        meta_episode_offset = 0
+        self.meta_episode_offsets = []
+
+        for dataset in datasets:
+            self.meta_episode_offsets.append(meta_episode_offset)
+            meta_episode_offset += len(dataset.valid_episodes)
+
+        from torch.utils.data import ConcatDataset
+        self.concat_dataset = ConcatDataset(datasets)
+
+    def __len__(self):
+        return len(self.concat_dataset)
+
+    def __getitem__(self, idx):
+        dataset_idx = bisect.bisect_right(self.concat_dataset.cumulative_sizes, idx)
+        
+        local_idx = idx
+        if dataset_idx > 0:
+            local_idx = idx - self.concat_dataset.cumulative_sizes[dataset_idx - 1]
+
+        dataset = self.datasets[dataset_idx]
+        data = dataset[local_idx]
+
+        # Map to meta buffer
+        source_episode_id, timestep_index = dataset.timepoints[local_idx].unbind(dim = -1)
+        
+        # We need relative episode index within the dataset's valid episodes
+        relative_episode_idx = torch.searchsorted(dataset.valid_episodes, source_episode_id)
+        
+        meta_episode_id = self.meta_episode_offsets[dataset_idx] + relative_episode_idx
+        
+        # Get meta fields (value, advantages, advantage_ids)
+        for field in self.meta_buffer.fieldnames:
+            meta_data = self.meta_buffer.data[field][meta_episode_id, timestep_index]
+            data[field] = tensor(meta_data)
+            
+        return data

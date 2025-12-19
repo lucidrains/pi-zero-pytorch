@@ -4,7 +4,7 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
-from pi_zero_pytorch import π0
+from pi_zero_pytorch import π0, ReplayBuffer, JoinedReplayDataset
 from einops import repeat, rearrange
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -50,7 +50,7 @@ def test_pi_zero_with_vit(
         depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 32,
+        num_tokens = 1024,
         num_advantage_tokens = 2 if advantage_condition else 0,
         sample_soft_mask_lens = (2, 1, 29),
         action_dit_norm_all_linears = action_dit_norm_all_linears,
@@ -59,7 +59,7 @@ def test_pi_zero_with_vit(
     ).to(device)
 
     images = torch.randn(2, 3, 2, 256, 256)
-    commands = torch.randint(0, 32, (2, 1024))
+    commands = torch.randint(0, 1024, (2, 32))
 
     if only_vlm:
         vlm_logits = model.forward_only_vision_language(images, commands)
@@ -139,14 +139,14 @@ def test_flow_policy_optimization(
         depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 32,
+        num_tokens = 1024,
         model_predict_output = model_predict_output,
         use_spo = use_spo,
         use_asymmetric_spo = use_asymmetric_spo
     ).to(device)
 
     images = torch.randn(2, 3, 2, 256, 256)
-    commands = torch.randint(0, 32, (2, 1024))
+    commands = torch.randint(0, 1024, (2, 32))
 
     joint_state = torch.randn(2, 12)
     actions = torch.randn(2, 32, 6)
@@ -161,7 +161,7 @@ def test_flow_policy_optimization(
         num_latent_genes = num_latent_genes
     )
 
-    mock_env = Env((256, 256), 2, 32, 1024, 12)
+    mock_env = Env((256, 256), 2, 1024, 32, 12)
 
     epo = EFPO(
         agent,
@@ -206,7 +206,7 @@ def test_evo_strat():
         depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 32,
+        num_tokens = 1024,
     ).to(device)
 
     # for parallelism
@@ -330,7 +330,7 @@ def test_pi_zero_six(
     # you'll want to supply your own environment
 
     from pi_zero_pytorch.mock import Env
-    mock_env = Env((256, 256), 2, 32, 1024, 12)
+    mock_env = Env((256, 256), 2, 1024, 32, 12)
 
     # pass your agent and environment to PiZeroSix for learning to be orchestrated
 
@@ -340,29 +340,57 @@ def test_pi_zero_six(
 
     experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, steps = 4)
 
+    # meta buffer
+    
+    meta_buffer = ReplayBuffer(
+        './meta',
+        max_episodes = 3,
+        max_timesteps = 4,
+        fields = dict(
+            value = 'float',
+            advantages = 'float',
+            returns = 'float',
+            advantage_ids = 'int'
+        ),
+        meta_fields = dict(
+            task_id = 'int'
+        ),
+        overwrite = True
+    )
+
+    # initialize meta task ids
+    meta_buffer.meta_data['task_id'][:] = -1
+
+    # update buffer values and calculate returns in meta buffer
+    pi_zero_six.update_buffer_values_(experience, destination_buffer = meta_buffer)
+    pi_zero_six.calculate_return_or_advantages_(experience, destination_buffer = meta_buffer)
+
     # labeling
 
     pi_zero_six.set_episode_fail_(experience, episode_id = 1)
     pi_zero_six.set_episode_success_(experience, episode_id = 2)
     pi_zero_six.invalidate_(experience, 1)
 
-    pi_zero_six.invalidate_by_value_threshold_(experience, -100.)
+    pi_zero_six.invalidate_by_value_threshold_(experience, -100., value_buffer = meta_buffer)
 
-    pi_zero_six.calculate_return_or_advantages_(experience)
+    # joined dataset for training
+
+    joined_dataset = JoinedReplayDataset([pi_zero_six.dataset(experience)], meta_buffer)
 
     if manual_training:
         # now learn from the experience
 
-        for batch in pi_zero_six.dataloader(experience):
+        for batch in pi_zero_six.dataloader(joined_dataset):
             loss, *_ = model(**batch)
             loss.backward()
     else:
-        pi_zero_six.train_value_network(experience, num_train_steps = 2)
+        pi_zero_six.train_value_network(joined_dataset, num_train_steps = 2)
 
-    pi_zero_six.calculate_return_or_advantages_(experience)
-    pi_zero_six.set_advantage_token_id_(experience)
+    pi_zero_six.update_buffer_values_(experience, destination_buffer = meta_buffer)
+    pi_zero_six.calculate_return_or_advantages_(experience, destination_buffer = meta_buffer)
+    pi_zero_six.set_advantage_token_id_(meta_buffer)
 
-    pi_zero_six.train_policy_network(experience, num_train_steps = 2)
+    pi_zero_six.train_policy_network(joined_dataset, num_train_steps = 2)
 
 def test_train_time_rtc():
     from pi_zero_pytorch import π0
@@ -441,7 +469,7 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
         dim = 64, # small dim for speed
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 100,
+        num_tokens = 1024,
         num_advantage_tokens = 2,
         num_tasks = 2
     )
@@ -500,7 +528,7 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
     # rollout
 
     from pi_zero_pytorch.mock import Env
-    mock_env = Env((256, 256), 2, 32, 1024, 12)
+    mock_env = Env((256, 256), 2, 1024, 32, 12)
 
     experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, task_id = task_id)
 
