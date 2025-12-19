@@ -86,9 +86,18 @@ class ReplayBuffer:
 
         # keeping track of episode length
 
-        self.num_episodes = 0
-        self.episode_index = 0
-        self.timestep_index = 0
+        num_episodes_path = folder / 'num_episodes.state.npy'
+        episode_index_path = folder / 'episode_index.state.npy'
+        timestep_index_path = folder / 'timestep_index.state.npy'
+
+        self._num_episodes = open_memmap(str(num_episodes_path), mode = 'w+' if not num_episodes_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+        self._episode_index = open_memmap(str(episode_index_path), mode = 'w+' if not episode_index_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+        self._timestep_index = open_memmap(str(timestep_index_path), mode = 'w+' if not timestep_index_path.exists() or overwrite else 'r+', dtype = np.int32, shape = ())
+
+        if overwrite:
+            self.num_episodes = 0
+            self.episode_index = 0
+            self.timestep_index = 0
 
         # auto infer the max episodes and max timesteps by grabbing a random data memmap file
 
@@ -179,6 +188,33 @@ class ReplayBuffer:
 
         self.circular = circular
 
+    @property
+    def num_episodes(self):
+        return self._num_episodes.item()
+
+    @num_episodes.setter
+    def num_episodes(self, value):
+        self._num_episodes[()] = value
+        self._num_episodes.flush()
+
+    @property
+    def episode_index(self):
+        return self._episode_index.item()
+
+    @episode_index.setter
+    def episode_index(self, value):
+        self._episode_index[()] = value
+        self._episode_index.flush()
+
+    @property
+    def timestep_index(self):
+        return self._timestep_index.item()
+
+    @timestep_index.setter
+    def timestep_index(self, value):
+        self._timestep_index[()] = value
+        self._timestep_index.flush()
+
     @classmethod
     def from_config(cls, folder, config_name = 'data.pkl'):
         filepath = folder / config_name
@@ -221,6 +257,10 @@ class ReplayBuffer:
 
         for memmap in self.meta_data.values():
             memmap.flush()
+
+        self._num_episodes.flush()
+        self._episode_index.flush()
+        self._timestep_index.flush()
 
     @contextmanager
     def one_episode(
