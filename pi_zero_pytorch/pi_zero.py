@@ -3017,7 +3017,7 @@ class PiZeroSix(Module):
         )
         
         values_and_advantages.meta_data['task_id'][:] = pretrain_data.meta_data['task_id'][:pretrain_data.num_episodes]
-        values_and_advantages.meta_data['episode_lens'][:] = pretrain_data.meta_data['episode_lens'][:pretrain_data.num_episodes]
+        values_and_advantages.episode_lens[:] = pretrain_data.episode_lens[:pretrain_data.num_episodes]
         values_and_advantages.num_episodes = pretrain_data.num_episodes
 
         dataset = self.dataset(pretrain_data)
@@ -3094,7 +3094,7 @@ class PiZeroSix(Module):
         )
         
         values_and_advantages.meta_data['task_id'][:] = pretrain_data.meta_data['task_id'][dataset.valid_episodes]
-        values_and_advantages.meta_data['episode_lens'][:] = pretrain_data.meta_data['episode_lens'][dataset.valid_episodes]
+        values_and_advantages.episode_lens[:] = pretrain_data.episode_lens[dataset.valid_episodes]
         values_and_advantages.num_episodes = num_episodes
 
         joined_dataset = JoinedReplayDataset([dataset], values_and_advantages)
@@ -3174,7 +3174,7 @@ class PiZeroSix(Module):
         for d in all_datasets:
             num_episodes = len(d.valid_episodes)
             values_and_advantages.meta_data['task_id'][offset:offset+num_episodes] = d.experiences.meta_data['task_id'][d.valid_episodes]
-            values_and_advantages.meta_data['episode_lens'][offset:offset+num_episodes] = d.experiences.meta_data['episode_lens'][d.valid_episodes]
+            values_and_advantages.episode_lens[offset:offset+num_episodes] = d.experiences.episode_lens[d.valid_episodes]
             offset += num_episodes
 
         # 3. Step 1: Calculate initial returns based on current critic
@@ -3559,12 +3559,12 @@ class PiZeroSix(Module):
         if isinstance(experiences, ReplayDataset):
             num_episodes = len(experiences.valid_episodes)
             all_task_ids = from_numpy(buffer.meta_data['task_id'][experiences.valid_episodes])
-            episode_lens = from_numpy(buffer.meta_data['episode_lens'][experiences.valid_episodes])
+            episode_lens = from_numpy(buffer.episode_lens[experiences.valid_episodes])
             episode_ids = experiences.valid_episodes
         else:
             num_episodes = buffer.num_episodes
             all_task_ids = from_numpy(buffer.meta_data['task_id'][:num_episodes])
-            episode_lens = from_numpy(buffer.meta_data['episode_lens'][:num_episodes])
+            episode_lens = from_numpy(buffer.episode_lens[:num_episodes])
             episode_ids = arange(num_episodes)
 
         max_timesteps = buffer.max_timesteps
@@ -3608,6 +3608,9 @@ class PiZeroSix(Module):
 
             # maybe sample from all advantages
             total_samples = indices.shape[0]
+
+            if total_samples == 0:
+                continue
 
             if total_samples > num_advantages_sample:
                 randperm_indices = torch.randperm(total_samples)[:num_advantages_sample]
