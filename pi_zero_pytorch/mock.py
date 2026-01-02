@@ -7,7 +7,7 @@ import torch
 from torch import tensor, randn, randint
 from torch.nn import Module
 
-from pi_zero_pytorch.replay_buffer import ReplayBuffer
+from memmap_replay_buffer import ReplayBuffer
 
 # functions
 
@@ -58,6 +58,7 @@ def create_mock_replay_buffer(
             internal    = ('float', (joint_dim,)),
             reward      = 'float',
             actions     = ('float', (trajectory_length, dim_action_input)),
+            actions_last_step = ('float', (trajectory_length, dim_action_input)),
             terminated  = 'bool',
             value       = 'float',
             advantages  = 'float',
@@ -96,6 +97,7 @@ def create_mock_replay_buffer(
                     internal = internal,
                     reward = reward,
                     actions = actions,
+                    actions_last_step = actions, # just mock it with same random actions
                     terminated = terminated,
                     value = value,
                     advantages = advantages,
