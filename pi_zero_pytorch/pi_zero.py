@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any
 
 import math
+import bisect
 from copy import deepcopy
 from random import random, randrange
 from shutil import rmtree
@@ -62,7 +63,7 @@ from x_evolution import EvoStrategy
 
 import tqdm
 
-from pi_zero_pytorch.replay_buffer import ReplayBuffer, ReplayDataset, JoinedReplayDataset
+from memmap_replay_buffer import ReplayBuffer
 
 from accelerate import Accelerator
 
@@ -1415,6 +1416,7 @@ class PiZero(Module):
         cache_kv = True,
         return_states_for_replay = False,
         critic: Module | None = None,
+        actions_last_step: Float['b na da'] | None = None,
     ):
         assert not self.is_critic
 
@@ -1422,6 +1424,10 @@ class PiZero(Module):
 
         was_training = self.training
         self.eval()
+
+        if exists(critic) and not exists(actions_last_step):
+            # default to zeros for first step or if not passed
+            actions_last_step = torch.zeros((batch_size, trajectory_length, self.dim_action_input), device = self.device)
 
         pbar = tqdm.tqdm(desc = 'sampling action trajectory', disable = not show_pbar, total = steps)
 
@@ -1570,7 +1576,12 @@ class PiZero(Module):
         del input_kwargs['cached_state_keys_values']
         input_kwargs['times'].zero_().add_(1.)
 
-        values, _ = critic(*input_args, **input_kwargs)
+        # the critic expects the state and the actions from the last step
+        # which was passed into sample_actions and captured in the closure
+
+        critic_input_args = (images, token_ids, joint_states, actions_last_step)
+
+        values, _ = critic(*critic_input_args, **input_kwargs)
 
         return out, values
 
@@ -2517,7 +2528,10 @@ class EFPO(Module):
         self,
         agent_or_model: Agent | PiZero,
         cpu = False,
-        accelerate_kwargs: dict = dict()
+        accelerate_kwargs: dict = dict(),
+        replay_buffer_folder: str | Path = './efpo_replay_buffer',
+        max_replay_buffer_episodes = 1000,
+        max_replay_buffer_steps = 1000
     ):
         super().__init__()
         self.accelerate = Accelerator(cpu = cpu, **accelerate_kwargs)
@@ -2542,6 +2556,17 @@ class EFPO(Module):
         )
 
         self.register_buffer('step', tensor(0))
+
+        # replay buffer
+
+        if not isinstance(replay_buffer_folder, Path):
+            replay_buffer_folder = Path(replay_buffer_folder)
+
+        self.replay_buffer_folder = replay_buffer_folder
+        self.replay_buffer_folder.mkdir(parents = True, exist_ok = True)
+
+        self.max_replay_buffer_episodes = max_replay_buffer_episodes
+        self.max_replay_buffer_steps = max_replay_buffer_steps
 
     @property
     def unwrapped_actor(self):
@@ -2569,41 +2594,69 @@ class EFPO(Module):
         actor = self.unwrapped_actor
         critic = self.unwrapped_critic
 
-        all_episode_memories = []
+        # Use ReplayBuffer for storing experiences
+
+        replay_buffer = ReplayBuffer(
+            self.replay_buffer_folder,
+            max_episodes = num_episodes,
+            max_timesteps = steps,
+            fields = dict(
+                images = ('float', (3, env.num_images, *env.image_shape)),
+                text = ('int', (env.max_text_len,)),
+                internal = ('float', (env.joint_dim,)),
+                reward = 'float',
+                terminated = 'bool',
+                actions = ('float', (trajectory_length, actor.dim_action_input)),
+                actions_last_step = ('float', (trajectory_length, actor.dim_action_input)),
+                value = 'float'
+            ),
+            overwrite = True
+        )
 
         for _ in range(num_episodes):
 
             states = env.reset()
 
-            memories = []
+            actions_last_step = torch.zeros((trajectory_length, actor.dim_action_input), device = torch.device('cpu'))
 
-            for _ in range(steps):
+            with replay_buffer.one_episode():
 
-                sampled_actions, values = temp_batch_dim(actor)(
-                    *states,
-                    trajectory_length = trajectory_length,
-                    steps = flow_sampling_steps,
-                    critic = critic,
-                    **sampling_kwargs
-                )
+                for _ in range(steps):
 
-                next_states, reward, truncated, terminated = env.step(sampled_actions)
+                    sampled_actions, values = temp_batch_dim(actor)(
+                        *states,
+                        trajectory_length = trajectory_length,
+                        steps = flow_sampling_steps,
+                        critic = critic,
+                        actions_last_step = actions_last_step,
+                        **sampling_kwargs
+                    )
 
-                memories.append(to_device([*states, reward, terminated, sampled_actions, values], torch.device('cpu')))
+                    next_states, reward, truncated, terminated = env.step(sampled_actions)
 
-                states = next_states
+                    images, text, internal = states
 
-            stacked_memories = tuple(map(stack, zip(*memories)))
+                    replay_buffer.store(
+                        images = images,
+                        text = text,
+                        internal = internal,
+                        reward = reward,
+                        terminated = terminated,
+                        actions = sampled_actions,
+                        actions_last_step = actions_last_step,
+                        value = values
+                    )
 
-            all_episode_memories.append(stacked_memories)
+                    states = next_states
+                    actions_last_step = sampled_actions.cpu()
 
         self.accelerate.wait_for_everyone()
 
-        return all_episode_memories
+        return replay_buffer
 
     def learn_agent(
         self,
-        memories,
+        memories: ReplayBuffer,
         fitnesses = None,
         epochs = 2,
         batch_size = 16
@@ -2612,40 +2665,15 @@ class EFPO(Module):
 
         self.agent.train()
 
-        (
-            images,
-            commands,
-            joint_state,
-            rewards,
-            terminated,
-            actions,
-            old_values
-        ) = map(stack, zip(*memories))
-
-        flow_timesteps = actions.shape[1]
-
-        # actions go out into the environment, rewards are received, generalized advantage calculated with critic values
-
-        boundaries = terminated
-
-        advantages, returns = calc_generalized_advantage_estimate(rewards, old_values, boundaries, use_accelerated = False)
-
-        data_tensors = (
-            images,
-            commands,
-            joint_state,
-            rewards,
-            terminated,
-            actions,
-            old_values,
-            advantages
-        )
-
-        data_tensors = tuple(rearrange(t, 'b t ... -> (b t) ...') for t in data_tensors)
-
         # dataset and dataloader
 
-        dataset = TensorDataset(*data_tensors)
+        dataset = ReplayDataset(
+            memories,
+            fieldname_map = dict(
+                text = 'token_ids',
+                internal = 'joint_state'
+            )
+        )
 
         dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
 
@@ -2656,16 +2684,13 @@ class EFPO(Module):
         # training loop
 
         for _ in range(epochs):
-            for (
-                images,
-                commands,
-                joint_state,
-                rewards,
-                terminated,
-                actions,
-                old_values,
-                advantages
-            ) in dataloader:
+            for batch in dataloader:
+
+                images, commands, joint_state, rewards, terminated, actions, actions_last_step, old_values = [batch[k] for k in ('images', 'token_ids', 'joint_state', 'reward', 'terminated', 'actions', 'actions_last_step', 'value')]
+
+                # calculate advantages
+
+                advantages, returns = calc_generalized_advantage_estimate(rewards, old_values, terminated, use_accelerated = False)
 
                 actor_loss = self.agent.actor.forward_for_policy_loss(
                     images,
@@ -2690,7 +2715,7 @@ class EFPO(Module):
                     images,
                     commands,
                     joint_state,
-                    actions,
+                    actions_last_step,
                     old_values = old_values,
                     advantages = advantages,
                 )
@@ -2726,6 +2751,131 @@ class TaskConfig(BaseModel):
     max_episode_length: int
     pretrain: TrainConfig
     finetune: TrainConfig
+
+# replay datasets
+
+class ReplayDataset(Dataset):
+    def __init__(
+        self,
+        experiences: ReplayBuffer,
+        task_id: int | None = None,
+        fields: list[str] | None = None,
+        fieldname_map: dict[str, str] = dict(),
+        return_indices = False
+    ):
+        self.experiences = experiences
+        self.return_indices = return_indices
+
+        episode_ids = arange(experiences.max_episodes)
+        episode_lens = from_numpy(experiences.episode_lens)
+
+        max_episode_len = episode_lens.amax().item()
+
+        valid_mask = episode_lens > 0
+        
+        if 'invalidated' in experiences.meta_data:
+            valid_mask = valid_mask & ~from_numpy(experiences.meta_data['invalidated'])
+
+        # filter by task id
+
+        if exists(task_id):
+            is_task_id = from_numpy(experiences.meta_data['task_id']) == task_id
+            valid_mask = valid_mask & is_task_id
+
+        valid_episodes = episode_ids[valid_mask]
+        self.valid_episodes = valid_episodes
+        valid_episode_lens = episode_lens[valid_mask]
+
+        timesteps = arange(max_episode_len)
+
+        episode_timesteps = stack(broadcast_tensors(
+            rearrange(valid_episodes, 'e -> e 1'),
+            rearrange(timesteps, 't -> 1 t')
+        ), dim = -1)
+
+        valid_timesteps = einx.less('j, i -> i j', timesteps, valid_episode_lens)
+
+        # filter by invalidated - bytedance's filtered BC method
+
+        if 'invalidated' in experiences.data:
+            timestep_invalidated = from_numpy(experiences.data['invalidated'][valid_episodes, :max_episode_len])
+
+            valid_timesteps = valid_timesteps & ~timestep_invalidated
+
+        self.timepoints = episode_timesteps[valid_timesteps]
+
+        self.fields = default(fields, list(experiences.fieldnames))
+
+        self.fieldname_map = fieldname_map
+
+    def __len__(self):
+        return len(self.timepoints)
+
+    def __getitem__(self, idx):
+        episode_id, timestep_index = self.timepoints[idx].unbind(dim = -1)
+
+        step_data = dict()
+
+        for field in self.fields:
+            data = self.experiences.data[field]
+
+            model_kwarg_name = self.fieldname_map.get(field, field)
+
+            step_data[model_kwarg_name] = data[episode_id, timestep_index]
+
+        if self.return_indices:
+            step_data['indices'] = self.timepoints[idx]
+
+        return step_data
+
+class JoinedReplayDataset(Dataset):
+    def __init__(
+        self,
+        datasets: list[ReplayDataset],
+        meta_buffer: ReplayBuffer
+    ):
+        super().__init__()
+        self.datasets = datasets
+        self.meta_buffer = meta_buffer
+
+        meta_episode_offset = 0
+        self.meta_episode_offsets = []
+
+        for dataset in datasets:
+            self.meta_episode_offsets.append(meta_episode_offset)
+            meta_episode_offset += len(dataset.valid_episodes)
+
+        self.concat_dataset = ConcatDataset(datasets)
+
+    def __len__(self):
+        return len(self.concat_dataset)
+
+    def __getitem__(self, idx):
+        dataset_idx = bisect.bisect_right(self.concat_dataset.cumulative_sizes, idx)
+        
+        local_idx = idx
+        if dataset_idx > 0:
+            local_idx = idx - self.concat_dataset.cumulative_sizes[dataset_idx - 1]
+
+        dataset = self.datasets[dataset_idx]
+        data = dataset[local_idx]
+
+        # Map to meta buffer
+        source_episode_id, timestep_index = dataset.timepoints[local_idx].unbind(dim = -1)
+        
+        # We need relative episode index within the dataset's valid episodes
+        relative_episode_idx = torch.searchsorted(dataset.valid_episodes, source_episode_id)
+        
+        meta_episode_id = self.meta_episode_offsets[dataset_idx] + relative_episode_idx
+        
+        # Get meta fields (value, advantages, advantage_ids)
+        for field in self.meta_buffer.fieldnames:
+            meta_data = self.meta_buffer.data[field][meta_episode_id, timestep_index]
+            data[field] = tensor(meta_data)
+            
+        return data
+
+# recap config
 
 class RecapConfig(BaseModel):
     tasks: dict[str, TaskConfig]
@@ -3213,7 +3363,8 @@ class PiZeroSix(Module):
         experiences: ReplayBuffer,
         task_id: int | None = None, 
         fields: list[str] | None = None,
-        return_indices = False
+        return_indices = False,
+        fieldname_map: dict[str, str] | None = None
     ):
         return ReplayDataset(
             experiences,
@@ -3225,10 +3376,10 @@ class PiZeroSix(Module):
             ]),
             task_id = task_id,
             return_indices = return_indices,
-            fieldname_map = dict(
+            fieldname_map = default(fieldname_map, dict(
                 text = 'token_ids',
                 internal = 'joint_state',
-            )
+            ))
         )
 
     def dataloader(
@@ -3238,12 +3389,13 @@ class PiZeroSix(Module):
         task_id: int | None = None,
         fields: list[str] | None = None,
         return_indices = False,
+        fieldname_map: dict[str, str] | None = None,
         **dl_kwargs
 
     ) -> DataLoader:
 
         if not isinstance(experiences, Dataset):
-            dataset = self.dataset(experiences, task_id = task_id, fields = fields, return_indices = return_indices)
+            dataset = self.dataset(experiences, task_id = task_id, fields = fields, return_indices = return_indices, fieldname_map = fieldname_map)
         else:
             dataset = experiences
 
@@ -3276,6 +3428,12 @@ class PiZeroSix(Module):
             experience,
             batch_size = batch_size,
             task_id = task_id,
+            fields = ['images', 'text', 'internal', 'actions_last_step'], # Critic is conditioned on actions_last_step
+            fieldname_map = dict(
+                text = 'token_ids',
+                internal = 'joint_state',
+                actions_last_step = 'actions'
+            ),
             **dl_kwargs
         )
 
@@ -3323,12 +3481,13 @@ class PiZeroSix(Module):
     ):
         optim = optim_klass(self.unwrapped_actor.parameters(), lr = lr, weight_decay = weight_decay, **optim_kwargs)
 
-        fields = [
+        fields = default(dl_kwargs.get('fields'), [
             'images',
             'text',
             'internal',
             'actions',
-        ]
+            'actions_last_step'
+        ])
 
         if exists(advantage_id):
             fields.append('advantage_ids')
@@ -3383,7 +3542,12 @@ class PiZeroSix(Module):
             experiences,
             batch_size = batch_size,
             task_id = task_id,
-            fields = ['images', 'text', 'internal', 'actions'],
+            fields = ['images', 'text', 'internal', 'actions_last_step'],
+            fieldname_map = dict(
+                text = 'token_ids',
+                internal = 'joint_state',
+                actions_last_step = 'actions'
+            ),
             return_indices = True,
             shuffle = False
         )
@@ -3778,6 +3942,7 @@ class PiZeroSix(Module):
                 internal    = ('float', (env.joint_dim,)),
                 reward      = 'float',
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
+                actions_last_step = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
                 task_id     = 'int',
                 invalidated = 'bool'
@@ -3794,6 +3959,8 @@ class PiZeroSix(Module):
 
             states = env.reset()
 
+            actions_last_step = torch.zeros((trajectory_length, actor.dim_action_input), device = torch.device('cpu'))
+
             with experience_buffer.one_episode(
                 task_id = tensor(task_id),
                 recap_step = tensor(recap_step)
@@ -3806,6 +3973,7 @@ class PiZeroSix(Module):
                         trajectory_length = trajectory_length,
                         steps = flow_sampling_steps,
                         critic = critic,
+                        actions_last_step = actions_last_step,
                         advantage_ids = highest_advantage_id,
                         cond_scale = cond_scale,
                         task_id = task_id,
@@ -3827,8 +3995,11 @@ class PiZeroSix(Module):
                         internal = internal,
                         reward = reward,
                         actions = sampled_actions,
+                        actions_last_step = actions_last_step,
                         task_id = tensor(task_id)
                     )
+
+                    actions_last_step = sampled_actions.cpu()
 
                     if truncated or terminated:
                         break
