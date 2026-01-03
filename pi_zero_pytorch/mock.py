@@ -64,7 +64,6 @@ def create_mock_replay_buffer(
             advantages  = 'float',
             returns     = 'float',
             advantage_ids = 'int',
-            task_id     = 'int',
             invalidated = 'bool'
         )
     )
@@ -102,8 +101,7 @@ def create_mock_replay_buffer(
                     value = value,
                     advantages = advantages,
                     returns = returns,
-                    advantage_ids = advantage_ids,
-                    task_id = task_id
+                    advantage_ids = advantage_ids
                 )
 
     return buffer

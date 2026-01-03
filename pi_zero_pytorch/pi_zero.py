@@ -2475,8 +2475,7 @@ class Agent(Module):
     ):
         super().__init__()
 
-        # evolutionary policy optimization related
-        # Wang et al. https://web3.arxiv.org/abs/2503.19037
+        # Wang et al. 2025
 
         assert num_latent_genes >= 1
         evolutionary_learning = num_latent_genes > 1
@@ -2587,6 +2586,7 @@ class EFPO(Module):
         num_episodes = 1,
         trajectory_length = 16,
         flow_sampling_steps = 4,
+        task_id = None,
         **sampling_kwargs
     ):
         self.agent.eval()
@@ -2600,6 +2600,9 @@ class EFPO(Module):
             self.replay_buffer_folder,
             max_episodes = num_episodes,
             max_timesteps = steps,
+            meta_fields = dict(
+                task_id = 'int'
+            ),
             fields = dict(
                 images = ('float', (3, env.num_images, *env.image_shape)),
                 text = ('int', (env.max_text_len,)),
@@ -2621,7 +2624,10 @@ class EFPO(Module):
 
             actions_last_step = torch.zeros((trajectory_length, actor.dim_action_input), device = torch.device('cpu'))
 
-            with replay_buffer.one_episode():
+            one_episode_kwargs = dict(task_id = task_id)
+            one_episode_kwargs = {k: v for k, v in one_episode_kwargs.items() if exists(v)}
+
+            with replay_buffer.one_episode(**one_episode_kwargs):
 
                 for _ in range(steps):
 
@@ -2692,15 +2698,15 @@ class EFPO(Module):
 
         # dataset and dataloader
 
-        dataset = ReplayDataset(
-            memories,
+        dataloader = memories.dataloader(
+            batch_size = batch_size,
+            timestep_level = True,
+            shuffle = True,
             fieldname_map = dict(
                 text = 'token_ids',
                 internal = 'joint_state'
             )
         )
-
-        dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
 
         # copy of old actor
 
@@ -2777,84 +2783,12 @@ class TaskConfig(BaseModel):
 
 # replay datasets
 
-class ReplayDataset(Dataset):
-    def __init__(
-        self,
-        experiences: ReplayBuffer,
-        task_id: int | None = None,
-        fields: list[str] | None = None,
-        fieldname_map: dict[str, str] = dict(),
-        return_indices = False
-    ):
-        self.experiences = experiences
-        self.return_indices = return_indices
-
-        episode_ids = arange(experiences.max_episodes)
-        episode_lens = from_numpy(experiences.episode_lens)
-
-        max_episode_len = episode_lens.amax().item()
-
-        valid_mask = episode_lens > 0
-        
-        if 'invalidated' in experiences.meta_data:
-            valid_mask = valid_mask & ~from_numpy(experiences.meta_data['invalidated'])
-
-        # filter by task id
-
-        if exists(task_id):
-            is_task_id = from_numpy(experiences.meta_data['task_id']) == task_id
-            valid_mask = valid_mask & is_task_id
-
-        valid_episodes = episode_ids[valid_mask]
-        self.valid_episodes = valid_episodes
-        valid_episode_lens = episode_lens[valid_mask]
-
-        timesteps = arange(max_episode_len)
-
-        episode_timesteps = stack(broadcast_tensors(
-            rearrange(valid_episodes, 'e -> e 1'),
-            rearrange(timesteps, 't -> 1 t')
-        ), dim = -1)
-
-        valid_timesteps = einx.less('j, i -> i j', timesteps, valid_episode_lens)
-
-        # filter by invalidated - bytedance's filtered BC method
-
-        if 'invalidated' in experiences.data:
-            timestep_invalidated = from_numpy(experiences.data['invalidated'][valid_episodes, :max_episode_len])
-
-            valid_timesteps = valid_timesteps & ~timestep_invalidated
-
-        self.timepoints = episode_timesteps[valid_timesteps]
-
-        self.fields = default(fields, list(experiences.fieldnames))
-
-        self.fieldname_map = fieldname_map
-
-    def __len__(self):
-        return len(self.timepoints)
-
-    def __getitem__(self, idx):
-        episode_id, timestep_index = self.timepoints[idx].unbind(dim = -1)
-
-        step_data = dict()
-
-        for field in self.fields:
-            data = self.experiences.data[field]
-
-            model_kwarg_name = self.fieldname_map.get(field, field)
-
-            step_data[model_kwarg_name] = data[episode_id, timestep_index]
-
-        if self.return_indices:
-            step_data['indices'] = self.timepoints[idx]
-
-        return step_data
+# ReplayDataset removed in favor of built-in memmap_replay_buffer.ReplayDatasetTimestep
 
 class JoinedReplayDataset(Dataset):
     def __init__(
         self,
-        datasets: list[ReplayDataset],
+        datasets: list[Dataset],
         meta_buffer: ReplayBuffer
     ):
         super().__init__()
@@ -2865,6 +2799,9 @@ class JoinedReplayDataset(Dataset):
         self.meta_episode_offsets = []
 
         for dataset in datasets:
+            if hasattr(dataset, 'return_indices'):
+                dataset.return_indices = True
+
             self.meta_episode_offsets.append(meta_episode_offset)
             meta_episode_offset += len(dataset.valid_episodes)
 
@@ -2884,18 +2821,18 @@ class JoinedReplayDataset(Dataset):
         data = dataset[local_idx]
 
         # Map to meta buffer
-        source_episode_id, timestep_index = dataset.timepoints[local_idx].unbind(dim = -1)
+        episode_id, timestep_index = data.get('_indices').unbind(dim = -1)
         
         # We need relative episode index within the dataset's valid episodes
-        relative_episode_idx = torch.searchsorted(dataset.valid_episodes, source_episode_id)
+        relative_episode_idx = torch.searchsorted(dataset.valid_episodes, episode_id)
         
         meta_episode_id = self.meta_episode_offsets[dataset_idx] + relative_episode_idx
         
         # Get meta fields (value, advantages, advantage_ids)
         for field in self.meta_buffer.fieldnames:
-            meta_data = self.meta_buffer.data[field][meta_episode_id, timestep_index]
+            meta_data = self.meta_buffer.data[field][meta_episode_id.item(), timestep_index.item()]
             data[field] = tensor(meta_data)
-            
+
         return data
 
 # recap config
@@ -3193,7 +3130,7 @@ class PiZeroSix(Module):
         values_and_advantages.episode_lens[:] = pretrain_data.episode_lens[:pretrain_data.num_episodes]
         values_and_advantages.num_episodes = pretrain_data.num_episodes
 
-        dataset = self.dataset(pretrain_data)
+        dataset = self.dataset(pretrain_data, return_indices = True)
         joined_dataset = JoinedReplayDataset([dataset], values_and_advantages)
 
         self.calculate_return_or_advantages_(dataset, type = 'returns', mode = 'pretrain', destination_buffer = values_and_advantages)
@@ -3311,15 +3248,15 @@ class PiZeroSix(Module):
         all_data_folders = [*task_workspace.glob('*/data.*/')]
         assert len(all_data_folders) > 0, f'no experiences generated yet through rollouts with environment'
 
-        all_rollout_data = [ReplayBuffer.from_config(data_dir) for data_dir in all_data_folders]
+        all_rollout_data = [ReplayBuffer.from_folder(data_dir) for data_dir in all_data_folders]
 
         all_datasets = [
-            self.dataset(pretrain_data, task_id = task_id),
-            *[self.dataset(data) for data in all_rollout_data]
+            self.dataset(pretrain_data, task_id = task_id, return_indices = True),
+            *[self.dataset(data, return_indices = True) for data in all_rollout_data]
         ]
 
         num_meta_episodes = sum(len(d.valid_episodes) for d in all_datasets)
-        max_timesteps = max([d.experiences.max_timesteps for d in all_datasets])
+        max_timesteps = max([d.replay_buffer.max_timesteps for d in all_datasets])
 
         # 2. Create/Prepare values_and_advantages buffer
         meta_buffer_path = task_workspace / 'values_and_advantages'
@@ -3346,8 +3283,8 @@ class PiZeroSix(Module):
         offset = 0
         for d in all_datasets:
             num_episodes = len(d.valid_episodes)
-            values_and_advantages.meta_data['task_id'][offset:offset+num_episodes] = d.experiences.meta_data['task_id'][d.valid_episodes]
-            values_and_advantages.episode_lens[offset:offset+num_episodes] = d.experiences.episode_lens[d.valid_episodes]
+            values_and_advantages.meta_data['task_id'][offset:offset+num_episodes] = d.replay_buffer.meta_data['task_id'][d.valid_episodes]
+            values_and_advantages.episode_lens[offset:offset+num_episodes] = d.replay_buffer.episode_lens[d.valid_episodes]
             offset += num_episodes
 
         # 3. Step 1: Calculate initial returns based on current critic
@@ -3389,16 +3326,17 @@ class PiZeroSix(Module):
         return_indices = False,
         fieldname_map: dict[str, str] | None = None
     ):
-        return ReplayDataset(
-            experiences,
-            fields = default(fields, [
-                'images',
-                'text',
-                'internal',
-                'actions'
-            ]),
-            task_id = task_id,
+        filter_meta = dict(task_id = task_id) if exists(task_id) else None
+
+        if exists(fields):
+            fields = tuple(fields)
+
+        return experiences.dataset(
+            timestep_level = True,
+            fields = fields,
+            filter_meta = filter_meta,
             return_indices = return_indices,
+            include_metadata = False,
             fieldname_map = default(fieldname_map, dict(
                 text = 'token_ids',
                 internal = 'joint_state',
@@ -3417,13 +3355,28 @@ class PiZeroSix(Module):
 
     ) -> DataLoader:
 
-        if not isinstance(experiences, Dataset):
-            dataset = self.dataset(experiences, task_id = task_id, fields = fields, return_indices = return_indices, fieldname_map = fieldname_map)
-        else:
-            dataset = experiences
+        if isinstance(experiences, ReplayBuffer):
+            filter_meta = dict(task_id = task_id) if exists(task_id) else None
 
-            if return_indices and hasattr(dataset, 'return_indices'):
-                dataset.return_indices = return_indices
+            if exists(fields):
+                fields = tuple(fields)
+
+            dataloader = experiences.dataloader(
+                batch_size = batch_size,
+                timestep_level = True,
+                fields = fields,
+                filter_meta = filter_meta,
+                return_indices = return_indices,
+                fieldname_map = fieldname_map,
+                **dl_kwargs
+            )
+
+            return dataloader
+
+        dataset = experiences
+
+        if return_indices and hasattr(dataset, 'return_indices'):
+            dataset.return_indices = return_indices
 
         assert len(dataset) > 0, 'no experiences to learn from'
 
@@ -3471,6 +3424,7 @@ class PiZeroSix(Module):
 
             batch_dict = next(dl_iter)
 
+            batch_dict.pop('task_id', None)
             returns = batch_dict.pop('returns')
 
             pred_value, logits = model(task_id = task_id, **batch_dict)
@@ -3533,6 +3487,8 @@ class PiZeroSix(Module):
 
             batch_dict = next(dl_iter)
 
+            batch_dict.pop('task_id', None)
+
             if exists(advantage_id):
                 batch_dict['advantage_ids'] = advantage_id
 
@@ -3551,7 +3507,7 @@ class PiZeroSix(Module):
     @torch.no_grad()
     def update_buffer_values_(
         self,
-        experiences: ReplayBuffer | ReplayDataset,
+        experiences: ReplayBuffer | Dataset,
         batch_size = 16,
         task_id: int | None = None,
         destination_buffer: ReplayBuffer | None = None,
@@ -3577,23 +3533,24 @@ class PiZeroSix(Module):
 
         dataloader = self.accelerate.prepare(dataloader)
 
-        dest_buffer = default(destination_buffer, experiences if isinstance(experiences, ReplayBuffer) else experiences.experiences)
+        dest_buffer = default(destination_buffer, experiences if isinstance(experiences, ReplayBuffer) else experiences.replay_buffer)
 
         for batch in dataloader:
-            indices = batch.pop('indices')
+            indices = batch.pop('_indices')
             batch_size = indices.shape[0]
 
             batch = tree_map_tensor(batch, lambda t: t.to(device))
 
             batch['times'] = torch.ones((batch_size,), device = device)
 
+            batch.pop('task_id', None)
             values, _ = critic(task_id = task_id, **batch)
 
             for i, (episode_id, timestep_index) in enumerate(indices):
 
                 if exists(destination_buffer):
-                    if isinstance(experiences, ReplayDataset):
-                        relative_episode_idx = torch.searchsorted(experiences.valid_episodes, episode_id)
+                    if hasattr(experiences, 'replay_buffer'):
+                        relative_episode_idx = torch.searchsorted(experiences.valid_episodes, episode_id.to(experiences.valid_episodes.device))
                         dest_episode_id = destination_episode_offset + relative_episode_idx
                     else:
                         dest_episode_id = destination_episode_offset + episode_id
@@ -3650,7 +3607,7 @@ class PiZeroSix(Module):
     @beartype
     def calculate_return_or_advantages_(
         self,
-        experiences: ReplayBuffer | ReplayDataset,
+        experiences: ReplayBuffer | Dataset,
         type: Literal['returns', 'advantages', 'returns_and_advantages'] = 'returns_and_advantages',
         gamma = 1.,
         lam = 0.95,
@@ -3660,10 +3617,11 @@ class PiZeroSix(Module):
         destination_episode_offset: int = 0
     ):
 
-        buffer = experiences.experiences if isinstance(experiences, ReplayDataset) else experiences
+        is_dataset = hasattr(experiences, 'replay_buffer')
+        buffer = experiences.replay_buffer if is_dataset else experiences
         dest_buffer = default(destination_buffer, buffer)
 
-        episode_ids = experiences.valid_episodes if isinstance(experiences, ReplayDataset) else range(buffer.num_episodes)
+        episode_ids = experiences.valid_episodes if is_dataset else range(buffer.num_episodes)
 
         for i, episode_id in enumerate(episode_ids):
 
@@ -3734,16 +3692,17 @@ class PiZeroSix(Module):
     @beartype
     def set_advantage_token_id_(
         self,
-        experiences: ReplayBuffer | ReplayDataset,
+        experiences: ReplayBuffer | Dataset,
         num_advantages_sample = 10_000,
         mode: Literal['pretrain', 'finetune'] = 'finetune',
         destination_buffer: ReplayBuffer | None = None,
         destination_episode_offset: int = 0
     ):
-        buffer = experiences.experiences if isinstance(experiences, ReplayDataset) else experiences
+        is_dataset = hasattr(experiences, 'replay_buffer')
+        buffer = experiences.replay_buffer if is_dataset else experiences
         dest_buffer = default(destination_buffer, buffer)
 
-        if isinstance(experiences, ReplayDataset):
+        if is_dataset:
             num_episodes = len(experiences.valid_episodes)
             all_task_ids = from_numpy(buffer.meta_data['task_id'][experiences.valid_episodes])
             episode_lens = from_numpy(buffer.episode_lens[experiences.valid_episodes])
@@ -3967,7 +3926,6 @@ class PiZeroSix(Module):
                 actions     = ('float', (trajectory_length, actor.dim_action_input)),
                 actions_last_step = ('float', (trajectory_length, actor.dim_action_input)),
                 terminated  = 'bool',
-                task_id     = 'int',
                 invalidated = 'bool'
             )
         )
@@ -3984,10 +3942,13 @@ class PiZeroSix(Module):
 
             actions_last_step = torch.zeros((trajectory_length, actor.dim_action_input), device = torch.device('cpu'))
 
-            with experience_buffer.one_episode(
-                task_id = tensor(task_id),
-                recap_step = tensor(recap_step)
-            ):
+            one_episode_kwargs = dict()
+            if exists(task_id):
+                one_episode_kwargs['task_id'] = tensor(task_id)
+            if exists(recap_step):
+                one_episode_kwargs['recap_step'] = tensor(recap_step)
+
+            with experience_buffer.one_episode(**one_episode_kwargs):
 
                 for _ in range(steps):
 
@@ -4018,8 +3979,7 @@ class PiZeroSix(Module):
                         internal = internal,
                         reward = reward,
                         actions = sampled_actions,
-                        actions_last_step = actions_last_step,
-                        task_id = tensor(task_id)
+                        actions_last_step = actions_last_step
                     )
 
                     actions_last_step = sampled_actions.cpu()
