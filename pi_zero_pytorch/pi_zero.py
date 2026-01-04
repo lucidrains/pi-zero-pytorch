@@ -51,7 +51,7 @@ from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
 from pi_zero_pytorch.tensor_typing import Float, Int, Bool
 
-from hyper_connections import HyperConnections
+from hyper_connections import ManifoldConstrainedHyperConnections
 
 from hl_gauss_pytorch import HLGaussLayer
 
@@ -1158,7 +1158,7 @@ class PiZero(Module):
         # residual functions, with maybe hyper connections
 
         assert num_residual_streams >= 1
-        init_residual_fn, self.maybe_expand_residuals, self.maybe_reduce_residuals = HyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
+        init_residual_fn, self.maybe_expand_residuals, self.maybe_reduce_residuals = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         residual_fns = []
         counter = count()
