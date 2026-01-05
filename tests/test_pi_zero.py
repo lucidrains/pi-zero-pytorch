@@ -100,11 +100,13 @@ def test_pi_zero_with_vit(
 @param('model_predict_output', ('flow', 'clean'))
 @param('use_spo', (False, True))
 @param('use_asymmetric_spo', (False, True))
+@param('action_magnitude_penalty', (False, True))
 def test_flow_policy_optimization(
     num_latent_genes,
     model_predict_output,
     use_spo,
-    use_asymmetric_spo
+    use_asymmetric_spo,
+    action_magnitude_penalty
 ):
 
     from vit_pytorch import ViT
@@ -163,9 +165,16 @@ def test_flow_policy_optimization(
 
     mock_env = Env((256, 256), 2, 1024, 32, 12)
 
+    action_penalty_thresholds = None
+
+    if action_magnitude_penalty:
+        action_penalty_thresholds = [1.] * 6 # for the 6 actions
+
     epo = EFPO(
         agent,
         cpu = True,
+        action_penalty_thresholds = action_penalty_thresholds,
+        action_penalty_weight = 1e-1
     )
 
     memories = epo.gather_experience_from_env(mock_env, steps = 4)

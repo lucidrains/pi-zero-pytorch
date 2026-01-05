@@ -2530,7 +2530,9 @@ class EFPO(Module):
         accelerate_kwargs: dict = dict(),
         replay_buffer_folder: str | Path = './efpo_replay_buffer',
         max_replay_buffer_episodes = 1000,
-        max_replay_buffer_steps = 1000
+        max_replay_buffer_steps = 1000,
+        action_penalty_thresholds: list[float] | Tensor | None = None,
+        action_penalty_weight = 1e-1
     ):
         super().__init__()
         self.accelerate = Accelerator(cpu = cpu, **accelerate_kwargs)
@@ -2566,6 +2568,15 @@ class EFPO(Module):
 
         self.max_replay_buffer_episodes = max_replay_buffer_episodes
         self.max_replay_buffer_steps = max_replay_buffer_steps
+
+        # penalize actions out of bounds - helps with FPO convergence in personal experiments
+
+        if isinstance(action_penalty_thresholds, list):
+            action_penalty_thresholds = tensor(action_penalty_thresholds)
+
+        self.register_buffer('action_penalty_thresholds', action_penalty_thresholds)
+
+        self.action_penalty_weight = action_penalty_weight
 
     @property
     def unwrapped_actor(self):
@@ -2641,6 +2652,12 @@ class EFPO(Module):
                     )
 
                     next_states, reward, truncated, terminated = env.step(sampled_actions)
+
+                    # maybe penalize actions
+
+                    if exists(self.action_penalty_thresholds):
+                        penalty = (sampled_actions.abs() - self.action_penalty_thresholds).relu().square().sum(dim = -1).mean()
+                        reward = reward - penalty * self.action_penalty_weight
 
                     images, text, internal = states
 
