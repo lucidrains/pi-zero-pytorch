@@ -308,6 +308,50 @@ def pad_at_dim(
 
 # flow related
 
+def log_snr_to_alpha_sigma(log_snr):
+    alpha = log_snr.sigmoid().sqrt()
+    sigma = (-log_snr).sigmoid().sqrt()
+    return alpha, sigma
+
+# vision encoder (SigLIP)
+
+class SigLIPEncoder(nn.Module):
+    def __init__(
+        self,
+        image_size = 224,
+        patch_size = 14,
+        dim = 1152,
+        depth = 27,
+        heads = 16,
+        mlp_dim = 4304
+    ):
+        super().__init__()
+        try:
+            from vit_pytorch import ViT
+        except ImportError:
+            print('vit-pytorch must be installed to use SigLIPEncoder (pip install vit-pytorch)')
+            raise
+
+        self.vit = ViT(
+            image_size = image_size,
+            patch_size = patch_size,
+            num_classes = 1, # unused
+            dim = dim,
+            depth = depth,
+            heads = heads,
+            mlp_dim = mlp_dim,
+            dim_head = dim // heads
+        )
+
+    def forward(self, x):
+        x = self.vit.to_patch_embedding(x)
+        b, n, _ = x.shape
+        x += self.vit.pos_embedding[:, 1:n+1]
+        x = self.vit.transformer(x)
+        return x
+
+# classes
+
 def default_sample_times(
     shape,
     s = 0.999,
@@ -593,6 +637,7 @@ class Attention(Module):
     def __init__(
         self,
         dim,
+        dim_action = None,       # separate dimension for action tokens (input/output)
         dim_head = 64,
         heads = 8,
         dropout = 0.,
@@ -605,6 +650,10 @@ class Attention(Module):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
+
+        # action input/output dimension defaults to state dimension for backwards compatibility
+        dim_action = default(dim_action, dim)
+        self.dim_action = dim_action
 
         self.rotary_emb = rotary_emb
 
@@ -626,17 +675,17 @@ class Attention(Module):
         self.to_mem_qkv = LinearNoBias(dim, 3 * dim_inner) if accept_memories else None
         self.to_mem_out = LinearNoBias(dim_inner, dim) if accept_memories else None
 
-        # action parameters
+        # action parameters - use dim_action for input/output but same heads
 
-        self.to_actions_qkvg = LinearNoBias(dim, 4 * dim_inner)
+        self.to_actions_qkvg = LinearNoBias(dim_action, 4 * dim_inner)
 
         self.to_action_value_residual_mix = nn.Sequential(
-            LinearNoBias(dim, heads),
+            LinearNoBias(dim_action, heads),
             nn.Sigmoid(),
             Rearrange('b n h -> b h n 1')
         ) if learned_value_action_residual_mix else (lambda _: 0.5)
 
-        self.to_actions_out = LinearNoBias(dim_inner, dim)
+        self.to_actions_out = LinearNoBias(dim_inner, dim_action)
 
         # norms for all action linears
         # from Bytedance's GR-3
@@ -647,7 +696,7 @@ class Attention(Module):
             self.actions_q_norm = nn.RMSNorm(dim_head)
             self.actions_k_norm = nn.RMSNorm(dim_head)
             self.actions_v_norm = nn.RMSNorm(dim_head)
-            self.actions_out_norm = nn.RMSNorm(dim, elementwise_affine = False)
+            self.actions_out_norm = nn.RMSNorm(dim_action, elementwise_affine = False)
 
         self.softclamp_value = softclamp_value
 
@@ -1023,12 +1072,14 @@ class PiZero(Module):
         num_tokens,
         dim_action_input,
         dim_joint_state,
+        dim_action = None,           # separate dimension for action tokens (for PI weight loading)
         dim_time_cond = None,
         depth = 12,
         dim_head = 64,
         heads = 8,
         use_flex_attn = False,
         ff_expand_factor = 4.,
+        action_ff_expand_factor = None,  # separate expand factor for action feedforward
         attn_softclamp_value = 50.,
         final_norm_softclamp_value = 30.,
         vit: Module | None = None,
@@ -1079,8 +1130,11 @@ class PiZero(Module):
     ):
         super().__init__()
         dim_time_cond = default(dim_time_cond, dim * 2)
+        dim_action = default(dim_action, dim)
+        action_ff_expand_factor = default(action_ff_expand_factor, ff_expand_factor)
 
         self.dim = dim
+        self.dim_action = dim_action
 
         # flex attention related
 
@@ -1098,9 +1152,10 @@ class PiZero(Module):
 
         self.token_emb = nn.Embedding(num_tokens, dim)
 
-        # internal states
+        # joint state tokens
+        # projects to dim_action (aligned with PI weights)
 
-        self.to_joint_state_tokens = nn.Linear(dim_joint_state, dim)
+        self.to_joint_state_tokens = nn.Linear(dim_joint_state, dim_action)
 
         self.dim_internal_state = default(dim_internal_state, dim)
         self.to_internal_state_tokens = nn.Linear(dim_internal_state, dim) if exists(dim_internal_state) else nn.Identity()
@@ -1110,14 +1165,14 @@ class PiZero(Module):
         external_state_encoders = default(external_state_encoders, [])
         self.external_state_encoders = ModuleList(external_state_encoders)
 
-        # actions
+        # actions - use dim_action for action token dimension
 
         self.dim_action_input = dim_action_input
 
-        self.action_register_tokens = nn.Parameter(torch.zeros(num_action_register_tokens, dim))
+        self.action_register_tokens = nn.Parameter(torch.zeros(num_action_register_tokens, dim_action))
         nn.init.normal_(self.action_register_tokens, std = 0.02)
 
-        self.to_action_tokens = nn.Linear(dim_action_input, dim)
+        self.to_action_tokens = nn.Linear(dim_action_input, dim_action)
 
         # time conditioning
 
@@ -1172,9 +1227,9 @@ class PiZero(Module):
             is_first_block = i == 0
 
             layers.append(ModuleList([
-                Attention(dim = dim, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **attn_kwargs),
+                Attention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **attn_kwargs),
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs),
-                SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, rmsnorm = False, norm_all = action_dit_norm_all_linears, **ff_kwargs),
+                SwiGLUFeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, rmsnorm = False, norm_all = action_dit_norm_all_linears, **ff_kwargs),
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
@@ -1186,8 +1241,8 @@ class PiZero(Module):
             cond_layers.append(ModuleList([
                 AdaptiveRMSNorm(dim, dim_time_cond),
                 AdaptiveLayerscale(dim, dim_time_cond),
-                AdaptiveRMSNorm(dim, dim_time_cond),
-                AdaptiveLayerscale(dim, dim_time_cond)
+                AdaptiveRMSNorm(dim_action, dim_time_cond),
+                AdaptiveLayerscale(dim_action, dim_time_cond)
             ]))
 
         self.layers = ModuleList(layers)
@@ -1198,7 +1253,7 @@ class PiZero(Module):
         self.final_norm_softclamp = partial(softclamp, value = final_norm_softclamp_value)
 
         self.final_norm = nn.RMSNorm(dim)
-        self.final_actions_norm = nn.RMSNorm(dim)
+        self.final_actions_norm = nn.RMSNorm(dim_action)
 
         # unembedding
 
@@ -1223,7 +1278,7 @@ class PiZero(Module):
         self.loss_fn = None
 
         if not is_critic:
-            self.actions_to_pred_flow = LinearNoBias(dim, dim_action_input)
+            self.actions_to_pred_flow = LinearNoBias(dim_action, dim_action_input)
             self.loss_fn = nn.MSELoss(reduction = 'none')
 
         # use simple policy optimization
