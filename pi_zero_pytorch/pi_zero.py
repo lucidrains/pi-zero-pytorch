@@ -315,7 +315,7 @@ def log_snr_to_alpha_sigma(log_snr):
 
 # vision encoder (SigLIP)
 
-class SigLIPEncoder(nn.Module):
+class SigLIPEncoder(Module):
     def __init__(
         self,
         image_size = 224,
@@ -335,18 +335,19 @@ class SigLIPEncoder(nn.Module):
         self.vit = ViT(
             image_size = image_size,
             patch_size = patch_size,
-            num_classes = 1, # unused
             dim = dim,
             depth = depth,
             heads = heads,
             mlp_dim = mlp_dim,
-            dim_head = dim // heads
+            dim_head = dim // heads,
+            num_classes = 0
         )
 
     def forward(self, x):
         x = self.vit.to_patch_embedding(x)
         b, n, _ = x.shape
-        x += self.vit.pos_embedding[:, 1:n+1]
+
+        x = x + self.vit.pos_embedding[:, 1:n+1]
         x = self.vit.transformer(x)
         return x
 

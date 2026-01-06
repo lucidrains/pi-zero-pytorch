@@ -1,6 +1,6 @@
 [project]
 name = "pi-zero-pytorch"
-version = "0.4.61"
+version = "0.4.62"
 description = "π0 in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -44,7 +44,7 @@ dependencies = [
     'torchdiffeq',
     'torchtyping>=0.1.5',
     'tqdm',
-    'vit-pytorch>=1.8.7',
+    'vit-pytorch>=1.17.3',
     'x-evolution>=0.1.15',
     'x-mlps-pytorch>=0.0.24',
     'x-transformers>=2.4.1',
