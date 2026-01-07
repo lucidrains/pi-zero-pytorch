@@ -20,7 +20,6 @@ from itertools import count
 
 import numpy as np
 from numpy import ndarray
-from numpy.lib.format import open_memmap
 
 import torch
 import torch.nn.functional as F
@@ -153,6 +152,9 @@ def default(v, d):
 
 def identity(t):
     return t
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def sample(prob):
     return random() < prob
@@ -641,6 +643,7 @@ class Attention(Module):
         dim_action = None,       # separate dimension for action tokens (input/output)
         dim_head = 64,
         heads = 8,
+        kv_heads = None,
         dropout = 0.,
         softclamp_value = 50.,
         accept_memories = False,
@@ -650,7 +653,22 @@ class Attention(Module):
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        kv_heads = default(kv_heads, heads)
+        self.kv_heads = kv_heads
+
+        assert divisible_by(heads, kv_heads)
+        self.query_groups = heads // kv_heads
+
         dim_inner = dim_head * heads
+        dim_kv_inner = dim_head * kv_heads
+
+        self.q_kv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+        self.actions_qkvg_split = (dim_inner, dim_kv_inner, dim_kv_inner, dim_inner)
+        self.mem_qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner, dim_inner, dim_kv_inner, dim_kv_inner)
 
         # action input/output dimension defaults to state dimension for backwards compatibility
         dim_action = default(dim_action, dim)
@@ -658,14 +676,15 @@ class Attention(Module):
 
         self.rotary_emb = rotary_emb
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
+
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.rmsnorm = nn.RMSNorm(dim)
 
         # state parameters
 
-        self.to_qkv = LinearNoBias(dim, 3 * dim_inner)
+        self.to_qkv = nn.Linear(dim, (heads + 2 * kv_heads) * dim_head, bias = False)
         self.to_out = LinearNoBias(dim_inner, dim)
 
         # maybe memory parameters
@@ -673,15 +692,15 @@ class Attention(Module):
         self.accept_memories = accept_memories
 
         self.mem_rmsnorm = nn.RMSNorm(dim) if accept_memories else None
-        self.to_mem_qkv = LinearNoBias(dim, 3 * dim_inner) if accept_memories else None
+        self.to_mem_qkv = LinearNoBias(dim, (heads + 2 * kv_heads) * dim_head) if accept_memories else None
         self.to_mem_out = LinearNoBias(dim_inner, dim) if accept_memories else None
 
         # action parameters - use dim_action for input/output but same heads
 
-        self.to_actions_qkvg = LinearNoBias(dim_action, 4 * dim_inner)
+        self.to_actions_qkvg = LinearNoBias(dim_action, (2 * heads + 2 * kv_heads) * dim_head)
 
         self.to_action_value_residual_mix = nn.Sequential(
-            LinearNoBias(dim_action, heads),
+            LinearNoBias(dim_action, kv_heads),
             nn.Sigmoid(),
             Rearrange('b n h -> b h n 1')
         ) if learned_value_action_residual_mix else (lambda _: 0.5)
@@ -713,7 +732,8 @@ class Attention(Module):
         flex_attn_fn: Callable | None = None,
         knowledge_insulate = False
     ):
-        aq, ak, av, ag = self.to_actions_qkvg(actions).chunk(4, dim = -1)
+
+        aq, ak, av, ag = self.to_actions_qkvg(actions).split(self.actions_qkvg_split, dim = -1)
 
         aq, ak, av, ag = tuple(self.split_heads(t) for t in (aq, ak, av, ag))
 
@@ -759,6 +779,10 @@ class Attention(Module):
         else:
             q = q * self.scale
 
+            if self.query_groups > 1:
+                k = repeat(k, 'b h n d -> b (h g) n d', g = self.query_groups)
+                v = repeat(v, 'b h n d -> b (h g) n d', g = self.query_groups)
+
             sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
             sim = softclamp(sim, self.softclamp_value)
@@ -796,7 +820,7 @@ class Attention(Module):
 
         device = state.device
 
-        q, k, v = self.to_qkv(state).chunk(3, dim = -1)
+        q, k, v = self.to_qkv(state).split(self.q_kv_split, dim = -1)
 
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
@@ -811,6 +835,10 @@ class Attention(Module):
         # attention
 
         q = q * self.scale
+
+        if self.query_groups > 1:
+            k = repeat(k, 'b h n d -> b (h g) n d', g = self.query_groups)
+            v = repeat(v, 'b h n d -> b (h g) n d', g = self.query_groups)
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
@@ -848,9 +876,9 @@ class Attention(Module):
 
         # separate projections for multimodal seq vs actions
 
-        mq, mk, mv = self.to_qkv(multimodal_seq).chunk(3, dim = -1)
+        mq, mk, mv = self.to_qkv(multimodal_seq).split(self.q_kv_split, dim = -1)
 
-        aq, ak, av, ag = self.to_actions_qkvg(actions).chunk(4, dim = -1)
+        aq, ak, av, ag = self.to_actions_qkvg(actions).split(self.actions_qkvg_split, dim = -1)
 
         mq, mk, mv, aq, ak, av, ag = tuple(self.split_heads(t) for t in (mq, mk, mv, aq, ak, av, ag))
 
@@ -879,10 +907,10 @@ class Attention(Module):
         if has_memories:
             memories, unpack_memories = pack_with_inverse(memories, 'b * d')
             memories = self.mem_rmsnorm(memories)
-            mqkv = self.to_mem_qkv(memories)
-            mqkv_read, mqkv_write = unpack_memories(mqkv, 'b * d')
+            mqkv_res = self.to_mem_qkv(memories).split(self.mem_qkv_split, dim = -1)
+            mqr, mkr, mvr, mqw, mkw, mvw = mqkv_res
 
-            mqr, mkr, mvr, mqw, mkw, mvw = tuple(self.split_heads(t) for t in (*mqkv_read.chunk(3, dim = -1), *mqkv_write.chunk(3, dim = -1)))
+            mqr, mkr, mvr, mqw, mkw, mvw = tuple(self.split_heads(t) for t in (mqr, mkr, mvr, mqw, mkw, mvw))
 
             k = cat((mkr, k, mkw), dim = -2)
             v = cat((mvr, v, mvw), dim = -2)
@@ -902,6 +930,10 @@ class Attention(Module):
 
         else:
             # attention
+
+            if self.query_groups > 1:
+                k = repeat(k, 'b h n d -> b (h g) n d', g = self.query_groups)
+                v = repeat(v, 'b h n d -> b (h g) n d', g = self.query_groups)
 
             q = q * self.scale
 
@@ -1078,6 +1110,7 @@ class PiZero(Module):
         depth = 12,
         dim_head = 64,
         heads = 8,
+        kv_heads = None,
         use_flex_attn = False,
         ff_expand_factor = 4.,
         action_ff_expand_factor = None,  # separate expand factor for action feedforward
@@ -1148,6 +1181,8 @@ class PiZero(Module):
         self.vit = vit
 
         self.maybe_to_image_tokens = nn.Linear(vit_dim, dim) if exists(vit_dim) and vit_dim != dim else nn.Identity()
+
+        self.attn_kwargs = {**attn_kwargs, 'kv_heads': kv_heads}
 
         # embedding
 
@@ -1228,7 +1263,7 @@ class PiZero(Module):
             is_first_block = i == 0
 
             layers.append(ModuleList([
-                Attention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **attn_kwargs),
+                Attention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **self.attn_kwargs),
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs),
                 SwiGLUFeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, rmsnorm = False, norm_all = action_dit_norm_all_linears, **ff_kwargs),
                 SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None

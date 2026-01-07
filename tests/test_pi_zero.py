@@ -16,6 +16,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 @param('task_status_loss', (False, True))
 @param('advantage_condition', (False, True))
 @param('model_predict_output', ('flow', 'clean'))
+@param('kv_heads', (None, 2))
 def test_pi_zero_with_vit(
     only_vlm: bool,
     num_residual_streams: int,
@@ -23,7 +24,8 @@ def test_pi_zero_with_vit(
     action_dit_norm_all_linears: bool,
     task_status_loss: bool,
     advantage_condition,
-    model_predict_output
+    model_predict_output,
+    kv_heads
 ):
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
@@ -51,6 +53,7 @@ def test_pi_zero_with_vit(
         dim_action_input = 6,
         dim_joint_state = 12,
         num_tokens = 1024,
+        kv_heads = kv_heads,
         num_advantage_tokens = 2 if advantage_condition else 0,
         sample_soft_mask_lens = (2, 1, 29),
         action_dit_norm_all_linears = action_dit_norm_all_linears,

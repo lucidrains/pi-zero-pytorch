@@ -69,9 +69,10 @@ def create_pizero_config_for_pi0(pi0_config):
         depth = pg['num_layers'],
         dim_head = pg['dim_head'],
         heads = pg['num_query_heads'],
+        kv_heads = pg['num_kv_heads'],
         ff_expand_factor = state_ff_expand,
         action_ff_expand_factor = action_ff_expand,
-        dim_time_cond = pg['dim'] * 2
+        dim_time_cond = 1024
     )
 
 
@@ -97,6 +98,12 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         if pi_k in pi_weights and pz_k in pz_state:
             new_state[pz_k] = pi_weights[pi_k]
 
+    # time conditioning
+
+    if "action_time_mlp_in.weight" in pi_weights:
+        new_state["to_time_cond.1.weight"] = pi_weights["action_time_mlp_in.weight"]
+        new_state["to_time_cond.1.bias"] = pi_weights["action_time_mlp_in.bias"]
+
     # transformer layers
 
     for i in range(pg['num_layers']):
@@ -110,7 +117,7 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         new_state[f"{pz_p}.1.rmsnorm.weight"] = pi_weights[f"{pi_p}.post_attention_layernorm.weight"]
         
         q, k, v = [pi_weights[f"{pi_p}.self_attn.{x}_proj.weight"] for x in ('q', 'k', 'v')]
-        new_state[f"{pz_p}.0.to_qkv.weight"] = cat([q, expand_kv_heads(k, pg['num_kv_heads'], pg['num_query_heads']), expand_kv_heads(v, pg['num_kv_heads'], pg['num_query_heads'])], dim = 0)
+        new_state[f"{pz_p}.0.to_qkv.weight"] = cat([q, k, v], dim = 0)
         new_state[f"{pz_p}.0.to_out.weight"] = pi_weights[f"{pi_p}.self_attn.o_proj.weight"]
 
         gate, up = [pi_weights[f"{pi_p}.mlp.{x}_proj.weight"] for x in ('gate', 'up')]
@@ -120,7 +127,6 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         # action path (gemma expert)
 
         aq, ak, av = [pi_weights[f"{pi_e}.self_attn.{x}_proj.weight"] for x in ('q', 'k', 'v')]
-        ak, av = [expand_kv_heads(x, ge['num_kv_heads'], ge['num_query_heads']) for x in (ak, av)]
         new_state[f"{pz_p}.0.to_actions_qkvg.weight"] = cat([aq, ak, av, torch.zeros_like(aq)], dim = 0)
         new_state[f"{pz_p}.0.to_actions_out.weight"] = pi_weights[f"{pi_e}.self_attn.o_proj.weight"]
 
@@ -153,7 +159,7 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         
         pos = pi_weights[f"{vi_p}.embeddings.position_embedding.weight"]
         pz_pos = pz_state["vit.vit.pos_embedding"].clone()
-        pz_pos[0, 1:] = pos
+        pz_pos[1:] = pos
         new_state["vit.vit.pos_embedding"] = pz_pos
 
         # vit layers
