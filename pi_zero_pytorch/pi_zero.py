@@ -315,9 +315,76 @@ def log_snr_to_alpha_sigma(log_snr):
     sigma = (-log_snr).sigmoid().sqrt()
     return alpha, sigma
 
-# vision encoder (SigLIP)
+# siglip encoder
 
-class SigLIPEncoder(Module):
+class SimpleAttention(Module):
+    def __init__(self, dim, heads = 16, dim_head = 72, eps = 1e-6):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim, eps = eps)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = True)
+        self.to_out = nn.Linear(inner_dim, dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
+        attn = sim.softmax(dim = -1)
+
+        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+class FeedForward(Module):
+    def __init__(
+        self,
+        dim,
+        dim_inner = None,
+        expand_factor = 4.,
+        glu = False,
+        bias = False,
+        rmsnorm = False,
+        norm_klass = None,
+        eps = 1e-6,
+        norm_all = False,
+        activation = nn.GELU(approximate = 'tanh')
+    ):
+        super().__init__()
+        dim_inner = default(dim_inner, int(dim * expand_factor * (2 / 3 if glu else 1)))
+
+        norm_klass = default(norm_klass, (nn.RMSNorm if rmsnorm else nn.LayerNorm))
+        self.norm = norm_klass(dim, eps = eps) if norm_klass != nn.Identity else nn.Identity()
+
+        self.glu = glu
+        self.activation = activation
+
+        self.proj_in = nn.Linear(dim, dim_inner * (2 if glu else 1), bias = bias)
+        self.proj_out = nn.Linear(dim_inner, dim, bias = bias)
+
+        self.post_proj_in_norm = nn.RMSNorm(dim_inner, eps = eps) if norm_all else nn.Identity()
+        self.post_proj_out_norm = nn.RMSNorm(dim, eps = eps, elementwise_affine = False) if norm_all else nn.Identity()
+
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.proj_in(x)
+
+        if self.glu:
+            x, gate = x.chunk(2, dim = -1)
+            x = x * self.activation(gate)
+        else:
+            x = self.activation(x)
+
+        x = self.post_proj_in_norm(x)
+        out = self.proj_out(x)
+        return self.post_proj_out_norm(out)
+
+class SigLIP(Module):
     def __init__(
         self,
         image_size = 224,
@@ -325,33 +392,42 @@ class SigLIPEncoder(Module):
         dim = 1152,
         depth = 27,
         heads = 16,
-        mlp_dim = 4304
+        mlp_dim = 4304,
+        eps = 1e-6,
+        norm_klass = nn.LayerNorm,
+        activation = nn.GELU(approximate = 'tanh')
     ):
         super().__init__()
-        try:
-            from vit_pytorch import ViT
-        except ImportError:
-            print('vit-pytorch must be installed to use SigLIPEncoder (pip install vit-pytorch)')
-            raise
+        num_patches = (image_size // patch_size) ** 2
+        dim_head = dim // heads
 
-        self.vit = ViT(
-            image_size = image_size,
-            patch_size = patch_size,
-            dim = dim,
-            depth = depth,
-            heads = heads,
-            mlp_dim = mlp_dim,
-            dim_head = dim // heads,
-            num_classes = 0
+        self.to_patch_embed = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+            nn.Linear(patch_size * patch_size * 3, dim)
         )
 
-    def forward(self, x):
-        x = self.vit.to_patch_embedding(x)
-        b, n, _ = x.shape
+        self.pos_embed = nn.Parameter(torch.randn(num_patches, dim))
 
-        x = x + self.vit.pos_embedding[:, 1:n+1]
-        x = self.vit.transformer(x)
-        return x
+        self.layers = ModuleList([])
+        for _ in range(depth):
+            self.layers.append(ModuleList([
+                SimpleAttention(dim, heads, dim_head, eps = eps),
+                FeedForward(dim = dim, dim_inner = mlp_dim, bias = True, eps = eps, norm_klass = norm_klass, activation = activation)
+            ]))
+
+        self.norm = norm_klass(dim, eps = eps)
+
+    def forward(self, x):
+        x = self.to_patch_embed(x)
+        num_patches = x.shape[1]
+
+        x = x + self.pos_embed[:num_patches]
+
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        return self.norm(x)
 
 # classes
 
@@ -635,7 +711,7 @@ class BinnedValueLayer(Module):
 
 # attention
 
-class Attention(Module):
+class JointAttention(Module):
     @beartype
     def __init__(
         self,
@@ -992,42 +1068,6 @@ class Attention(Module):
 
         return output, (mk, mv, ak, av)
 
-# attention
-
-class SwiGLUFeedForward(Module):
-    def __init__(
-        self,
-        dim,
-        expand_factor = 4.,
-        dim_inner = None,
-        rmsnorm = True,
-        norm_all = False
-    ):
-        super().__init__()
-        dim_inner = default(dim_inner, int(dim * expand_factor * 2 / 3))
-
-        self.rmsnorm = nn.RMSNorm(dim) if rmsnorm else nn.Identity()
-        self.proj_in = LinearNoBias(dim, dim_inner * 2)
-        self.proj_out = LinearNoBias(dim_inner, dim)
-
-        # maybe additional norms for action branch
-
-        self.post_proj_in_norm = nn.RMSNorm(dim_inner) if norm_all else nn.Identity()
-        self.post_proj_out_norm = nn.RMSNorm(dim, elementwise_affine = False) if norm_all else nn.Identity()
-
-    def forward(
-        self,
-        seq
-    ):
-        seq = self.rmsnorm(seq)
-        seq, gates = self.proj_in(seq).chunk(2, dim = -1)
-
-        seq = seq * F.gelu(gates)
-        seq = self.post_proj_in_norm(seq)
-
-        out = self.proj_out(seq)
-        return self.post_proj_out_norm(out)
-
 # actions need time conditioning
 # ada-ln zero from DiT - here we will improvise with adaptive rmsnorm
 
@@ -1193,8 +1233,8 @@ class PiZero(Module):
 
         self.to_joint_state_tokens = nn.Linear(dim_joint_state, dim_action)
 
-        self.dim_internal_state = default(dim_internal_state, dim)
-        self.to_internal_state_tokens = nn.Linear(dim_internal_state, dim) if exists(dim_internal_state) else nn.Identity()
+        self.dim_internal_state = default(dim_internal_state, dim_action)
+        self.to_internal_state_tokens = nn.Linear(self.dim_internal_state, dim_action) if exists(dim_internal_state) else nn.Identity()
 
         # additional external states
 
@@ -1263,10 +1303,10 @@ class PiZero(Module):
             is_first_block = i == 0
 
             layers.append(ModuleList([
-                Attention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **self.attn_kwargs),
-                SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs),
-                SwiGLUFeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, rmsnorm = False, norm_all = action_dit_norm_all_linears, **ff_kwargs),
-                SwiGLUFeedForward(dim = dim, expand_factor = ff_expand_factor, **ff_kwargs) if self.has_recurrent_memories else None
+                JointAttention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **self.attn_kwargs),
+                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, **ff_kwargs),
+                FeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, glu = True, norm_klass = nn.Identity, norm_all = action_dit_norm_all_linears, **ff_kwargs),
+                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
             residual_fns.append(ModuleList([

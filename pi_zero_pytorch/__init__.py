@@ -4,7 +4,7 @@ from memmap_replay_buffer import (
 
 from pi_zero_pytorch.pi_zero import (
     PiZero, π0,
-    SigLIPEncoder,
+    SigLIP,
     SoftMaskInpainter,
     RTCGuidance,
     EFPO,

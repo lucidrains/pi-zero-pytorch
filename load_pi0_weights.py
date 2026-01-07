@@ -4,7 +4,8 @@ from pathlib import Path
 from torch import nn, tensor, cat
 from safetensors import safe_open
 from collections import OrderedDict
-from pi_zero_pytorch import PiZero, SigLIPEncoder
+from einops import rearrange
+from pi_zero_pytorch import PiZero, SigLIP
 
 # helpers
 
@@ -114,7 +115,7 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         # state path (paligemma)
 
         new_state[f"{pz_p}.0.rmsnorm.weight"] = pi_weights[f"{pi_p}.input_layernorm.weight"]
-        new_state[f"{pz_p}.1.rmsnorm.weight"] = pi_weights[f"{pi_p}.post_attention_layernorm.weight"]
+        new_state[f"{pz_p}.1.norm.weight"] = pi_weights[f"{pi_p}.post_attention_layernorm.weight"]
         
         q, k, v = [pi_weights[f"{pi_p}.self_attn.{x}_proj.weight"] for x in ('q', 'k', 'v')]
         new_state[f"{pz_p}.0.to_qkv.weight"] = cat([q, k, v], dim = 0)
@@ -147,48 +148,49 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         log("Mapping SigLIP weights...")
         vi_p = "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
         
-        # patch and pos
-
-        pw = pi_weights[f"{vi_p}.embeddings.patch_embedding.weight"]
-        new_state["vit.vit.to_patch_embedding.2.weight"] = pw.permute(0, 2, 3, 1).reshape(pw.shape[0], -1)
-        new_state["vit.vit.to_patch_embedding.2.bias"] = pi_weights[f"{vi_p}.embeddings.patch_embedding.bias"]
+        # patch embedding
+        new_state["vit.to_patch_embed.1.weight"] = rearrange(pi_weights[f"{vi_p}.embeddings.patch_embedding.weight"], 'o c p1 p2 -> o (p1 p2 c)')
+        new_state["vit.to_patch_embed.1.bias"] = pi_weights[f"{vi_p}.embeddings.patch_embedding.bias"]
         
-        for n in (1, 3):
-            new_state[f"vit.vit.to_patch_embedding.{n}.weight"] = torch.ones_like(pz_state[f"vit.vit.to_patch_embedding.{n}.weight"])
-            new_state[f"vit.vit.to_patch_embedding.{n}.bias"] = torch.zeros_like(pz_state[f"vit.vit.to_patch_embedding.{n}.bias"])
-        
-        pos = pi_weights[f"{vi_p}.embeddings.position_embedding.weight"]
-        pz_pos = pz_state["vit.vit.pos_embedding"].clone()
-        pz_pos[1:] = pos
-        new_state["vit.vit.pos_embedding"] = pz_pos
+        # position embedding
+        new_state["vit.pos_embed"] = pi_weights[f"{vi_p}.embeddings.position_embedding.weight"]
 
-        # vit layers
-
+        # transformer layers
         for i in range(27):
             v_pi = f"{vi_p}.encoder.layers.{i}"
-            v_pz = f"vit.vit.transformer.layers.{i}"
+            v_pz = f"vit.layers.{i}"
             
+            # attention
             new_state[f"{v_pz}.0.norm.weight"] = pi_weights[f"{v_pi}.layer_norm1.weight"]
             new_state[f"{v_pz}.0.norm.bias"] = pi_weights[f"{v_pi}.layer_norm1.bias"]
-            new_state[f"{v_pz}.1.net.0.weight"] = pi_weights[f"{v_pi}.layer_norm2.weight"]
-            new_state[f"{v_pz}.1.net.0.bias"] = pi_weights[f"{v_pi}.layer_norm2.bias"]
             
             vq, vk, vv = [pi_weights[f"{v_pi}.self_attn.{x}_proj.weight"] for x in ('q', 'k', 'v')]
+            bq, bk, bv = [pi_weights[f"{v_pi}.self_attn.{x}_proj.bias"] for x in ('q', 'k', 'v')]
+            
             new_state[f"{v_pz}.0.to_qkv.weight"] = cat([vq, vk, vv], dim = 0)
+            new_state[f"{v_pz}.0.to_qkv.bias"] = cat([bq, bk, bv], dim = 0)
             
-            new_state[f"{v_pz}.0.to_out.0.weight"] = pi_weights[f"{v_pi}.self_attn.out_proj.weight"]
-            new_state[f"{v_pz}.0.to_out.0.bias"] = pi_weights[f"{v_pi}.self_attn.out_proj.bias"]
+            new_state[f"{v_pz}.0.to_out.weight"] = pi_weights[f"{v_pi}.self_attn.out_proj.weight"]
+            new_state[f"{v_pz}.0.to_out.bias"] = pi_weights[f"{v_pi}.self_attn.out_proj.bias"]
             
-            for n, x in ((1, 'fc1'), (4, 'fc2')):
-                new_state[f"{v_pz}.1.net.{n}.weight"] = pi_weights[f"{v_pi}.mlp.{x}.weight"]
-                new_state[f"{v_pz}.1.net.{n}.bias"] = pi_weights[f"{v_pi}.mlp.{x}.bias"]
+            # feedforward
+            new_state[f"{v_pz}.1.norm.weight"] = pi_weights[f"{v_pi}.layer_norm2.weight"]
+            new_state[f"{v_pz}.1.norm.bias"] = pi_weights[f"{v_pi}.layer_norm2.bias"]
+            new_state[f"{v_pz}.1.proj_in.weight"] = pi_weights[f"{v_pi}.mlp.fc1.weight"]
+            new_state[f"{v_pz}.1.proj_in.bias"] = pi_weights[f"{v_pi}.mlp.fc1.bias"]
+            new_state[f"{v_pz}.1.proj_out.weight"] = pi_weights[f"{v_pi}.mlp.fc2.weight"]
+            new_state[f"{v_pz}.1.proj_out.bias"] = pi_weights[f"{v_pi}.mlp.fc2.bias"]
 
-        new_state["vit.vit.transformer.norm.weight"] = pi_weights[f"{vi_p}.post_layernorm.weight"]
-        new_state["vit.vit.transformer.norm.bias"] = pi_weights[f"{vi_p}.post_layernorm.bias"]
+        # post-layernorm
+        new_state["vit.norm.weight"] = pi_weights[f"{vi_p}.post_layernorm.weight"]
+        new_state["vit.norm.bias"] = pi_weights[f"{vi_p}.post_layernorm.bias"]
 
+        # multimodal projector
         p_pi = "paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
         new_state["maybe_to_image_tokens.weight"] = pi_weights[f"{p_pi}.weight"]
         new_state["maybe_to_image_tokens.bias"] = pi_weights[f"{p_pi}.bias"]
+
+
 
     return new_state
 
@@ -205,7 +207,7 @@ def load_pi0_weights_into_pizero(
     
     pz_config = create_pizero_config_for_pi0(config)
     
-    pz_config['vit'] = SigLIPEncoder()
+    pz_config['vit'] = SigLIP()
     pz_config['vit_dim'] = 1152
 
     model = PiZero(**pz_config)
