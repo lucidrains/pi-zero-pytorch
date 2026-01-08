@@ -1493,6 +1493,56 @@ class PiZero(Module):
 
         self._nm = num_recurrent_memory_tokens
 
+    @staticmethod
+    def from_checkpoint(
+        folder: str | Path = 'checkpoints/pi0_base',
+        **kwargs
+    ):
+        import json
+        from safetensors import safe_open
+        from pi_zero_pytorch.load import (
+            create_pizero_config_for_pi0,
+            build_converted_state_dict,
+            download_pi0_weights
+        )
+
+        folder = Path(folder)
+
+        if not folder.exists():
+            download_pi0_weights(folder)
+
+        config_path = folder / 'config.json'
+        weights_path = folder / 'model.safetensors'
+        pizero_weights_path = folder / 'pizero.pt'
+
+        assert config_path.exists(), f'config file not found at "{str(config_path)}"'
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        pz_config = create_pizero_config_for_pi0(config)
+
+        pz_config.update(kwargs)
+
+        if 'vit' not in pz_config:
+            pz_config['vit'] = SigLIP(norm_eps = pz_config['norm_eps'])
+            pz_config['vit_dim'] = 1152
+
+        model = PiZero(**pz_config)
+
+        if not pizero_weights_path.exists():
+            print('Converting weights to pizero.pt...')
+            with safe_open(weights_path, framework = 'pt') as pi_weights:
+                build_converted_state_dict(pi_weights, model.state_dict())
+                torch.save(model.state_dict(), pizero_weights_path)
+
+            return model
+
+        new_state = torch.load(pizero_weights_path, weights_only = True, mmap = True)
+        model.load_state_dict(new_state, strict = False)
+
+        return model
+
     def action_params_for_evolution(self):
         action_params = set()
 
@@ -1520,13 +1570,6 @@ class PiZero(Module):
     @property
     def device(self):
         return next(self.parameters()).device
-
-    @beartype
-    def load_pretrained_vlm_weights_(
-        self,
-        weights: dict[str, Tensor]
-    ):
-        raise NotImplementedError
 
     def create_ema(
         self,
