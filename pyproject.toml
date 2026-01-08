@@ -38,7 +38,6 @@ dependencies = [
     "hl-gauss-pytorch>=0.1.21",
     'memmap-replay-buffer>=0.0.10',
     "pydantic>=2",
-    "rotary-embedding-torch>=0.8.5",
     'scipy',
     "torch>=2.5",
     'torchdiffeq',

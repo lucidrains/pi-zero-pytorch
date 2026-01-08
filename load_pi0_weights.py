@@ -71,6 +71,9 @@ def create_pizero_config_for_pi0(pi0_config):
         dim_head = pg['dim_head'],
         heads = pg['num_query_heads'],
         kv_heads = pg['num_kv_heads'],
+        attn_softclamp_value = 0.,
+        final_norm_softclamp_value = 0.,
+        norm_eps = 1e-6,
         ff_expand_factor = state_ff_expand,
         action_ff_expand_factor = action_ff_expand,
         dim_time_cond = 1024
@@ -135,6 +138,12 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         new_state[f"{pz_p}.2.proj_in.weight"] = cat([agate, aup], dim = 0)
         new_state[f"{pz_p}.2.proj_out.weight"] = pi_weights[f"{pi_e}.mlp.down_proj.weight"]
 
+
+    # final norm and rotary
+    
+
+    new_state["final_norm.weight"] = pi_weights["paligemma_with_expert.paligemma.model.language_model.norm.weight"]
+
     # lm head
 
     pi_head = "paligemma_with_expert.paligemma.lm_head.weight"
@@ -149,8 +158,8 @@ def build_converted_state_dict(pi_weights, pz_state, verbose = True):
         vi_p = "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
         
         # patch embedding
-        new_state["vit.to_patch_embed.1.weight"] = rearrange(pi_weights[f"{vi_p}.embeddings.patch_embedding.weight"], 'o c p1 p2 -> o (p1 p2 c)')
-        new_state["vit.to_patch_embed.1.bias"] = pi_weights[f"{vi_p}.embeddings.patch_embedding.bias"]
+        new_state["vit.to_patch_embed.0.weight"] = pi_weights[f"{vi_p}.embeddings.patch_embedding.weight"]
+        new_state["vit.to_patch_embed.0.bias"] = pi_weights[f"{vi_p}.embeddings.patch_embedding.bias"]
         
         # position embedding
         new_state["vit.pos_embed"] = pi_weights[f"{vi_p}.embeddings.position_embedding.weight"]
@@ -207,7 +216,7 @@ def load_pi0_weights_into_pizero(
     
     pz_config = create_pizero_config_for_pi0(config)
     
-    pz_config['vit'] = SigLIP()
+    pz_config['vit'] = SigLIP(norm_eps = pz_config['norm_eps'])
     pz_config['vit_dim'] = 1152
 
     model = PiZero(**pz_config)

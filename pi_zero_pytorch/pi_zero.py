@@ -39,11 +39,6 @@ from ema_pytorch import EMA
 
 from adam_atan2_pytorch import AdamAtan2
 
-from rotary_embedding_torch import (
-    RotaryEmbedding,
-    apply_rotary_emb
-)
-
 import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
@@ -113,7 +108,9 @@ if torch.cuda.is_available():
 
 def create_pizero_attn_mask(
     prefix_causal_length,
-    mask: Bool['b n']
+    mask: Bool['b n'],
+    prefix_bidirectional_length = 0,
+    prefix_bidirectional_start = 0
 ):
     # the pi-zero attention is a triangular causal mask, but bidirectional attention for the actions at the very right hand side
 
@@ -121,12 +118,17 @@ def create_pizero_attn_mask(
         key_mask = mask[batch_index, key_index]   # variable length states
         causal_mask = query_index >= key_index    # causal
 
+        is_prefix = (
+            key_index >= prefix_bidirectional_start and
+            key_index < (prefix_bidirectional_start + prefix_bidirectional_length)
+        )
+
         bidirectional_action_mask = (             # bidirectional action mask
             key_index >= prefix_causal_length and
             query_index >= prefix_causal_length
         )
 
-        return (key_mask & causal_mask) | bidirectional_action_mask
+        return key_mask & (is_prefix | causal_mask | bidirectional_action_mask)
 
     return mask_fn
 
@@ -140,7 +142,7 @@ def softclamp_score_mod(value):
         score = score * value
         return score
 
-    return softclamped if value > 0. else identity
+    return softclamped if exists(value) and value > 0. else identity
 
 # helper functions
 
@@ -218,14 +220,14 @@ def cycle(it):
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
-def l2norm(t, dim = -1):
-    return F.normalize(t, dim = dim)
+def l2norm(t, dim = -1, eps = 1e-6):
+    return F.normalize(t, dim = dim, eps = eps)
 
 def straight_through(src, tgt):
     return src + (tgt - src).detach()
 
 def softclamp(t, value):
-    if value <= 0.:
+    if not exists(value) or value <= 0.:
         return t
 
     return (t / value).tanh() * value
@@ -315,16 +317,53 @@ def log_snr_to_alpha_sigma(log_snr):
     sigma = (-log_snr).sigmoid().sqrt()
     return alpha, sigma
 
+# rotary embedding
+
+class RotaryEmbedding(Module):
+    def __init__(self, dim, theta = 10000):
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, t, device = None):
+        if isinstance(t, int):
+            t = torch.arange(t, device = device).type_as(self.inv_freq)
+
+        t = t.type_as(self.inv_freq)
+        freqs = torch.einsum('... i , j -> ... i j', t, self.inv_freq)
+        freqs = torch.cat((freqs, freqs), dim = -1)
+
+        return freqs
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim = -1)
+    return torch.cat((-x2, x1), dim = -1)
+
+def apply_rotary_pos_emb(pos, t):
+    return (t * pos.cos()) + (rotate_half(t) * pos.sin())
+
+# gemma rms norm
+
+class RMSNorm(Module):
+    def __init__(self, dim, eps = 1e-6):
+        super().__init__()
+        self.scale = dim ** 0.5
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        return l2norm(x, eps = self.eps) * self.scale * (1 + self.weight)
+
 # siglip encoder
 
 class SimpleAttention(Module):
-    def __init__(self, dim, heads = 16, dim_head = 72, eps = 1e-6):
+    def __init__(self, dim, heads = 16, dim_head = 72, norm_eps = 1e-6, norm_klass = nn.LayerNorm):
         super().__init__()
         inner_dim = dim_head * heads
         self.heads = heads
         self.scale = dim_head ** -0.5
 
-        self.norm = nn.LayerNorm(dim, eps = eps)
+        self.norm = norm_klass(dim, eps = norm_eps)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = True)
         self.to_out = nn.Linear(inner_dim, dim)
 
@@ -351,15 +390,15 @@ class FeedForward(Module):
         bias = False,
         rmsnorm = False,
         norm_klass = None,
-        eps = 1e-6,
+        norm_eps = 1e-6,
         norm_all = False,
         activation = nn.GELU(approximate = 'tanh')
     ):
         super().__init__()
         dim_inner = default(dim_inner, int(dim * expand_factor * (2 / 3 if glu else 1)))
 
-        norm_klass = default(norm_klass, (nn.RMSNorm if rmsnorm else nn.LayerNorm))
-        self.norm = norm_klass(dim, eps = eps) if norm_klass != nn.Identity else nn.Identity()
+        norm_klass = default(norm_klass, (RMSNorm if rmsnorm else nn.LayerNorm))
+        self.norm = norm_klass(dim, eps = norm_eps) if norm_klass != nn.Identity else nn.Identity()
 
         self.glu = glu
         self.activation = activation
@@ -367,8 +406,8 @@ class FeedForward(Module):
         self.proj_in = nn.Linear(dim, dim_inner * (2 if glu else 1), bias = bias)
         self.proj_out = nn.Linear(dim_inner, dim, bias = bias)
 
-        self.post_proj_in_norm = nn.RMSNorm(dim_inner, eps = eps) if norm_all else nn.Identity()
-        self.post_proj_out_norm = nn.RMSNorm(dim, eps = eps, elementwise_affine = False) if norm_all else nn.Identity()
+        self.post_proj_in_norm = RMSNorm(dim_inner, eps = norm_eps) if norm_all else nn.Identity()
+        self.post_proj_out_norm = RMSNorm(dim, eps = norm_eps) if norm_all else nn.Identity()
 
     def forward(self, x):
         x = self.norm(x)
@@ -393,7 +432,7 @@ class SigLIP(Module):
         depth = 27,
         heads = 16,
         mlp_dim = 4304,
-        eps = 1e-6,
+        norm_eps = 1e-6,
         norm_klass = nn.LayerNorm,
         activation = nn.GELU(approximate = 'tanh')
     ):
@@ -402,8 +441,8 @@ class SigLIP(Module):
         dim_head = dim // heads
 
         self.to_patch_embed = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size),
-            nn.Linear(patch_size * patch_size * 3, dim)
+            nn.Conv2d(3, dim, kernel_size = patch_size, stride = patch_size),
+            Rearrange('b c h w -> b (h w) c')
         )
 
         self.pos_embed = nn.Parameter(torch.randn(num_patches, dim))
@@ -411,11 +450,11 @@ class SigLIP(Module):
         self.layers = ModuleList([])
         for _ in range(depth):
             self.layers.append(ModuleList([
-                SimpleAttention(dim, heads, dim_head, eps = eps),
-                FeedForward(dim = dim, dim_inner = mlp_dim, bias = True, eps = eps, norm_klass = norm_klass, activation = activation)
+                SimpleAttention(dim, heads, dim_head, norm_eps = norm_eps, norm_klass = norm_klass),
+                FeedForward(dim = dim, dim_inner = mlp_dim, bias = True, norm_eps = norm_eps, norm_klass = norm_klass, activation = activation)
             ]))
 
-        self.norm = norm_klass(dim, eps = eps)
+        self.norm = norm_klass(dim, eps = norm_eps)
 
     def forward(self, x):
         x = self.to_patch_embed(x)
@@ -721,10 +760,11 @@ class JointAttention(Module):
         heads = 8,
         kv_heads = None,
         dropout = 0.,
-        softclamp_value = 50.,
+        softclamp_value = None,
         accept_memories = False,
         actions_norm_all = False,
         learned_value_action_residual_mix = False,
+        norm_eps = 1e-6,
         rotary_emb: RotaryEmbedding | None = None
     ):
         super().__init__()
@@ -756,7 +796,7 @@ class JointAttention(Module):
 
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
-        self.rmsnorm = nn.RMSNorm(dim)
+        self.rmsnorm = RMSNorm(dim, eps = norm_eps)
 
         # state parameters
 
@@ -767,7 +807,7 @@ class JointAttention(Module):
 
         self.accept_memories = accept_memories
 
-        self.mem_rmsnorm = nn.RMSNorm(dim) if accept_memories else None
+        self.mem_rmsnorm = RMSNorm(dim, eps = norm_eps) if accept_memories else None
         self.to_mem_qkv = LinearNoBias(dim, (heads + 2 * kv_heads) * dim_head) if accept_memories else None
         self.to_mem_out = LinearNoBias(dim_inner, dim) if accept_memories else None
 
@@ -789,10 +829,10 @@ class JointAttention(Module):
         self.actions_norm_all = actions_norm_all
 
         if actions_norm_all:
-            self.actions_q_norm = nn.RMSNorm(dim_head)
-            self.actions_k_norm = nn.RMSNorm(dim_head)
-            self.actions_v_norm = nn.RMSNorm(dim_head)
-            self.actions_out_norm = nn.RMSNorm(dim_action, elementwise_affine = False)
+            self.actions_q_norm = RMSNorm(dim_head, eps = norm_eps)
+            self.actions_k_norm = RMSNorm(dim_head, eps = norm_eps)
+            self.actions_v_norm = RMSNorm(dim_head, eps = norm_eps)
+            self.actions_out_norm = RMSNorm(dim_action, eps = norm_eps)
 
         self.softclamp_value = softclamp_value
 
@@ -828,10 +868,6 @@ class JointAttention(Module):
         if knowledge_insulate:
             mk, mv = tuple(t.detach() for t in (mk, mv))
 
-        # concat cache key / values with action key / values
-
-        k, v = tuple(cat(tensors, dim = -2) for tensors in zip((mk, mv), (ak, av)))
-
         # handle read, write memories
 
         assert not (self.accept_memories ^ exists(memories))
@@ -839,14 +875,19 @@ class JointAttention(Module):
         if exists(memories):
             _, write_memories = memories
             write_memories = self.mem_rmsnorm(write_memories)
-            # mqkv_write = self.to_mem_qkv(write_memories)
+
+        # concat cache key / values with action key / values
 
         if exists(rotary_emb):
-            q = apply_rotary_emb(rotary_emb, q, freqs_seq_dim = -2)
-            k = apply_rotary_emb(rotary_emb, k)
+            action_len = aq.shape[-2]
+            rotary_emb_actions = rotary_emb[..., -action_len:, :]
 
-        elif exists(self.rotary_emb):
-            q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+            q = apply_rotary_pos_emb(rotary_emb_actions, q)
+            ak = apply_rotary_pos_emb(rotary_emb_actions, ak)
+
+        # concat cache key / values with action key / values
+
+        k, v = tuple(cat(tensors, dim = -2) for tensors in zip((mk, mv), (ak, av)))
 
         # attention
 
@@ -891,8 +932,12 @@ class JointAttention(Module):
     def forward_only_vision_language(
         self,
         state: Float['b n d'],
+        num_visual_tokens = 0,
+        is_prefix = False,
         rotary_emb = None
     ) -> Float['b n d']:
+
+        state = self.rmsnorm(state)
 
         device = state.device
 
@@ -901,12 +946,8 @@ class JointAttention(Module):
         q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
 
         if exists(rotary_emb):
-            q = apply_rotary_emb(rotary_emb, q)
-            k = apply_rotary_emb(rotary_emb, k)
-
-        elif exists(self.rotary_emb):
-            q = self.rotary_emb.rotate_queries_or_keys(q)
-            k = self.rotary_emb.rotate_queries_or_keys(k)
+            q = apply_rotary_pos_emb(rotary_emb, q)
+            k = apply_rotary_pos_emb(rotary_emb, k)
 
         # attention
 
@@ -921,6 +962,11 @@ class JointAttention(Module):
         sim = softclamp(sim, self.softclamp_value)
 
         causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+
+        if is_prefix:
+            causal_mask.fill_(False)
+        elif num_visual_tokens > 0:
+            causal_mask[:, :num_visual_tokens] = False
 
         sim = sim.masked_fill(causal_mask, max_neg_value(sim))
 
@@ -938,6 +984,8 @@ class JointAttention(Module):
         self,
         multimodal_seq,
         actions,
+        multimodal_prefix_bidirectional_length = 0,
+        multimodal_prefix_bidirectional_start = 0,
         rotary_emb = None,
         memories: tuple[Tensor, Tensor] | None = None,
         mask: Bool['b n'] | None = None,
@@ -995,11 +1043,8 @@ class JointAttention(Module):
         # rotary embedding
 
         if exists(rotary_emb):
-            q = apply_rotary_emb(rotary_emb, q)
-            k = apply_rotary_emb(rotary_emb, k)
-        elif exists(self.rotary_emb):
-            q = self.rotary_emb.rotate_queries_or_keys(q)
-            k = self.rotary_emb.rotate_queries_or_keys(k)
+            q = apply_rotary_pos_emb(rotary_emb, q)
+            k = apply_rotary_pos_emb(rotary_emb, k)
 
         if exists(flex_attn_fn):
             out = flex_attn_fn(q, k, v)
@@ -1021,6 +1066,11 @@ class JointAttention(Module):
 
             if exists(mask):
                 causal_mask = einx.logical_or('b j, i j -> b 1 i j', ~mask, causal_mask)
+
+            if multimodal_prefix_bidirectional_length > 0:
+                start = multimodal_prefix_bidirectional_start
+                end = start + multimodal_prefix_bidirectional_length
+                causal_mask[..., start:end, start:end] = False
 
             causal_mask[..., seq_len:, seq_len:] = False  # actions have bidirectional attention, lining up with Transfusion paper
 
@@ -1092,7 +1142,7 @@ class AdaptiveRMSNorm(Module):
         dim_cond
     ):
         super().__init__()
-        self.norm = nn.RMSNorm(dim, elementwise_affine = False)
+        self.norm = RMSNorm(dim, eps = 1e-6)
 
         self.to_gamma = nn.Sequential(
             nn.Linear(dim_cond, dim),
@@ -1156,6 +1206,7 @@ class PiZero(Module):
         action_ff_expand_factor = None,  # separate expand factor for action feedforward
         attn_softclamp_value = 50.,
         final_norm_softclamp_value = 30.,
+        norm_eps = 1e-6,
         vit: Module | None = None,
         vit_dim = None,
         external_state_encoders: Module | list[Module] | None = None,
@@ -1220,9 +1271,9 @@ class PiZero(Module):
 
         self.vit = vit
 
-        self.maybe_to_image_tokens = nn.Linear(vit_dim, dim) if exists(vit_dim) and vit_dim != dim else nn.Identity()
+        self.maybe_to_image_tokens = nn.Linear(vit_dim, dim) if exists(vit_dim) else nn.Identity()
 
-        self.attn_kwargs = {**attn_kwargs, 'kv_heads': kv_heads}
+        self.attn_kwargs = {**attn_kwargs, 'kv_heads': kv_heads, 'norm_eps': norm_eps}
 
         # embedding
 
@@ -1284,7 +1335,7 @@ class PiZero(Module):
         self.memory_tokens = nn.Parameter(torch.zeros(num_recurrent_memory_tokens, dim))
         nn.init.normal_(self.memory_tokens, std = 0.02)
 
-        self.final_norm_write_memories = nn.RMSNorm(dim) if self.has_recurrent_memories else None
+        self.final_norm_write_memories = RMSNorm(dim, eps = norm_eps) if self.has_recurrent_memories else None
 
         # residual functions, with maybe hyper connections
 
@@ -1304,9 +1355,9 @@ class PiZero(Module):
 
             layers.append(ModuleList([
                 JointAttention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **self.attn_kwargs),
-                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, **ff_kwargs),
-                FeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, glu = True, norm_klass = nn.Identity, norm_all = action_dit_norm_all_linears, **ff_kwargs),
-                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, **ff_kwargs) if self.has_recurrent_memories else None
+                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, norm_eps = norm_eps, **ff_kwargs),
+                FeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, glu = True, norm_klass = nn.Identity, norm_all = action_dit_norm_all_linears, norm_eps = norm_eps, **ff_kwargs),
+                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, norm_eps = norm_eps, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
             residual_fns.append(ModuleList([
@@ -1328,8 +1379,8 @@ class PiZero(Module):
 
         self.final_norm_softclamp = partial(softclamp, value = final_norm_softclamp_value)
 
-        self.final_norm = nn.RMSNorm(dim)
-        self.final_actions_norm = nn.RMSNorm(dim_action)
+        self.final_norm = RMSNorm(dim, eps = norm_eps)
+        self.final_actions_norm = RMSNorm(dim_action, eps = norm_eps)
 
         # unembedding
 
@@ -1802,9 +1853,12 @@ class PiZero(Module):
 
         visual_tokens = self.maybe_to_image_tokens(visual_tokens)
 
+        # scaling
+        language_tokens = language_tokens * (self.dim ** 0.5)
+
         # concat visual rep with language
 
-        state_tokens, _ = pack_with_inverse([
+        state_tokens, ps = pack([
             visual_tokens,
             language_tokens,
         ], 'b * d')
@@ -1813,19 +1867,31 @@ class PiZero(Module):
 
         seq_len = state_tokens.shape[-2]
 
-        seq = torch.arange(seq_len, device = device)
+        # match Paligemma position ids
+        # they start at 1
+
+        seq = torch.arange(1, seq_len + 1, device = device)
 
         rotary_emb = self.rotary_emb(seq)
 
         # transformer
 
+        num_visual_tokens = visual_tokens.shape[-2]
+
         for attn, ff, _, _ in self.layers:
 
-            state_attn_out = attn.forward_only_vision_language(state_tokens, rotary_emb = rotary_emb)
+            state_attn_out = attn.forward_only_vision_language(
+                state_tokens,
+                num_visual_tokens = num_visual_tokens,
+                is_prefix = True,
+                rotary_emb = rotary_emb
+            )
 
             state_tokens = state_tokens + state_attn_out
 
             state_tokens = ff(state_tokens) + state_tokens
+
+        state_tokens = self.final_norm(state_tokens)
 
         embed = self.final_norm_softclamp(state_tokens)
 
@@ -2216,6 +2282,18 @@ class PiZero(Module):
             else:
                 external_state_tokens = visual_tokens.new_empty((batch, 0, self.dim))
 
+            # scaling
+            # in PaliGemma, only the embed_tokens (text) are scaled
+            # image projector outputs are NOT scaled
+
+            scale = self.dim ** 0.5
+
+            language_tokens = language_tokens * scale
+            reward_tokens = reward_tokens * scale
+            advantage_tokens = advantage_tokens * scale
+            task_token = task_token * scale
+            external_state_tokens = external_state_tokens * scale
+
             # concat visual rep with language
 
             state_tokens, inverse_packed_states = pack_with_inverse([
@@ -2253,6 +2331,16 @@ class PiZero(Module):
 
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
 
+        # multimodal prefix bidirectional attention
+        # which can have a start and length, and vision follows such a pattern in PaliGemma
+
+        multimodal_prefix_bidirectional_length = 0
+        multimodal_prefix_bidirectional_start = 0
+
+        if not inferencing:
+            multimodal_prefix_bidirectional_length = visual_tokens.shape[-2]
+            multimodal_prefix_bidirectional_start = external_state_tokens.shape[-2]
+
         # prepare maybe flex attention
 
         flex_attn_fn = None
@@ -2266,6 +2354,8 @@ class PiZero(Module):
                 create_pizero_attn_mask(
                     prefix_length,
                     mask = mask,
+                    prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
+                    prefix_bidirectional_start = multimodal_prefix_bidirectional_start
                 ),
                 Q_LEN = seq_len,
                 KV_LEN = seq_len,
@@ -2314,6 +2404,8 @@ class PiZero(Module):
                 (state_attn_out, actions_attn_out, *maybe_mem_out), (state_keys, state_values, action_keys, action_values) = attn(
                     state_tokens,
                     action_tokens,
+                    multimodal_prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
+                    multimodal_prefix_bidirectional_start = multimodal_prefix_bidirectional_start,
                     rotary_emb = rotary_emb,
                     flex_attn_fn = flex_attn_fn,
                     actions_value_residual = actions_value_residual,
