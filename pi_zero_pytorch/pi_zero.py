@@ -1,6 +1,9 @@
 from __future__ import annotations
 from typing import Any
 
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import math
 import bisect
 from copy import deepcopy
@@ -65,7 +68,9 @@ from pydantic import BaseModel, Field, model_validator
 
 from torch_einops_utils import (
     pad_at_dim,
-    pack_with_inverse
+    pad_left_at_dim,
+    pack_with_inverse,
+    pad_sequence
 )
 
 # ein notation
@@ -115,7 +120,8 @@ def create_pizero_attn_mask(
     prefix_causal_length,
     mask: Bool['b n'],
     prefix_bidirectional_length = 0,
-    prefix_bidirectional_start = 0
+    prefix_bidirectional_start = 0,
+    discretized_action_length = 0
 ):
     # the pi-zero attention is a triangular causal mask, but bidirectional attention for the actions at the very right hand side
 
@@ -133,7 +139,16 @@ def create_pizero_attn_mask(
             query_index >= prefix_causal_length
         )
 
-        return key_mask & (is_prefix | causal_mask | bidirectional_action_mask)
+        # whether actions should not attend to discretized tokens
+
+        action_ignore_discretized_tokens = (
+            discretized_action_length > 0 and
+            query_index >= prefix_causal_length and
+            key_index >= (prefix_causal_length - discretized_action_length) and
+            key_index < prefix_causal_length
+        )
+
+        return key_mask & (is_prefix | (causal_mask & ~action_ignore_discretized_tokens) | bidirectional_action_mask)
 
     return mask_fn
 
@@ -221,6 +236,9 @@ def cycle(it):
             yield batch
 
 # tensor helpers
+
+def is_tensor_empty(t):
+    return t.numel() == 0
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
@@ -821,7 +839,8 @@ class JointAttention(Module):
         actions_value_residual: Tensor | None = None,
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
-        knowledge_insulate = False
+        knowledge_insulate = False,
+        discretized_action_length = 0
     ):
 
         aq, ak, av, ag = self.to_actions_qkvg(actions).split(self.actions_qkvg_split, dim = -1)
@@ -881,6 +900,13 @@ class JointAttention(Module):
 
             if exists(mask):
                 sim = einx.where('b j, b h i j, -> b h i j', mask, sim, max_neg_value(sim))
+
+            if discretized_action_length > 0:
+                m_len = mk.shape[-2]
+                discretized_action_mask = torch.zeros(sim.shape[-1], dtype = torch.bool, device = actions.device)
+                discretized_action_mask[(m_len - discretized_action_length):m_len] = True
+
+                sim = sim.masked_fill(discretized_action_mask, max_neg_value(sim))
 
             attn = sim.softmax(dim = -1)
 
@@ -967,7 +993,8 @@ class JointAttention(Module):
         actions_value_residual: Tensor | None = None,
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
-        knowledge_insulate = False
+        knowledge_insulate = False,
+        discretized_action_length = 0
     ):
         seq_len, device = multimodal_seq.shape[-2], multimodal_seq.device
 
@@ -1046,6 +1073,9 @@ class JointAttention(Module):
                 start = multimodal_prefix_bidirectional_start
                 end = start + multimodal_prefix_bidirectional_length
                 causal_mask[..., start:end, start:end] = False
+
+            if discretized_action_length > 0:
+                causal_mask[..., seq_len:, (seq_len - discretized_action_length):seq_len] = True
 
             causal_mask[..., seq_len:, seq_len:] = False  # actions have bidirectional attention, lining up with Transfusion paper
 
@@ -1227,6 +1257,9 @@ class PiZero(Module):
             rtol = 1e-5,
             method = 'midpoint'
         ),
+        predict_discretized_action_aux_loss = False,
+        predict_discrete_action_loss_weight = 0.1,
+        discrete_action_pad_id = -1
     ):
         super().__init__()
         dim_time_cond = default(dim_time_cond, dim * 2)
@@ -1234,6 +1267,8 @@ class PiZero(Module):
         action_ff_expand_factor = default(action_ff_expand_factor, ff_expand_factor)
 
         self.dim = dim
+        self.token_scale = dim ** 0.5
+
         self.dim_action = dim_action
 
         # flex attention related
@@ -1453,9 +1488,31 @@ class PiZero(Module):
         assert not train_time_rtc or exists(train_time_rtc_max_delay)
         self.train_time_rtc_max_delay = train_time_rtc_max_delay
 
+        # predicting discretized action auxiliary loss
+
+        self.predict_discretized_action_aux_loss = predict_discretized_action_aux_loss
+
+        if predict_discretized_action_aux_loss:
+            # https://arxiv.org/abs/2501.09747
+
+            from transformers import AutoProcessor
+            self.discretized_action_tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
+
+            self.discretized_action_vocab_size = self.discretized_action_tokenizer.vocab_size
+            self.discrete_action_embeds = nn.Embedding(self.discretized_action_vocab_size + 1, dim)
+
+            self.to_discrete_action_pred = nn.Sequential(
+                RMSNorm(dim),
+                LinearNoBias(dim, self.discretized_action_vocab_size)
+            )
+
+            self.discrete_action_pad_id = discrete_action_pad_id
+
         # loss related
 
         self.lm_loss_weight = lm_loss_weight
+        self.predict_discrete_action_loss_weight = predict_discrete_action_loss_weight
+
         self.flow_loss_weight = flow_loss_weight
 
         # sampling related
@@ -2220,6 +2277,13 @@ class PiZero(Module):
             time_cond = pad_at_dim(time_cond, (action_with_registers_length - orig_action_len, 0), dim = -2)
 
         state_tokens = None
+        discretized_action_length = 0
+        discrete_action_ids = None
+
+        if exists(actions) and self.predict_discretized_action_aux_loss:
+            discrete_action_ids = self.discretized_action_tokenizer(actions)
+            discrete_action_ids = pad_sequence([tensor(ids) for ids in discrete_action_ids], value = -1)
+            discretized_action_length = discrete_action_ids.shape[-1]
 
         if not inferencing:
             # language
@@ -2291,6 +2355,16 @@ class PiZero(Module):
 
                 task_token = self.task_emb(task_id)
 
+            # handle maybe discretized action prediction
+
+            discrete_action_tokens = empty_token
+
+            if exists(discrete_action_ids):
+                discrete_action_ids_with_start = pad_left_at_dim(discrete_action_ids + 1, 1)
+                discrete_action_ids_in_pack, target_discrete_action_ids = discrete_action_ids_with_start[:, :-1], discrete_action_ids_with_start[:, 1:]
+
+                discrete_action_tokens = self.discrete_action_embeds(discrete_action_ids_in_pack)
+
             # additional external states
 
             if exists(external_states):
@@ -2304,13 +2378,14 @@ class PiZero(Module):
             # in PaliGemma, only the embed_tokens (text) are scaled
             # image projector outputs are NOT scaled
 
-            scale = self.dim ** 0.5
+            scale = self.token_scale
 
             language_tokens = language_tokens * scale
             reward_tokens = reward_tokens * scale
             advantage_tokens = advantage_tokens * scale
             task_token = task_token * scale
             external_state_tokens = external_state_tokens * scale
+            discrete_action_tokens = discrete_action_tokens * scale
 
             # concat visual rep with language
 
@@ -2320,7 +2395,8 @@ class PiZero(Module):
                 language_tokens,
                 reward_tokens,
                 advantage_tokens,
-                task_token
+                task_token,
+                discrete_action_tokens
             ], 'b * d')
 
         # take care of masking for variable lengthed states, starting with the language tokens
@@ -2373,7 +2449,8 @@ class PiZero(Module):
                     prefix_length,
                     mask = mask,
                     prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
-                    prefix_bidirectional_start = multimodal_prefix_bidirectional_start
+                    prefix_bidirectional_start = multimodal_prefix_bidirectional_start,
+                    discretized_action_length = discretized_action_length
                 ),
                 Q_LEN = seq_len,
                 KV_LEN = seq_len,
@@ -2430,7 +2507,8 @@ class PiZero(Module):
                     mask = mask,
                     return_keys_values = True,
                     knowledge_insulate = knowledge_insulate,
-                    memories = memory_tokens
+                    memories = memory_tokens,
+                    discretized_action_length = discretized_action_length
                 )
 
                 next_state_cached_keys_values.append((state_keys, state_values))
@@ -2498,7 +2576,8 @@ class PiZero(Module):
                     cached_state_keys_values = next(cached_state_key_values_iter),
                     rotary_emb = rotary_emb,
                     mask = mask,
-                    return_keys_values = True
+                    return_keys_values = True,
+                    discretized_action_length = discretized_action_length
                 )
 
                 actions_value_residual = default(actions_value_residual, action_values)
@@ -2534,7 +2613,7 @@ class PiZero(Module):
         if not inferencing:
             # unpack and unembed to predictions
 
-            _, visual_tokens, tokens, *_ = inverse_packed_states(state_tokens, 'b * d')
+            _, visual_tokens, tokens, *_, maybe_discrete_action_tokens = inverse_packed_states(state_tokens, 'b * d')
 
             # gemma uses a final softclamp before norm
 
@@ -2620,6 +2699,20 @@ class PiZero(Module):
 
             flow_loss = flow_loss.mean()
 
+        # maybe discrete action embed loss
+
+        discrete_action_ar_loss = self.zero
+
+        if not is_tensor_empty(maybe_discrete_action_tokens):
+
+            pred_discrete_action_logits = self.to_discrete_action_pred(maybe_discrete_action_tokens)
+
+            discrete_action_ar_loss = F.cross_entropy(
+                rearrange(pred_discrete_action_logits, 'b n l -> b l n'),
+                target_discrete_action_ids,
+                ignore_index = self.discrete_action_pad_id
+            )
+
         # language cross entropy loss
 
         language_loss = self.zero
@@ -2637,13 +2730,14 @@ class PiZero(Module):
 
         # loss breakdown
 
-        loss_breakdown = (language_loss, flow_loss)
+        loss_breakdown = (language_loss, discrete_action_ar_loss, flow_loss)
 
         # total loss and return breakdown
 
         total_loss = (
             language_loss * self.lm_loss_weight +
-            flow_loss * self.flow_loss_weight
+            flow_loss * self.flow_loss_weight +
+            discrete_action_ar_loss * self.predict_discrete_action_loss_weight
         )
 
         # add the task status loss if needed

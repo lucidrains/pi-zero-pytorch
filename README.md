@@ -334,4 +334,16 @@ That's it
 }
 ```
 
+```bibtex
+@misc{pertsch2025fastefficientactiontokenization,
+    title   = {FAST: Efficient Action Tokenization for Vision-Language-Action Models}, 
+    author  = {Karl Pertsch and Kyle Stachowicz and Brian Ichter and Danny Driess and Suraj Nair and Quan Vuong and Oier Mees and Chelsea Finn and Sergey Levine},
+    year    = {2025},
+    eprint  = {2501.09747},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2501.09747}, 
+}
+```
+
 [*dear alice*](https://www.youtube.com/watch?v=z-Ng5ZvrDm4)
