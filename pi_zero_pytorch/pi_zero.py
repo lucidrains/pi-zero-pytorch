@@ -63,6 +63,11 @@ from accelerate import Accelerator
 
 from pydantic import BaseModel, Field, model_validator
 
+from torch_einops_utils import (
+    pad_at_dim,
+    pack_with_inverse
+)
+
 # ein notation
 
 # b - batch
@@ -259,25 +264,6 @@ def maybe_and_masks(*masks):
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
-def pack_with_inverse(t, pattern):
-    packed, packed_shape = pack(t, pattern)
-
-    def inverse(out, inv_pattern = None):
-        inv_pattern = default(inv_pattern, pattern)
-        out = unpack(out, packed_shape, inv_pattern)
-        return out
-
-    return packed, inverse
-
-def pack_one_with_inverse(t, pattern):
-    packed, inverse = pack_with_inverse([t], pattern)
-
-    def inverse_one(out, inv_pattern = None):
-        out, = inverse(out, inv_pattern)
-        return out
-
-    return packed, inverse_one
-
 def tree_flatten_with_inverse(input):
     out, tree_spec = tree_flatten(input)
 
@@ -287,8 +273,8 @@ def tree_flatten_with_inverse(input):
     return out, inverse
 
 def project(x, y):
-    x, inverse = pack_one_with_inverse(x, 'b *')
-    y, _ = pack_one_with_inverse(y, 'b *')
+    x, inverse = pack_with_inverse(x, 'b *')
+    y, _ = pack_with_inverse(y, 'b *')
 
     dtype = x.dtype
     x, y = x.double(), y.double()
@@ -298,17 +284,6 @@ def project(x, y):
     orthogonal = x - parallel
 
     return inverse(parallel).to(dtype), inverse(orthogonal).to(dtype)
-
-def pad_at_dim(
-    t,
-    pad: tuple[int, int],
-    *,
-    dim = -1,
-    value = 0.
-):
-    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
-    zeros = ((0, 0) * dims_from_right)
-    return F.pad(t, (*zeros, *pad), value = value)
 
 # flow related
 
