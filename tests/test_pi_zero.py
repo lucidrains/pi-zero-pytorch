@@ -9,8 +9,8 @@ from einops import repeat, rearrange
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+@param('pi05', (False, True))
 @param('only_vlm', (True, False))
-@param('num_residual_streams', (1, 4))
 @param('inpaint_with_frozen_actions', (False, True))
 @param('action_dit_norm_all_linears', (False, True))
 @param('task_status_loss', (False, True))
@@ -19,8 +19,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 @param('kv_heads', (None, 2))
 @param('predict_discretized_action_aux_loss', (False, True))
 def test_pi_zero_with_vit(
+    pi05: bool,
     only_vlm: bool,
-    num_residual_streams: int,
     inpaint_with_frozen_actions: bool,
     action_dit_norm_all_linears: bool,
     task_status_loss: bool,
@@ -33,14 +33,14 @@ def test_pi_zero_with_vit(
     from vit_pytorch.extractor import Extractor
 
     v = ViT(
-        image_size = 256,
+        image_size = 128,
         patch_size = 32,
         num_classes = 1000,
         dim = 32,
         depth = 1,
-        heads = 16,
-        dim_head = 16,
-        mlp_dim = 64,
+        heads = 4,
+        dim_head = 8,
+        mlp_dim = 32,
         dropout = 0.1,
         emb_dropout = 0.1
     ).to(device)
@@ -54,18 +54,18 @@ def test_pi_zero_with_vit(
         depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 1024,
+        num_tokens = 256,
         kv_heads = kv_heads,
         num_advantage_tokens = 2 if advantage_condition else 0,
         sample_soft_mask_lens = (2, 1, 29),
         action_dit_norm_all_linears = action_dit_norm_all_linears,
-        num_residual_streams = num_residual_streams,
         model_predict_output = model_predict_output,
-        predict_discretized_action_aux_loss = predict_discretized_action_aux_loss
+        predict_discretized_action_aux_loss = predict_discretized_action_aux_loss,
+        pi05 = pi05
     ).to(device)
 
-    images = torch.randn(2, 3, 2, 256, 256)
-    commands = torch.randint(0, 1024, (2, 32))
+    images = torch.randn(2, 3, 2, 128, 128)
+    commands = torch.randint(0, 256, (2, 16))
 
     if only_vlm:
         vlm_logits = model.forward_only_vision_language(images, commands)
@@ -247,15 +247,15 @@ def test_self_contained_rtc_guidance():
     from pi_zero_pytorch import RTCGuidance
 
     model = π0(
-        dim = 512,
+        dim = 64,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000,
+        num_tokens = 100,
         action_dit_norm_all_linears = True
     )
 
-    vision = torch.randn(1, 1024, 512)
-    commands = torch.randint(0, 20_000, (1, 1024))
+    vision = torch.randn(1, 32, 64)
+    commands = torch.randint(0, 100, (1, 32))
     joint_state = torch.randn(1, 12)
     times = torch.rand(1,)
     actions = torch.randn(1, 32, 6)
@@ -283,16 +283,16 @@ def test_value(
 ):
 
     model = π0(
-        dim = 512,
+        dim = 64,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000,
+        num_tokens = 100,
         is_critic = True,
         critic_use_discrete_bins = critic_use_discrete_bins
     )
 
-    vision = torch.randn(1, 1024, 512)
-    commands = torch.randint(0, 20_000, (1, 1024))
+    vision = torch.randn(1, 32, 64)
+    commands = torch.randint(0, 100, (1, 32))
     joint_state = torch.randn(1, 12)
     times = torch.rand(1,)
     actions = torch.randn(1, 32, 6)
@@ -333,11 +333,11 @@ def test_pi_zero_six(
     model = π0(
         vit = v,
         vit_dim = 32,
-        dim = 512,
+        dim = 64,
         depth = 1,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000,
+        num_tokens = 100,
         num_advantage_tokens = 2,
         num_tasks = 10
     )
@@ -345,7 +345,7 @@ def test_pi_zero_six(
     # you'll want to supply your own environment
 
     from pi_zero_pytorch.mock import Env
-    mock_env = Env((256, 256), 2, 1024, 32, 12)
+    mock_env = Env((256, 256), 2, 100, 32, 12)
 
     # pass your agent and environment to PiZeroSix for learning to be orchestrated
 
@@ -411,16 +411,16 @@ def test_train_time_rtc():
     from pi_zero_pytorch import π0
 
     model = π0(
-        dim = 512,
+        dim = 64,
         dim_action_input = 6,
         dim_joint_state = 12,
-        num_tokens = 20_000,
+        num_tokens = 100,
         train_time_rtc = True,
         train_time_rtc_max_delay = 4
     )
 
-    vision = torch.randn(1, 1024, 512)
-    commands = torch.randint(0, 20_000, (1, 1024))
+    vision = torch.randn(1, 32, 64)
+    commands = torch.randint(0, 100, (1, 32))
     joint_state = torch.randn(1, 12)
     actions = torch.randn(1, 32, 6)
 
@@ -567,3 +567,58 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
     )
 
     assert (workspace / task_name / "1" / "actor.pt").exists()
+
+def test_internal_state_parity():
+    # 1. Initialize a small PiZero model
+    model = π0(
+        dim = 128,
+        num_tokens = 1000,
+        dim_action_input = 8,
+        dim_joint_state = 16,
+        depth = 2,
+        heads = 4,
+        dim_head = 32
+    )
+    model.eval()
+
+    # 2. Dummy inputs
+    batch = 1
+    # vision tokens: (batch, seq, dim)
+    visual_tokens = torch.randn(batch, 1, 64, 128)
+    token_ids = torch.randint(0, 100, (batch, 32))
+    joint_state = torch.randn(batch, 16)
+    actions = torch.randn(batch, 10, 8)
+    times = torch.rand(batch)
+
+    # 3. Capture state logits from forward_only_vision_language
+    with torch.no_grad():
+        logits_vlm = model.forward_only_vision_language(
+            images = visual_tokens,
+            token_ids = token_ids
+        )
+
+    # 4. Capture state logits from full forward
+    logits_full = []
+    def h_full(m, i, o):
+        logits_full.append(o.detach().clone())
+
+    h = model.state_to_logits.register_forward_hook(h_full)
+
+    with torch.no_grad():
+        _ = model(
+            None, # images is required positional
+            visual_tokens = visual_tokens,
+            token_ids = token_ids,
+            joint_state = joint_state,
+            actions = actions,
+            times = times
+        )
+    h.remove()
+
+    logits_full = logits_full[0]
+    
+    # 5. Compare (only the language tokens slice, as forward() only computes those)
+    # visual_tokens seq len is 1 * 64
+    logits_vlm_slice = logits_vlm[:, 64:]
+    
+    assert torch.allclose(logits_vlm_slice, logits_full, atol = 1e-3)
