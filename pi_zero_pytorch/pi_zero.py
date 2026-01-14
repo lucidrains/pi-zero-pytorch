@@ -36,8 +36,6 @@ from torch.utils.data import TensorDataset, ConcatDataset, DataLoader, Dataset
 
 from torchdiffeq import odeint
 
-from scipy.optimize import linear_sum_assignment
-
 from ema_pytorch import EMA
 
 from adam_atan2_pytorch import AdamAtan2
@@ -47,8 +45,6 @@ from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
 from pi_zero_pytorch.tensor_typing import Float, Int, Bool
-
-from hyper_connections import ManifoldConstrainedHyperConnections
 
 from hl_gauss_pytorch import HLGaussLayer
 
@@ -139,30 +135,9 @@ def create_pizero_attn_mask(
             query_index >= prefix_causal_length
         )
 
-        # whether actions should not attend to discretized tokens
-
-        action_ignore_discretized_tokens = (
-            discretized_action_length > 0 and
-            query_index >= prefix_causal_length and
-            key_index >= (prefix_causal_length - discretized_action_length) and
-            key_index < prefix_causal_length
-        )
-
         return key_mask & (is_prefix | (causal_mask & ~action_ignore_discretized_tokens) | bidirectional_action_mask)
 
     return mask_fn
-
-def softclamp_score_mod(value):
-    def identity(score, b, h, q, k):
-        return score
-
-    def softclamped(score, b, h, q, k):
-        score = score / value
-        score = torch.tanh(score)
-        score = score * value
-        return score
-
-    return softclamped if exists(value) and value > 0. else identity
 
 # helper functions
 
@@ -249,12 +224,6 @@ def l2norm(t, dim = -1, eps = 1e-6):
 def straight_through(src, tgt):
     return src + (tgt - src).detach()
 
-def softclamp(t, value):
-    if not exists(value) or value <= 0.:
-        return t
-
-    return (t / value).tanh() * value
-
 def append_dims(t, dims):
     shape = t.shape
     ones = ((1,) * dims)
@@ -320,7 +289,7 @@ class RotaryEmbedding(Module):
 
     def forward(self, t, device = None):
         if isinstance(t, int):
-            t = torch.arange(t, device = device).type_as(self.inv_freq)
+            t = torch.arange(t, device = device)
 
         t = t.type_as(self.inv_freq)
         freqs = torch.einsum('... i , j -> ... i j', t, self.inv_freq)
@@ -340,12 +309,14 @@ def apply_rotary_pos_emb(pos, t):
 class RMSNorm(Module):
     def __init__(self, dim, eps = 1e-6):
         super().__init__()
-        self.scale = dim ** 0.5
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
-        return l2norm(x, eps = self.eps) * self.scale * (1 + self.weight)
+        x_float = x.float()
+        output = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
 
 # siglip encoder
 
@@ -367,7 +338,7 @@ class SimpleAttention(Module):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
-        attn = sim.softmax(dim = -1)
+        attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
         out = rearrange(out, 'b h n d -> b n (h d)')
@@ -385,16 +356,26 @@ class FeedForward(Module):
         norm_klass = None,
         norm_eps = 1e-6,
         norm_all = False,
-        activation = nn.GELU(approximate = 'tanh')
+        activation = None
     ):
         super().__init__()
+        activation = default(activation, 'silu' if glu else 'gelu_tanh')
+
+        if isinstance(activation, str):
+            if activation == 'silu':
+                activation = nn.SiLU()
+            elif activation in ('gelu', 'gelu_pytorch_tanh', 'gelu_new', 'gelu_tanh', 'gelu_fast'):
+                activation = nn.GELU(approximate = 'tanh' if activation != 'gelu' else 'none')
+            else:
+                 raise ValueError(f'unknown activation {activation}')
+
+        self.activation = activation
         dim_inner = default(dim_inner, int(dim * expand_factor * (2 / 3 if glu else 1)))
 
         norm_klass = default(norm_klass, (RMSNorm if rmsnorm else nn.LayerNorm))
         self.norm = norm_klass(dim, eps = norm_eps) if norm_klass != nn.Identity else nn.Identity()
 
         self.glu = glu
-        self.activation = activation
 
         self.proj_in = nn.Linear(dim, dim_inner * (2 if glu else 1), bias = bias)
         self.proj_out = nn.Linear(dim_inner, dim, bias = bias)
@@ -407,8 +388,8 @@ class FeedForward(Module):
         x = self.proj_in(x)
 
         if self.glu:
-            x, gate = x.chunk(2, dim = -1)
-            x = x * self.activation(gate)
+            gate, x = x.chunk(2, dim = -1)
+            x = self.activation(gate) * x
         else:
             x = self.activation(x)
 
@@ -427,7 +408,7 @@ class SigLIP(Module):
         mlp_dim = 4304,
         norm_eps = 1e-6,
         norm_klass = nn.LayerNorm,
-        activation = nn.GELU(approximate = 'tanh')
+        activation = 'gelu_tanh'
     ):
         super().__init__()
         num_patches = (image_size // patch_size) ** 2
@@ -459,7 +440,10 @@ class SigLIP(Module):
             x = attn(x) + x
             x = ff(x) + x
 
-        return self.norm(x)
+        out = self.norm(x)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
 
 # classes
 
@@ -477,12 +461,6 @@ def default_sample_times(
     sampled = Beta(alpha, beta).sample()
     return (1. - sampled) * s
 
-def noise_assignment(data, noise):
-    device = data.device
-    data, noise = tuple(rearrange(t, 'b ... -> b (...)') for t in (data, noise))
-    dist = torch.cdist(data, noise)
-    _, assign = linear_sum_assignment(dist.cpu())
-    return from_numpy(assign).to(device)
 
 # inpainting softmask, for real-time action chunking
 # https://arxiv.org/abs/2506.07339 - eq (5)
@@ -753,12 +731,12 @@ class JointAttention(Module):
         heads = 8,
         kv_heads = None,
         dropout = 0.,
-        softclamp_value = None,
         accept_memories = False,
         actions_norm_all = False,
         learned_value_action_residual_mix = False,
         norm_eps = 1e-6,
-        rotary_emb: RotaryEmbedding | None = None
+        rotary_emb: RotaryEmbedding | None = None,
+        attn_value_gating = False  # whether to apply gating to attention values
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -805,14 +783,18 @@ class JointAttention(Module):
         self.to_mem_out = LinearNoBias(dim_inner, dim) if accept_memories else None
 
         # action parameters - use dim_action for input/output but same heads
-
-        self.to_actions_qkvg = LinearNoBias(dim_action, (2 * heads + 2 * kv_heads) * dim_head)
-
-        self.to_action_value_residual_mix = nn.Sequential(
-            LinearNoBias(dim_action, kv_heads),
-            nn.Sigmoid(),
-            Rearrange('b n h -> b h n 1')
-        ) if learned_value_action_residual_mix else (lambda _: 0.5)
+        # split QKV from gate projection for cleaner control
+        self.attn_value_gating = attn_value_gating
+        
+        self.to_actions_qkv = LinearNoBias(dim_action, (heads + 2 * kv_heads) * dim_head)
+        self.actions_qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+        
+        # separate gate projection, only created if gating is enabled
+        if attn_value_gating:
+            self.to_actions_gate = LinearNoBias(dim_action, dim_inner)
+            nn.init.zeros_(self.to_actions_gate.weight)  # zero-init so (1 + gate) = 1 initially
+        else:
+            self.to_actions_gate = None
 
         self.to_actions_out = LinearNoBias(dim_inner, dim_action)
 
@@ -827,7 +809,8 @@ class JointAttention(Module):
             self.actions_v_norm = RMSNorm(dim_head, eps = norm_eps)
             self.actions_out_norm = RMSNorm(dim_action, eps = norm_eps)
 
-        self.softclamp_value = softclamp_value
+
+        # identity probes for surgery
 
     def forward_actions_with_cached_state(
         self,
@@ -836,23 +819,25 @@ class JointAttention(Module):
         memories: tuple[Tensor, Tensor] | None = None,
         rotary_emb = None,
         mask: Bool['b n'] | None = None,
-        actions_value_residual: Tensor | None = None,
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
         knowledge_insulate = False,
         discretized_action_length = 0
     ):
 
-        aq, ak, av, ag = self.to_actions_qkvg(actions).split(self.actions_qkvg_split, dim = -1)
+        aq, ak, av = self.to_actions_qkv(actions).split(self.actions_qkv_split, dim = -1)
+        
+        # optional gating
+        if self.attn_value_gating:
+            ag = self.to_actions_gate(actions)
+            ag = self.split_heads(ag)
+        else:
+            ag = None
 
-        aq, ak, av, ag = tuple(self.split_heads(t) for t in (aq, ak, av, ag))
+        aq, ak, av = tuple(self.split_heads(t) for t in (aq, ak, av))
 
         if self.actions_norm_all:
             aq, ak, av = tuple(norm(t) for norm, t in zip((self.actions_q_norm, self.actions_k_norm, self.actions_v_norm), (aq, ak, av)))
-
-        if exists(actions_value_residual):
-            mix = self.to_action_value_residual_mix(actions)
-            av = av * mix + actions_value_residual * (1. - mix)
 
         q = aq
         mk, mv = cached_state_keys_values
@@ -896,7 +881,6 @@ class JointAttention(Module):
 
             sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
-            sim = softclamp(sim, self.softclamp_value)
 
             if exists(mask):
                 sim = einx.where('b j, b h i j, -> b h i j', mask, sim, max_neg_value(sim))
@@ -908,13 +892,14 @@ class JointAttention(Module):
 
                 sim = sim.masked_fill(discretized_action_mask, max_neg_value(sim))
 
-            attn = sim.softmax(dim = -1)
+            attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
 
             out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
-        # gate
+        # optional gate - use (1 + gates) so zero-init produces identity
 
-        out = out * ag.sigmoid()
+        if self.attn_value_gating and exists(ag):
+            out = out * (1. + ag)
 
         # merge attention heads
 
@@ -960,18 +945,17 @@ class JointAttention(Module):
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
-        sim = softclamp(sim, self.softclamp_value)
-
         causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
 
         if is_prefix:
             causal_mask.fill_(False)
         elif num_visual_tokens > 0:
             causal_mask[:, :num_visual_tokens] = False
+            causal_mask[:num_visual_tokens, :num_visual_tokens] = False
 
         sim = sim.masked_fill(causal_mask, max_neg_value(sim))
 
-        attn = sim.softmax(dim = -1)
+        attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
@@ -990,23 +974,42 @@ class JointAttention(Module):
         rotary_emb = None,
         memories: tuple[Tensor, Tensor] | None = None,
         mask: Bool['b n'] | None = None,
-        actions_value_residual: Tensor | None = None,
+        ar_mask: Bool['b n'] | None = None,
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
         knowledge_insulate = False,
         discretized_action_length = 0
     ):
-        seq_len, device = multimodal_seq.shape[-2], multimodal_seq.device
+        
+        multimodal_len = multimodal_seq.shape[-2] if exists(multimodal_seq) else 0
+        device = multimodal_seq.device if exists(multimodal_seq) else actions.device
 
-        multimodal_seq = self.rmsnorm(multimodal_seq)
+        if exists(multimodal_seq):
+            multimodal_seq = self.rmsnorm(multimodal_seq)
 
-        # separate projections for multimodal seq vs actions
+            # separate projections for multimodal seq vs actions
 
-        mq, mk, mv = self.to_qkv(multimodal_seq).split(self.q_kv_split, dim = -1)
+            mq, mk, mv = self.to_qkv(multimodal_seq).split(self.q_kv_split, dim = -1)
+        else:
+            mq = mk = mv = None
 
-        aq, ak, av, ag = self.to_actions_qkvg(actions).split(self.actions_qkvg_split, dim = -1)
+        # Actions are already RMS-normalized by attn_ada_rmsnorm before being passed here
+        # (see PiZero.forward line ~2630: action_tokens, gate = attn_ada_rmsnorm(...))
+        aq, ak, av = self.to_actions_qkv(actions).split(self.actions_qkv_split, dim = -1)
+        
+        # optional gating
+        if self.attn_value_gating:
+            ag = self.to_actions_gate(actions)
+        else:
+            ag = None
 
-        mq, mk, mv, aq, ak, av, ag = tuple(self.split_heads(t) for t in (mq, mk, mv, aq, ak, av, ag))
+        if exists(multimodal_seq):
+            mq, mk, mv, aq, ak, av = tuple(self.split_heads(t) for t in (mq, mk, mv, aq, ak, av))
+        else:
+            aq, ak, av = tuple(self.split_heads(t) for t in (aq, ak, av))
+        
+        if exists(ag):
+            ag = self.split_heads(ag)
 
         if self.actions_norm_all:
             aq, ak, av = tuple(norm(t) for norm, t in zip((self.actions_q_norm, self.actions_k_norm, self.actions_v_norm), (aq, ak, av)))
@@ -1018,11 +1021,10 @@ class JointAttention(Module):
 
         # value residual
 
-        if exists(actions_value_residual):
-            mix = self.to_action_value_residual_mix(actions)
-            av = av * mix + actions_value_residual * (1. - mix)
-
-        q, k, v = tuple(cat(tensors, dim = -2) for tensors in zip((mq, mk, mv), (aq, ak, av)))
+        if exists(multimodal_seq):
+            q, k, v = tuple(cat(tensors, dim = -2) for tensors in zip((mq, mk, mv), (aq, ak, av)))
+        else:
+            q, k, v = aq, ak, av
 
         # handle read, write memories
 
@@ -1044,9 +1046,16 @@ class JointAttention(Module):
 
         # rotary embedding
 
+
         if exists(rotary_emb):
             q = apply_rotary_pos_emb(rotary_emb, q)
             k = apply_rotary_pos_emb(rotary_emb, k)
+            
+            # Extract post-RoPE keys for caching (used for KV caching in inference)
+            if exists(multimodal_seq):
+                mk = k[:, :, :multimodal_len, :]  # state portion post-RoPE
+                ak = k[:, :, multimodal_len:, :]  # action portion post-RoPE
+
 
         if exists(flex_attn_fn):
             out = flex_attn_fn(q, k, v)
@@ -1062,34 +1071,44 @@ class JointAttention(Module):
 
             sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
-            sim = softclamp(sim, self.softclamp_value)
 
-            causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+            if exists(ar_mask):
+                cumsum = ar_mask.cumsum(dim = -1)
 
-            if exists(mask):
-                causal_mask = einx.logical_or('b j, i j -> b 1 i j', ~mask, causal_mask)
+                # att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+                # where True means can attend. PiZero's causal_mask is inverted (True = masked out).
+                # So: causal_mask = NOT(cumsum_k <= cumsum_q) = cumsum_k > cumsum_q
+                causal_mask = cumsum.unsqueeze(-2) > cumsum.unsqueeze(-1)  # [b, Q, K]
+                causal_mask = causal_mask.unsqueeze(1) # [b, 1, Q, K]
 
-            if multimodal_prefix_bidirectional_length > 0:
+
+            elif multimodal_prefix_bidirectional_length > 0:
                 start = multimodal_prefix_bidirectional_start
                 end = start + multimodal_prefix_bidirectional_length
-                causal_mask[..., start:end, start:end] = False
+                causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+                causal_mask[start:end, start:end] = False
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # [1, 1, i, j]
+            else:
+                causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # [1, 1, i, j]
 
-            if discretized_action_length > 0:
+            if exists(mask):
+                causal_mask = causal_mask | (~mask.view(actions.shape[0], 1, 1, -1))
+
+            if not exists(ar_mask) and discretized_action_length > 0:
                 causal_mask[..., seq_len:, (seq_len - discretized_action_length):seq_len] = True
-
-            causal_mask[..., seq_len:, seq_len:] = False  # actions have bidirectional attention, lining up with Transfusion paper
 
             sim = sim.masked_fill(causal_mask, max_neg_value(sim))
 
-            attn = sim.softmax(dim = -1)
+            attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
 
             out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
-        # gating of values, used in alphafold line of work
+        # optional gating of values - use (1 + gates) so zero-init produces identity
 
-        gates = pad_at_dim(ag.sigmoid(), (out.shape[-2] - ag.shape[-2], 0), value = 1., dim = -2)
-
-        out = out * gates
+        if self.attn_value_gating and exists(ag):
+            gates = pad_at_dim(1. + ag, (out.shape[-2] - ag.shape[-2], 0), value = 1., dim = -2)
+            out = out * gates
 
         # split out memories
 
@@ -1101,14 +1120,15 @@ class JointAttention(Module):
         out = self.merge_heads(out)
 
         # separate projections for multimodal seq vs actions
-
-        mout, aout = out[:, :seq_len], out[:, seq_len:]
+        
+        mout, aout = out[:, :multimodal_len], out[:, multimodal_len:]
 
         mout, aout = self.to_out(mout), self.to_actions_out(aout)
 
         if self.actions_norm_all:
             aout = self.actions_out_norm(aout)
 
+        # need to facilitate returning full merged output to match their residual path
         output = (mout, aout)
 
         if self.accept_memories:
@@ -1140,32 +1160,65 @@ class RandomFourierEmbed(Module):
         rand_proj = self.proj(times)
         return torch.cos(2 * pi * rand_proj)
 
+class SinusoidalEmbed(Module):
+    def __init__(self, dim, min_period = 0.004, max_period = 4.0):
+        super().__init__()
+        self.dim = dim
+        self.min_period = min_period
+        self.max_period = max_period
+
+    def forward(self, times):
+        device = times.device
+        half_dim = self.dim // 2
+        # For exact parity, sinusoidal periods must be calculated in float64
+        # MPS doesn't support float64, so calculate on CPU, cast down, and move
+        calculation_device = 'cpu' if device.type == 'mps' else device
+        fraction = torch.linspace(0.0, 1.0, half_dim, device = calculation_device, dtype = torch.float64)
+        period = self.min_period * (self.max_period / self.min_period) ** fraction
+        scaling_factor = (2 * math.pi / period).to(device = device, dtype = times.dtype)
+
+        sin_input = times.unsqueeze(-1) * scaling_factor
+        return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim = -1)
+
 class AdaptiveRMSNorm(Module):
     def __init__(
         self,
         dim,
-        dim_cond
+        dim_cond,
+        eps = 1e-6
     ):
         super().__init__()
-        self.norm = RMSNorm(dim, eps = 1e-6)
+        self.eps = eps
+        self.to_modulation = nn.Linear(dim_cond, dim * 3)
+        
+        # For weight sync compatibility - stores the base weight
+        self.norm = nn.Module()
+        self.norm.weight = nn.Parameter(torch.zeros(dim))
 
-        self.to_gamma = nn.Sequential(
-            nn.Linear(dim_cond, dim),
-            nn.Sigmoid()
-        )
 
-        self.to_beta = LinearNoBias(dim_cond, dim)
+    def forward(self, x, cond, return_gate = False):
+        x_float = x.float()
+        raw_normed = (pow(x_float, 2).mean(-1, keepdim = True) + self.eps).rsqrt() * x_float
 
-    def forward(self, actions, cond):
+        if not exists(cond):
+            w = self.norm.weight.float()
+            out = raw_normed * (1. + w)
+            return (out, None) if return_gate else out
 
         if cond.ndim == 2:
             cond = rearrange(cond, 'b d -> b 1 d')
 
-        normed = self.norm(actions)
-        gamma = self.to_gamma(cond)
-        beta = self.to_beta(cond)
+        modulation = self.to_modulation(cond)
+        scale, shift, gate = modulation.chunk(3, dim = -1)
 
-        return normed * gamma + beta
+        # With conditioning - just use modulation's scale, no extra weight
+        out = raw_normed * (1. + scale) + shift
+
+
+        if return_gate:
+            return out.to(x.dtype), gate
+
+        return out.to(x.dtype)
 
 class AdaptiveLayerscale(Module):
     def __init__(
@@ -1182,6 +1235,8 @@ class AdaptiveLayerscale(Module):
         self.to_adaln_zero_gamma = adaln_zero_gamma_linear
 
     def forward(self, actions, cond):
+        if not exists(cond):
+            return actions
 
         if cond.ndim == 2:
             cond = rearrange(cond, 'b d -> b 1 d')
@@ -1202,6 +1257,12 @@ class PiZero(Module):
         dim_joint_state,
         dim_action = None,           # separate dimension for action tokens (for PI weight loading)
         dim_time_cond = None,
+        time_mlp_depth = 1,
+        time_sinusoidal = False,
+        time_min_period = 0.004,
+        time_max_period = 4.,
+        time_infused_action_tokens = False,
+        layer_time_cond = True,
         depth = 12,
         dim_head = 64,
         heads = 8,
@@ -1209,22 +1270,22 @@ class PiZero(Module):
         use_flex_attn = False,
         ff_expand_factor = 4.,
         action_ff_expand_factor = None,  # separate expand factor for action feedforward
-        attn_softclamp_value = 50.,
-        final_norm_softclamp_value = 30.,
         norm_eps = 1e-6,
         vit: Module | None = None,
         vit_dim = None,
         external_state_encoders: Module | list[Module] | None = None,
         dim_internal_state: int | None = None,
         num_action_register_tokens = 4,
+        pi05 = False,
+        token_scale: float | None = None,  # Override token scaling (None = auto sqrt(dim), 1.0 = no scaling)
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict(),
+        activation: str = 'silu',
         lm_pad_id = -1,
         lm_loss_weight = 1.,
         model_predict_output: Literal['flow', 'clean'] = 'flow', # dreamer4 as well as https://arxiv.org/abs/2511.13720 - something is going around, make sure it is not missed.
         max_timesteps = 16,
         flow_loss_weight = 1.,
-        immiscible_flow = False,             # https://arxiv.org/abs/2406.12303
         sample_times_fn = default_sample_times,
         rtc_guidance = None,                 # use the guidance proposed in https://arxiv.org/abs/2506.07339, which in turn is inspired by training-free guidance paper, which in turn from pseudo-inverse paper.
         train_time_rtc = False,
@@ -1267,7 +1328,7 @@ class PiZero(Module):
         action_ff_expand_factor = default(action_ff_expand_factor, ff_expand_factor)
 
         self.dim = dim
-        self.token_scale = dim ** 0.5
+        self.token_scale = default(token_scale, dim ** 0.5)
 
         self.dim_action = dim_action
 
@@ -1275,7 +1336,7 @@ class PiZero(Module):
 
         assert not (use_flex_attn and not exists(flex_attention)), 'flex attention cannot be used'
         self.use_flex_attn = use_flex_attn
-        self.attn_softclamp_value = attn_softclamp_value
+        self.pi05 = pi05
 
         # vit
 
@@ -1312,12 +1373,58 @@ class PiZero(Module):
         self.to_action_tokens = nn.Linear(dim_action_input, dim_action)
 
         # time conditioning
+        
+        self.time_infused_action_tokens = time_infused_action_tokens
+        self.layer_time_cond = layer_time_cond
 
-        self.to_time_cond = nn.Sequential(
-            RandomFourierEmbed(dim),
-            nn.Linear(dim, dim_time_cond),
-            nn.SiLU(),
-        )
+        if time_sinusoidal:
+            # If time-infused, sinusoidal dim should match dim_action (usually 1024)
+            # cats [action_tokens (1024), sinusoidal (1024)] -> 2048
+            # BUT the to_time_cond MLP might expect a different input dim (e.g. 2048 in pretrained)
+            
+            mlp_in_dim = dim
+            time_embed = SinusoidalEmbed(mlp_in_dim, min_period = time_min_period, max_period = time_max_period)
+            
+            self.infusion_time_embed = nn.Identity()
+            if time_infused_action_tokens:
+                 self.infusion_time_embed = SinusoidalEmbed(dim_action, min_period = time_min_period, max_period = time_max_period)
+        else:
+            time_embed = RandomFourierEmbed(dim)
+            self.infusion_time_embed = nn.Identity()
+
+        # we can reuse to_time_cond for infusion or layer conditioning
+        # for PI0, it's used for infusion
+        
+        in_dim = mlp_in_dim if time_sinusoidal else dim
+        
+        time_cond_layers = [time_embed]
+        
+        for i in range(time_mlp_depth):
+            is_last = i == (time_mlp_depth - 1)
+            
+            out_dim = dim_time_cond
+            if is_last and not layer_time_cond:
+                out_dim = dim_action
+                
+            time_cond_layers.append(nn.Linear(in_dim, out_dim))
+            in_dim = out_dim
+            
+            if not is_last or layer_time_cond:
+                 if activation == 'silu':
+                     time_cond_layers.append(nn.SiLU())
+                 elif activation in ('gelu', 'gelu_pytorch_tanh', 'gelu_new'):
+                     time_cond_layers.append(nn.GELU(approximate = 'tanh' if activation != 'gelu' else 'none'))
+
+        self.to_time_cond = nn.Sequential(*time_cond_layers)
+
+        # Action-time fusion (for PI0 style)
+        self.to_action_time_fuse = nn.Identity()
+        if time_infused_action_tokens:
+            self.to_action_time_fuse = nn.Sequential(
+                nn.Linear(dim_action * 2, dim_action),
+                nn.SiLU(),
+                nn.Linear(dim_action, dim_action)
+            )
 
         # latent variable / gene conditioning
 
@@ -1347,13 +1454,10 @@ class PiZero(Module):
 
         self.final_norm_write_memories = RMSNorm(dim, eps = norm_eps) if self.has_recurrent_memories else None
 
-        # residual functions, with maybe hyper connections
+        # residual functions
+        # previously used ManifoldConstrainedHyperConnections
 
-        assert num_residual_streams >= 1
-        init_residual_fn, self.maybe_expand_residuals, self.maybe_reduce_residuals = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
-
-        residual_fns = []
-        counter = count()
+        assert num_residual_streams == 1, 'simplified residual only supports single stream for now'
 
         # attention and feedforward
 
@@ -1365,32 +1469,34 @@ class PiZero(Module):
 
             layers.append(ModuleList([
                 JointAttention(dim = dim, dim_action = dim_action, dim_head = dim_head, heads = heads, actions_norm_all = action_dit_norm_all_linears, accept_memories = self.has_recurrent_memories, learned_value_action_residual_mix = not is_first_block, **self.attn_kwargs),
-                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, norm_eps = norm_eps, **ff_kwargs),
-                FeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, glu = True, norm_klass = nn.Identity, norm_all = action_dit_norm_all_linears, norm_eps = norm_eps, **ff_kwargs),
+                FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, norm_eps = norm_eps, activation = activation, **ff_kwargs),
+                FeedForward(dim = dim_action, expand_factor = action_ff_expand_factor, glu = True, norm_klass = nn.Identity, norm_all = action_dit_norm_all_linears, norm_eps = norm_eps, activation = activation, **ff_kwargs),
                 FeedForward(dim = dim, expand_factor = ff_expand_factor, glu = True, rmsnorm = True, norm_eps = norm_eps, **ff_kwargs) if self.has_recurrent_memories else None
             ]))
 
-            residual_fns.append(ModuleList([
-                init_residual_fn(dim = dim, layer_index = next(counter)),
-                init_residual_fn(dim = dim, layer_index = next(counter)),
-            ]))
-
-            cond_layers.append(ModuleList([
-                AdaptiveRMSNorm(dim, dim_time_cond),
-                AdaptiveLayerscale(dim, dim_time_cond),
-                AdaptiveRMSNorm(dim_action, dim_time_cond),
-                AdaptiveLayerscale(dim_action, dim_time_cond)
-            ]))
+            # PI0.5: AdaptiveRMSNorm with time conditioning
+            # PI0: plain RMSNorm without time conditioning
+            if layer_time_cond:
+                cond_layers.append(ModuleList([
+                    AdaptiveRMSNorm(dim_action, dim_time_cond),
+                    AdaptiveRMSNorm(dim_action, dim_time_cond),
+                ]))
+            else:
+                cond_layers.append(ModuleList([
+                    RMSNorm(dim_action, eps = norm_eps),
+                    RMSNorm(dim_action, eps = norm_eps),
+                ]))
 
         self.layers = ModuleList(layers)
         self.cond_layers = ModuleList(cond_layers)
 
-        self.residual_layers = ModuleList(residual_fns)
-
-        self.final_norm_softclamp = partial(softclamp, value = final_norm_softclamp_value)
 
         self.final_norm = RMSNorm(dim, eps = norm_eps)
-        self.final_actions_norm = RMSNorm(dim_action, eps = norm_eps)
+
+        if not layer_time_cond:
+            self.final_actions_norm = RMSNorm(dim_action, eps = norm_eps)
+        else:
+            self.final_actions_norm = AdaptiveRMSNorm(dim_action, dim_time_cond, eps = norm_eps)
 
         # unembedding
 
@@ -1415,7 +1521,7 @@ class PiZero(Module):
         self.loss_fn = None
 
         if not is_critic:
-            self.actions_to_pred_flow = LinearNoBias(dim_action, dim_action_input)
+            self.actions_to_pred_flow = nn.Linear(dim_action, dim_action_input)
             self.loss_fn = nn.MSELoss(reduction = 'none')
 
         # use simple policy optimization
@@ -1452,7 +1558,6 @@ class PiZero(Module):
 
         # flow related
 
-        self.immiscible_flow = immiscible_flow
 
         # reward classifier free guidance
 
@@ -1521,6 +1626,7 @@ class PiZero(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
+
         # tensor typing
 
         self._nm = num_recurrent_memory_tokens
@@ -1584,12 +1690,13 @@ class PiZero(Module):
 
         for (
             (attn, state_ff, actions_ff, memories_ff),
-            (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
-            (attn_residual, actions_ff_residual),
-        ) in zip(self.layers, self.cond_layers, self.residual_layers):
+            (attn_ada_rmsnorm, ff_ada_rmsnorm),
+        ) in zip(self.layers, self.cond_layers):
 
             add_module(attn.to_actions_out)
-            add_module(attn.to_actions_qkvg)
+            add_module(attn.to_actions_qkv)
+            if attn.attn_value_gating:
+                add_module(attn.to_actions_gate)
             add_module(actions_ff)
 
         add_module(self.actions_to_pred_flow)
@@ -1898,6 +2005,7 @@ class PiZero(Module):
         self,
         images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
         token_ids: Int['b nt'],                                          # language
+        visual_tokens: Float['b nv d'] | None = None
     ) -> Float['b n d']:
 
         device = token_ids.device
@@ -1906,7 +2014,9 @@ class PiZero(Module):
 
         # vision
 
-        if exists(self.vit):
+        if exists(visual_tokens):
+            pass
+        elif exists(self.vit):
             assert images.ndim in {4, 5}
             is_multiple_images = images.ndim == 5
 
@@ -1923,13 +2033,18 @@ class PiZero(Module):
                 visual_tokens = rearrange(visual_tokens, 'b f n d -> b (f n) d')
 
         else:
-            assert images.ndim == 3, 'images must be already encoded as (batch, seq, feature dimension)'
+            assert images.ndim in {3, 4}, 'images must be already encoded as (batch, seq, feature dimension) or (batch, frames, seq, feature dimension)'
+            
+            if images.ndim == 4:
+                images = rearrange(images, 'b f n d -> b (f n) d')
+
             visual_tokens = images
 
         visual_tokens = self.maybe_to_image_tokens(visual_tokens)
+        visual_tokens = visual_tokens / self.token_scale
 
-        # scaling
-        language_tokens = language_tokens * (self.dim ** 0.5)
+        # Language tokens scaled by sqrt(dim) to match reference embed_prefix
+        language_tokens = language_tokens * self.token_scale
 
         # concat visual rep with language
 
@@ -1939,17 +2054,12 @@ class PiZero(Module):
         ], 'b * d')
 
         # rotary embeddings
-
         seq_len = state_tokens.shape[-2]
-
-        # match Paligemma position ids
-        # they start at 1
-
-        seq = torch.arange(1, seq_len + 1, device = device)
-
+        seq = torch.arange(seq_len, device = device)
         rotary_emb = self.rotary_emb(seq)
 
         # transformer
+        state_tokens = state_tokens * self.token_scale
 
         num_visual_tokens = visual_tokens.shape[-2]
 
@@ -1957,8 +2067,8 @@ class PiZero(Module):
 
             state_attn_out = attn.forward_only_vision_language(
                 state_tokens,
-                num_visual_tokens = num_visual_tokens,
-                is_prefix = True,
+                num_visual_tokens = num_visual_tokens,  # Only visual tokens are bidirectional
+                is_prefix = True,   # Only bidirectional attend to visual tokens (prefix-LM attention)
                 rotary_emb = rotary_emb
             )
 
@@ -1968,7 +2078,7 @@ class PiZero(Module):
 
         state_tokens = self.final_norm(state_tokens)
 
-        embed = self.final_norm_softclamp(state_tokens)
+        embed = state_tokens
 
         logits = self.state_to_logits(embed)
 
@@ -2148,6 +2258,7 @@ class PiZero(Module):
         return_language_loss = True,
         return_action_flow_loss = True,
         knowledge_insulate = False,
+        visual_tokens: Float['b nv d'] | None = None,
         **kwargs
     ):
         inferencing = exists(cached_state_keys_values)
@@ -2181,9 +2292,6 @@ class PiZero(Module):
         if not return_actions_flow and not self.is_critic:
             noise = default(noise, torch.randn_like(actions))
 
-            if self.immiscible_flow:
-                assignment = noise_assignment(actions, noise)
-                noise = noise[assignment]
 
             flow = actions - noise
             padded_times = rearrange(times, 'b -> b 1 1')
@@ -2213,8 +2321,16 @@ class PiZero(Module):
 
         # actions
 
-        time_cond = self.to_time_cond(times)
+        time_cond = self.to_time_cond(times) if self.layer_time_cond else None
         action_tokens = self.to_action_tokens(actions)
+        empty_token_action_dim = action_tokens.new_empty((batch, 0, self.dim_action))
+        
+        if self.time_infused_action_tokens:
+            sinusoidal = self.infusion_time_embed(times)
+            sinusoidal = sinusoidal[:, None, :].expand_as(action_tokens)
+            
+            action_tokens = torch.cat([action_tokens, sinusoidal], dim = -1)
+            action_tokens = self.to_action_time_fuse(action_tokens)
 
         # handle maybe latents
 
@@ -2244,7 +2360,11 @@ class PiZero(Module):
 
         # joint state + additional internal states
 
-        joint_state_tokens = self.to_joint_state_tokens(joint_state)
+        joint_state_tokens = empty_token_action_dim
+
+        if not self.pi05:
+            joint_state_tokens = self.to_joint_state_tokens(joint_state)
+            joint_state_tokens = joint_state_tokens.unsqueeze(1)
 
         # additional internal state tokens
 
@@ -2272,7 +2392,7 @@ class PiZero(Module):
 
         # take care of padding time conditioning if doing training rtc
 
-        if time_cond.ndim == 3:
+        if exists(time_cond) and time_cond.ndim == 3:
             orig_action_len = orig_actions.shape[-2]
             time_cond = pad_at_dim(time_cond, (action_with_registers_length - orig_action_len, 0), dim = -2)
 
@@ -2294,7 +2414,9 @@ class PiZero(Module):
 
             # vision
 
-            if exists(self.vit):
+            if exists(visual_tokens):
+                pass
+            elif exists(self.vit):
                 assert images.ndim in {4, 5}
                 is_multiple_images = images.ndim == 5
 
@@ -2311,10 +2433,16 @@ class PiZero(Module):
                     visual_tokens = rearrange(visual_tokens, 'b f n d -> b (f n) d')
 
             else:
-                assert images.ndim == 3, 'images must be already encoded as (batch, seq, feature dimension)'
+                assert images.ndim in {3, 4}, 'images must be already encoded as (batch, seq, feature dimension) or (batch, frames, seq, feature dimension)'
+
+                if images.ndim == 4:
+                    images = rearrange(images, 'b f n d -> b (f n) d')
+
                 visual_tokens = images
 
             visual_tokens = self.maybe_to_image_tokens(visual_tokens)
+
+            visual_tokens = visual_tokens / self.token_scale
 
             # empty
 
@@ -2369,14 +2497,10 @@ class PiZero(Module):
 
             if exists(external_states):
                 external_state_tokens = [encode(external_state) for encode, external_state in zip(self.external_state_encoders, external_states)]
-                external_state_tokens = pack(external_state_tokens, 'b * d')
+                external_state_tokens, _ = pack(external_state_tokens, 'b * d')
 
             else:
                 external_state_tokens = visual_tokens.new_empty((batch, 0, self.dim))
-
-            # scaling
-            # in PaliGemma, only the embed_tokens (text) are scaled
-            # image projector outputs are NOT scaled
 
             scale = self.token_scale
 
@@ -2412,28 +2536,59 @@ class PiZero(Module):
         else:
             state_length = state_tokens.shape[-2]
 
-        mask = F.pad(language_mask, (state_length - command_length, action_with_registers_length), value = True) # assume fixed number of images for now, but address variable length modality states later
-
-        # memory
-
+        mask = F.pad(language_mask, (state_length - command_length, action_with_registers_length), value = True)
         mask = F.pad(mask, (past_recurrent_memory_tokens.shape[-2], write_memory_tokens.shape[-2]), value = True)
 
-        # rotary embeddings
+        # construct ar_mask for segment based bidirectional attention
 
-        seq = mask.float().cumsum(dim = -1)
+        ar_mask = torch.zeros_like(mask, dtype = torch.int)
+
+        if not inferencing:
+            # prefix segment (0)
+            prefix_len = state_length
+            
+            # registers + state + internal_state
+            
+            num_registers = self.action_register_tokens.shape[-2]
+            num_joint_state = joint_state_tokens.shape[-2]
+            num_internal_state = internal_state_tokens.shape[-2]
+
+            # prefix ends at state_length
+            
+            if not self.pi05:
+                # suffix_att_masks = [1, 1, 0, 0, ...] meaning:
+                # - joint_state (pos 0): cumsum=1, can only attend to itself within suffix
+                # - first_action (pos 1): cumsum=2, starts a new segment
+                # - rest of actions: cumsum=2, all bidirectional within segment
+                
+                # Segment 1: joint_state
+                if (prefix_len + num_registers) < ar_mask.shape[-1]:
+                    ar_mask[:, prefix_len + num_registers] = 1
+                
+                # Segment 2: first action token
+                first_action_pos = prefix_len + num_registers + num_joint_state + num_internal_state
+                if first_action_pos < ar_mask.shape[-1]:
+                    ar_mask[:, first_action_pos] = 1
+            else:
+                # PI0.5: Segment 1 starts at actions
+                action_tokens_start = prefix_len + num_registers
+                if action_tokens_start < ar_mask.shape[-1]:
+                    ar_mask[:, action_tokens_start] = 1
+
+        # rotary embeddings
+        seq = (mask.float().cumsum(dim = -1) - 1).clamp_min(0)
         rotary_emb = self.rotary_emb(seq)
 
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
 
         # multimodal prefix bidirectional attention
-        # which can have a start and length, and vision follows such a pattern in PaliGemma
 
         multimodal_prefix_bidirectional_length = 0
         multimodal_prefix_bidirectional_start = 0
 
         if not inferencing:
-            multimodal_prefix_bidirectional_length = visual_tokens.shape[-2]
-            multimodal_prefix_bidirectional_start = external_state_tokens.shape[-2]
+            multimodal_prefix_bidirectional_length = state_tokens.shape[-2]
+            multimodal_prefix_bidirectional_start = 0
 
         # prepare maybe flex attention
 
@@ -2458,7 +2613,7 @@ class PiZero(Module):
                 _compile = True,
             )
 
-            score_mod_fn = softclamp_score_mod(self.attn_softclamp_value)
+            score_mod_fn = None
 
             flex_attn_fn = partial(
                 flex_attention,
@@ -2470,15 +2625,10 @@ class PiZero(Module):
 
         cached_state_key_values_iter = iter(default(cached_state_keys_values, []))
 
-        # value residual learning
+        if exists(state_tokens):
+            state_tokens = state_tokens * self.token_scale
 
-        actions_value_residual = None
-
-        # maybe expand residual streams
-
-        action_tokens = self.maybe_expand_residuals(action_tokens)
-
-        # transformer
+        action_tokens = action_tokens * (self.dim_action ** 0.5)
 
         if not inferencing:
 
@@ -2486,15 +2636,17 @@ class PiZero(Module):
 
             for (
                 (attn, state_ff, actions_ff, memories_ff),
-                (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
-                (attn_residual, actions_ff_residual),
-            ) in zip(self.layers, self.cond_layers, self.residual_layers):
-
+                (attn_ada_rmsnorm, ff_ada_rmsnorm),
+            ) in zip(self.layers, self.cond_layers):
                 # joint attention
 
-                action_tokens, add_action_residual = attn_residual(action_tokens)
+                action_residual = action_tokens
 
-                action_tokens = attn_ada_rmsnorm(action_tokens, time_cond)
+                if self.layer_time_cond:
+                    action_tokens, gate = attn_ada_rmsnorm(action_tokens, time_cond, return_gate = True)
+                else:
+                    action_tokens = attn_ada_rmsnorm(action_tokens)
+                    gate = None
 
                 (state_attn_out, actions_attn_out, *maybe_mem_out), (state_keys, state_values, action_keys, action_values) = attn(
                     state_tokens,
@@ -2503,8 +2655,8 @@ class PiZero(Module):
                     multimodal_prefix_bidirectional_start = multimodal_prefix_bidirectional_start,
                     rotary_emb = rotary_emb,
                     flex_attn_fn = flex_attn_fn,
-                    actions_value_residual = actions_value_residual,
                     mask = mask,
+                    ar_mask = ar_mask,
                     return_keys_values = True,
                     knowledge_insulate = knowledge_insulate,
                     memories = memory_tokens,
@@ -2513,12 +2665,14 @@ class PiZero(Module):
 
                 next_state_cached_keys_values.append((state_keys, state_values))
 
-                actions_value_residual = default(actions_value_residual, action_values)
-
-                action_attn_out = attn_ada_layerscale(actions_attn_out, time_cond)
+                action_attn_out = actions_attn_out
 
                 state_tokens = state_tokens + state_attn_out
-                action_tokens = add_action_residual(action_attn_out)
+
+                if exists(gate):
+                    action_attn_out = action_attn_out * gate
+
+                action_tokens = action_residual + action_attn_out
 
                 if self.has_recurrent_memories:
                     (read_mem_attn_out, write_mem_attn_out), = maybe_mem_out
@@ -2534,15 +2688,23 @@ class PiZero(Module):
 
                 # action feedforward
 
-                action_tokens, add_action_ff_residual = actions_ff_residual(action_tokens)
+                action_ff_residual = action_tokens
 
-                action_tokens = ff_ada_rmsnorm(action_tokens, time_cond)
+                if self.layer_time_cond:
+                    action_tokens, gate = ff_ada_rmsnorm(action_tokens, time_cond, return_gate = True)
+                else:
+                    action_tokens = ff_ada_rmsnorm(action_tokens)
+                    gate = None
 
                 action_tokens_out = actions_ff(action_tokens)
 
-                action_tokens_out = ff_ada_layerscale(action_tokens_out, time_cond)
+                action_tokens_out = action_tokens_out
+                # action_tokens_out = ff_ada_layerscale(action_tokens_out, time_cond)
 
-                action_tokens = add_action_ff_residual(action_tokens_out)
+                if exists(gate):
+                    action_tokens_out = action_tokens_out * gate
+
+                action_tokens = action_ff_residual + action_tokens_out
 
                 # maybe memory feedforward
 
@@ -2561,15 +2723,17 @@ class PiZero(Module):
 
             for (
                 (attn, state_ff, actions_ff, memories_ff),
-                (attn_ada_rmsnorm, attn_ada_layerscale, ff_ada_rmsnorm, ff_ada_layerscale),
-                (attn_residual, actions_ff_residual),
-            ) in zip(self.layers, self.cond_layers, self.residual_layers):
-
+                (attn_ada_rmsnorm, ff_ada_rmsnorm),
+            ) in zip(self.layers, self.cond_layers):
                 # actions attention
 
-                action_tokens, add_action_residual = attn_residual(action_tokens)
+                action_residual = action_tokens
 
-                action_tokens = attn_ada_rmsnorm(action_tokens, time_cond)
+                if self.layer_time_cond:
+                    action_tokens, gate = attn_ada_rmsnorm(action_tokens, time_cond, return_gate = True)
+                else:
+                    action_tokens = attn_ada_rmsnorm(action_tokens)
+                    gate = None
 
                 actions_attn_out, (state_keys, state_values, action_keys, action_values) = attn.forward_actions_with_cached_state(
                     action_tokens,
@@ -2580,22 +2744,29 @@ class PiZero(Module):
                     discretized_action_length = discretized_action_length
                 )
 
-                actions_value_residual = default(actions_value_residual, action_values)
+                if exists(gate):
+                    actions_attn_out = actions_attn_out * gate
 
-                actions_attn_out = attn_ada_layerscale(actions_attn_out, time_cond)
-                action_tokens = add_action_residual(actions_attn_out)
+                action_tokens = action_residual + actions_attn_out
 
                 # actions feed forward
 
-                action_tokens, add_action_ff_residual = actions_ff_residual(action_tokens)
+                action_ff_residual = action_tokens
 
-                action_tokens = ff_ada_rmsnorm(action_tokens, time_cond)
+                if self.layer_time_cond:
+                    action_tokens, gate = ff_ada_rmsnorm(action_tokens, time_cond, return_gate = True)
+                else:
+                    action_tokens = ff_ada_rmsnorm(action_tokens)
+                    gate = None
 
                 action_out = actions_ff(action_tokens)
 
-                action_out = ff_ada_layerscale(action_out, time_cond)
+                # action_out = ff_ada_layerscale(action_out, time_cond)  # Removed: no layerscale
 
-                action_tokens = add_action_residual(action_out)
+                if exists(gate):
+                    action_out = action_out * gate
+
+                action_tokens = action_ff_residual + action_out
 
                 # maybe memory feed forward
 
@@ -2606,22 +2777,16 @@ class PiZero(Module):
 
                     memory_tokens = unpack_memory(memory_tokens)
 
-        # maybe reduce residual streams
-
-        action_tokens = self.maybe_reduce_residuals(action_tokens)
 
         if not inferencing:
             # unpack and unembed to predictions
 
+            state_tokens = self.final_norm(state_tokens)
+
             _, visual_tokens, tokens, *_, maybe_discrete_action_tokens = inverse_packed_states(state_tokens, 'b * d')
-
-            # gemma uses a final softclamp before norm
-
-            tokens = self.final_norm_softclamp(tokens)
 
         *_, action_tokens = inverse_pack_action_registers(action_tokens)
 
-        action_tokens = self.final_norm_softclamp(action_tokens)
 
         # memories
 
@@ -2634,7 +2799,15 @@ class PiZero(Module):
 
         # final actions norm
 
-        action_embeds = self.final_actions_norm(action_tokens)
+        if self.layer_time_cond:
+            curr_time_cond = time_cond
+            if curr_time_cond.ndim == 3:
+                curr_time_cond = curr_time_cond[:, -action_tokens.shape[-2]:]
+
+            action_embeds, _ = self.final_actions_norm(action_tokens, curr_time_cond, return_gate = True)
+        else:
+            action_embeds = self.final_actions_norm(action_tokens)
+
 
         # pool the action embeds and project if critic loss
 
@@ -2718,8 +2891,6 @@ class PiZero(Module):
         language_loss = self.zero
 
         if return_language_loss:
-            tokens = self.final_norm(tokens)
-
             language_logits = self.state_to_logits(tokens)
 
             language_loss = F.cross_entropy(
