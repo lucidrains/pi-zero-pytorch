@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing import Any
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -44,7 +43,6 @@ import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
-from pi_zero_pytorch.tensor_typing import Float, Int, Bool
 
 from hl_gauss_pytorch import HLGaussLayer
 
@@ -116,7 +114,7 @@ if torch.cuda.is_available():
 
 def create_pizero_attn_mask(
     prefix_causal_length,
-    mask: Bool['b n'],
+    mask: Tensor, # bool[b n]
     prefix_bidirectional_length = 0,
     prefix_bidirectional_start = 0,
     discretized_action_length = 0
@@ -513,7 +511,7 @@ class SoftMaskInpainter(Module):
 
     def pad_frozen(
         self,
-        frozen_actions: Float['b nfa d']
+        frozen_actions: Tensor # float[b nfa d]
     ):
         traj_len = self.trajectory_length
         frozen_len = frozen_actions.shape[1]
@@ -525,8 +523,8 @@ class SoftMaskInpainter(Module):
 
     def forward(
         self,
-        frozen_actions: Float['b nfa d'],
-        new_actions: Float['b na d']
+        frozen_actions: Tensor, # float[b nfa d]
+        new_actions: Tensor     # float[b na d]
     ):
         frozen_actions = self.pad_frozen(frozen_actions)
 
@@ -548,8 +546,8 @@ class RTCGuidance(Module):
     def with_model_and_frozen_actions(
         self,
         model: Module,
-        frozen_actions: Float['b na d'],
-        soft_mask: tuple[int, int, int] | Float['na'] | Float['1 na 1'],
+        frozen_actions: Tensor, # float[b na d]
+        soft_mask: tuple[int, int, int] | Tensor, # float[na] | float[1 na 1]
         input_time_arg_name = 'times',
         input_noised_actions_arg_name = 'actions',
         add_guidance_to_flow = True,
@@ -608,11 +606,11 @@ class RTCGuidance(Module):
 
     def forward(
         self,
-        noise_actions: Float['b na d'],
-        pred_actions: Float['b na d'],
-        frozen_actions: Float['b na d'],
-        times: Float[''] | Float['b'],
-        soft_mask: Float['na'] | Float['1 na 1'],
+        noise_actions: Tensor,  # float[b na d]
+        pred_actions: Tensor,   # float[b na d]
+        frozen_actions: Tensor, # float[b na d]
+        times: Tensor,          # float[] | float[b]
+        soft_mask: Tensor,      # float[na] | float[1 na 1]
         eps = 1e-4
     ):
 
@@ -671,10 +669,10 @@ class BinnedValueLayer(Module):
 
     def value_to_prob(
         self,
-        value: Float['...'],
+        value: Tensor, # float[...]
         temperature = 0.1,
         hard = False
-    ) -> Float['... bins']:
+    ) -> Tensor: # float[... bins]
         requires_grad = value.requires_grad
 
         distance = einx.subtract('..., bins -> ... bins', value, self.bins)
@@ -822,7 +820,7 @@ class JointAttention(Module):
         cached_state_keys_values: tuple[Tensor, Tensor],
         memories: tuple[Tensor, Tensor] | None = None,
         rotary_emb = None,
-        mask: Bool['b n'] | None = None,
+        mask: Tensor | None = None, # bool[b n]
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
         knowledge_insulate = False,
@@ -921,11 +919,11 @@ class JointAttention(Module):
 
     def forward_only_vision_language(
         self,
-        state: Float['b n d'],
+        state: Tensor, # float[b n d]
         num_visual_tokens = 0,
         is_prefix = False,
         rotary_emb = None
-    ) -> Float['b n d']:
+    ) -> Tensor: # float[b n d]
 
         state = self.rmsnorm(state)
 
@@ -977,8 +975,8 @@ class JointAttention(Module):
         multimodal_prefix_bidirectional_start = 0,
         rotary_emb = None,
         memories: tuple[Tensor, Tensor] | None = None,
-        mask: Bool['b n'] | None = None,
-        ar_mask: Bool['b n'] | None = None,
+        mask: Tensor | None = None,    # bool[b n]
+        ar_mask: Tensor | None = None, # bool[b n]
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
         knowledge_insulate = False,
@@ -1720,11 +1718,11 @@ class PiZero(Module):
         token_ids,
         joint_states,
         trajectory_length: int,
-        latents: Float['d'] | Float['b d'] = None,
-        reward_tokens: Float['b d'] | None = None,
-        advantage_ids: Int['b'] | int | None = None,
-        internal_state_tokens: Float['b ns d'] | None = None,
-        frozen_actions: Float['b nfa da'] | None = None,
+        latents: Tensor | None = None,               # float[d] | float[b d]
+        reward_tokens: Tensor | None = None,         # float[b d]
+        advantage_ids: Tensor | int | None = None,   # int[b] | int
+        internal_state_tokens: Tensor | None = None, # float[b ns d]
+        frozen_actions: Tensor | None = None,        # float[b nfa da]
         soft_mask_lens: tuple[int, int, int] | None = None, # overriding the softmax inpainter at init
         return_frozen_actions_with_sampled = False,
         return_original_noise = False,
@@ -1737,7 +1735,7 @@ class PiZero(Module):
         cache_kv = True,
         return_states_for_replay = False,
         critic: Module | None = None,
-        actions_last_step: Float['b na da'] | None = None,
+        actions_last_step: Tensor | None = None, # float[b na da]
     ):
         assert not self.is_critic
 
@@ -1910,7 +1908,7 @@ class PiZero(Module):
     def forward_with_reward_cfg(
         self,
         *args,
-        reward_tokens: Float['b d'] | None = None,
+        reward_tokens: Tensor | None = None, # float[b d]
         cached_state_keys_values = (None, None),
         cond_scale = 0.,
         remove_parallel_component = False,
@@ -1960,10 +1958,10 @@ class PiZero(Module):
     @move_input_tensors_to_device
     def forward_only_vision_language(
         self,
-        images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
-        token_ids: Int['b nt'],                                          # language
-        visual_tokens: Float['b nv d'] | None = None
-    ) -> Float['b n d']:
+        images: Tensor,         # float[b nv d] | float[b c h w] | float[b c f h w] - vision
+        token_ids: Tensor,      # int[b nt] - language
+        visual_tokens: Tensor | None = None # float[b nv d]
+    ) -> Tensor: # float[b n d]
 
         device = token_ids.device
 
@@ -2065,7 +2063,7 @@ class PiZero(Module):
         joint_state,
         actions,
         old_actor: PiZero,
-        advantages: Float['b t'],
+        advantages: Tensor, # float[b t]
         clip_eps = 0.2,
         norm_eps = 1e-5,
         num_monte_carlo = 2,
@@ -2155,8 +2153,8 @@ class PiZero(Module):
     def forward_for_critic_loss(
         self,
         *args,
-        old_values: Float['b'],
-        advantages: Float['b'],
+        old_values: Tensor, # float[b]
+        advantages: Tensor, # float[b]
         value_clip = True,
         clip_eps = 0.4,
     ):
@@ -2194,28 +2192,28 @@ class PiZero(Module):
     @move_input_tensors_to_device
     def forward(
         self,
-        images: Float['b nv d'] | Float['b c h w'] | Float['b c f h w'], # vision
-        token_ids: Int['b nt'],                                          # language
-        joint_state: Float['b djs'],                                     # joint state
-        actions: Float['b na da'] | None = None,                         # action
-        times: Float['b'] = None,
-        noise: Float['b na da'] | None = None,
-        latents: Float['d'] | Float['b d'] = None,
-        reward_tokens: Float['b d'] | None = None,
-        internal_state_tokens: Float['b ns d'] | None = None,
-        external_states: tuple[Float['b ...']] | None = None,
+        images: Tensor,                                          # float[b nv d] | float[b c h w] | float[b c f h w] - vision
+        token_ids: Tensor,                                       # int[b nt] - language
+        joint_state: Tensor,                                     # float[b djs] - joint state
+        actions: Tensor | None = None,                           # float[b na da] - action
+        times: Tensor | None = None,                             # float[b]
+        noise: Tensor | None = None,                             # float[b na da]
+        latents: Tensor | None = None,                           # float[d] | float[b d]
+        reward_tokens: Tensor | None = None,                     # float[b d]
+        internal_state_tokens: Tensor | None = None,             # float[b ns d]
+        external_states: tuple[Tensor, ...] | None = None,       # tuple[float[b ...]]
         record_and_return_memory_tokens = False,
-        past_recurrent_memory_tokens: Float['b {self._nm} d'] | None = None,
-        task_id: Int['b'] | int | None = None,
-        task_status: Int['b'] | None = None,
-        advantage_ids: Int['b'] | int | None = None,
+        past_recurrent_memory_tokens: Tensor | None = None,      # float[b {self._nm} d]
+        task_id: Tensor | int | None = None,                      # int[b]
+        task_status: Tensor | None = None,                       # int[b]
+        advantage_ids: Tensor | int | None = None,               # int[b]
         return_actions_flow = False,
         return_state_keys_values = False,
         cached_state_keys_values: list[tuple[Tensor, Tensor]] | None = None,
         return_language_loss = True,
         return_action_flow_loss = True,
         knowledge_insulate = False,
-        visual_tokens: Float['b nv d'] | None = None,
+        visual_tokens: Tensor | None = None,                     # float[b nv d]
         **kwargs
     ):
         inferencing = exists(cached_state_keys_values)
