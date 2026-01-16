@@ -530,6 +530,9 @@ class SoftMaskInpainter(Module):
     ):
         frozen_actions = self.pad_frozen(frozen_actions)
 
+        if self.soft_mask.device != new_actions.device:
+            self.soft_mask = self.soft_mask.to(new_actions.device)
+
         return new_actions.lerp(frozen_actions, self.soft_mask)
 
 # action guidance related
