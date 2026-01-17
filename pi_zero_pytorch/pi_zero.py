@@ -43,7 +43,6 @@ import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, einsum, pack, unpack
 
-
 from hl_gauss_pytorch import HLGaussLayer
 
 from assoc_scan import AssocScan
@@ -63,10 +62,13 @@ from accelerate import Accelerator
 from pydantic import BaseModel, Field, model_validator
 
 from torch_einops_utils import (
+    maybe,
+    pad_right_ndim,
     pad_at_dim,
     pad_left_at_dim,
     pack_with_inverse,
-    pad_sequence
+    pad_sequence,
+    and_masks
 )
 
 # ein notation
@@ -159,16 +161,6 @@ def sample(prob):
 def xnor(x, y):
     return not (x ^ y)
 
-def maybe(fn):
-    @wraps(fn)
-    def inner(t, *args, **kwargs):
-        if not exists(t):
-            return None
-
-        return fn(t, *args, **kwargs)
-
-    return inner
-
 def save_args_kwargs(fn):
     @wraps(fn)
     def decorated(self, *args, **kwargs):
@@ -224,29 +216,9 @@ def l2norm(t, dim = -1, eps = 1e-6):
 def straight_through(src, tgt):
     return src + (tgt - src).detach()
 
-def append_dims(t, dims):
-    shape = t.shape
-    ones = ((1,) * dims)
-    return t.reshape(*shape, *ones)
-
 def lens_to_mask(lens, max_len):
     seq = torch.arange(max_len, device = lens.device)
     return einx.less('j, i -> i j', seq, lens)
-
-def maybe_and_masks(*masks):
-    masks = [*filter(exists, masks)]
-
-    if len(masks) == 0:
-        return None
-    elif len(masks) == 1:
-        return masks[0]
-
-    mask, *rest_mask = masks
-
-    for rest_mask in rest_masks:
-        mask = mask & rest_mask
-
-    return mask
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
@@ -1834,7 +1806,7 @@ class PiZero(Module):
             if inpaint_actions and exists(self.rtc_guidance):
                 assert self.model_predict_output == 'flow' # handle this eventually
 
-                padded_timestep = append_dims(timestep, flow.ndim - 1)
+                padded_timestep = pad_right_ndim(timestep, flow.ndim - 1)
 
                 pred_actions = denoised_actions + flow * (1. - padded_timestep)
 
@@ -2816,7 +2788,9 @@ class PiZero(Module):
             if exists(task_status):
                 is_not_invalid_mask = task_status != self.task_status_is_invalid
 
-            mask = maybe_and_masks(is_not_invalid_mask, action_prefix_mask)
+            is_not_action_prefix_mask = maybe(torch.logical_not)(action_prefix_mask)
+
+            mask = and_masks([is_not_invalid_mask, is_not_action_prefix_mask])
 
             # mask out
 
