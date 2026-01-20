@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Env Rollout Labeller</title>
+    <link rel="stylesheet" href="/ui/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="glass-container">
+        <header>
+            <div class="logo">π0 Labeller</div>
+            <div id="video-info" class="video-info">
+                <span class="filename" id="current-filename">Select a video</span>
+                <span class="badge" id="current-frames">0 frames</span>
+            </div>
+        </header>
+
+        <main>
+            <div class="sidebar">
+                <h2>Rollouts</h2>
+                <ul id="video-list">
+                    <!-- Videos will be populated here -->
+                </ul>
+            </div>
+
+            <div class="main-content">
+                <div class="player-container">
+                    <div class="video-wrapper">
+                        <video id="main-player" controls>
+                            Your browser does not support the video tag.
+                        </video>
+                    </div>
+                </div>
+
+                <div class="carousel-container">
+                    <div class="carousel-track" id="carousel-track">
+                        <!-- Frames will be populated here -->
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="/ui/app.js"></script>
+</body>
+
+</html>

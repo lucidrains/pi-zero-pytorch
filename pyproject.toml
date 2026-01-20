@@ -46,6 +46,14 @@ dependencies = [
     'x-evolution>=0.1.15',
     'x-mlps-pytorch>=0.0.24',
     'x-transformers>=2.4.1',
+    "gymnasium[box2d]>=1.2.3",
+    "moviepy>=2.2.1",
+    "swig>=4.4.1",
+    "fastapi>=0.128.0",
+    "uvicorn>=0.40.0",
+    "jinja2>=3.1.6",
+    "opencv-python>=4.13.0.90",
+    "click>=8.3.1",
 ]
 
 [project.urls]
@@ -85,6 +93,9 @@ build-backend = "hatchling.build"
 [tool.rye]
 managed = true
 dev-dependencies = []
+
+[project.scripts]
+env_rollout_labeller = "pi_zero_pytorch.web_server:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
