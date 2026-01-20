@@ -486,7 +486,7 @@ class SoftMaskInpainter(Module):
         frozen_len = frozen_actions.shape[1]
 
         if frozen_len >= traj_len:
-            return frozen_actions[:, :traj_len]
+            return frozen_actions[:, -traj_len:]
 
         return pad_at_dim(frozen_actions, (0, traj_len - frozen_len), dim = 1)
 
