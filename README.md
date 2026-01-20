@@ -16,6 +16,8 @@ Update: The [official repository](https://github.com/Physical-Intelligence/openp
 
 - [@Wonder1905](https://github.com/Wonder1905) for the code review and identifying issues
 
+- [Pranoy](https://github.com/pranoyr) for various bug fixes!
+
 - You? maybe a phd student who wants to contribute to the latest SOTA architecture?
 
 ### Install
