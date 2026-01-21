@@ -13,6 +13,13 @@ import shutil
 from typing import List
 from memmap_replay_buffer import ReplayBuffer
 from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate
+import json
+
+recap_config_path = Path(__file__).parent / "recap_config.json"
+RECAP_CONFIG = {}
+if recap_config_path.exists():
+    with open(recap_config_path) as f:
+        RECAP_CONFIG = json.load(f)
 
 app = FastAPI()
 
@@ -125,6 +132,46 @@ def init_replay_buffer(video_dir: Path):
     
     print("ReplayBuffer initialization complete.")
 
+@app.get("/api/tasks")
+async def get_tasks():
+    if not RECAP_CONFIG:
+        return []
+        
+    tasks = []
+    for task_name, config in RECAP_CONFIG.get('tasks', {}).items():
+        tasks.append({
+            "id": task_name,
+            "name": task_name.replace('_', ' ').title(),
+            "max_duration": config.get('max_episode_length', 0),
+            "pretrain": config.get('pretrain', {}),
+            "finetune": config.get('finetune', {})
+        })
+    return tasks
+
+@app.post("/api/episode/task")
+async def assign_task(req: dict):
+    filename = req.get("filename")
+    task_id_str = req.get("task_id")
+    
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    # Task IDs are indices in the recap config task keys
+    task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
+    try:
+        task_idx = task_keys.index(task_id_str)
+    except ValueError:
+        return {"error": f"Task {task_id_str} not found in config"}
+
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_id', torch.tensor(task_idx))
+    REPLAY_BUFFER.flush()
+    
+    return {"status": "ok"}
+
 @app.get("/api/videos", response_model=List[VideoInfo])
 async def list_videos():
     videos = []
@@ -166,9 +213,14 @@ async def get_all_labels():
     
     # Return mapping of filename to its current label status
     result = {}
+    task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
+    
     for filename, episode_id in VIDEO_TO_EPISODE.items():
         task_completed = REPLAY_BUFFER.meta_data['task_completed'][episode_id].item()
         marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
+        task_idx = REPLAY_BUFFER.meta_data['task_id'][episode_id].item()
+        
+        task_id = task_keys[task_idx] if 0 <= task_idx < len(task_keys) else None
         
         if task_completed != -1:
             # Also get returns if they exist
@@ -179,7 +231,15 @@ async def get_all_labels():
             result[filename] = {
                 "task_completed": task_completed,
                 "marked_timestep": marked_timestep,
+                "task_id": task_id,
                 "returns": returns
+            }
+        elif task_id:
+            result[filename] = {
+                "task_completed": -1,
+                "marked_timestep": -1,
+                "task_id": task_id,
+                "returns": []
             }
     return result
 
@@ -197,12 +257,10 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'fail', False)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_completed', -1)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', -1)
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_id', torch.tensor(-1))
     
     # Reset returns to NaN
     REPLAY_BUFFER.data['returns'][episode_id] = float('nan')
-    
-    # Optional: also clear reward at the marked timestep if we wanted to be thorough
-    # but since task_completed is -1, it's effectively reset.
     
     REPLAY_BUFFER.flush()
     return {"status": "ok"}
@@ -229,12 +287,20 @@ async def label_video(req: LabelRequest):
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', req.timestep)
     
     # Calculate returns
-  
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
     returns = torch.full((timesteps,), float('nan'))
     
+    # Get max duration for normalization
+    task_idx = REPLAY_BUFFER.meta_data['task_id'][episode_id].item()
+    task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
+    max_duration = 1.0
+    if 0 <= task_idx < len(task_keys):
+        task_key = task_keys[task_idx]
+        max_duration = RECAP_CONFIG['tasks'][task_key].get('max_episode_length', 1.0)
+
     for t in range(req.timestep + 1):
-        returns[t] = float(t - req.timestep)
+        # normalize by max duration
+        returns[t] = float(t - req.timestep) / max_duration
     
     REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
     
@@ -264,8 +330,16 @@ async def calculate_returns(req: dict):
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
     returns = torch.full((timesteps,), float('nan'))
     
+    # Get max duration for normalization
+    task_idx = REPLAY_BUFFER.meta_data['task_id'][episode_id].item()
+    task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
+    max_duration = 1.0
+    if 0 <= task_idx < len(task_keys):
+        task_key = task_keys[task_idx]
+        max_duration = RECAP_CONFIG['tasks'][task_key].get('max_episode_length', 1.0)
+
     for t in range(marked_timestep + 1):
-        returns[t] = float(t - marked_timestep)
+        returns[t] = float(t - marked_timestep) / max_duration
     
     REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
     REPLAY_BUFFER.flush()

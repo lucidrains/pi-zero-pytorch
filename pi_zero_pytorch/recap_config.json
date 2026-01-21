@@ -1,0 +1,70 @@
+{
+    "tasks": {
+        "laundry_tshirt_shorts": {
+            "max_episode_length": 200,
+            "pretrain": {
+                "advantage_lookahead": -1,
+                "positive_data_fraction": 0.30,
+                "percentile_cutoff": 70
+            },
+            "finetune": {
+                "advantage_lookahead": 50,
+                "positive_data_fraction": 0.10,
+                "percentile_cutoff": 90
+            }
+        },
+        "laundry_diverse": {
+            "max_episode_length": 500,
+            "pretrain": {
+                "advantage_lookahead": -1,
+                "positive_data_fraction": 0.30,
+                "percentile_cutoff": 70
+            },
+            "finetune": {
+                "advantage_lookahead": 50,
+                "positive_data_fraction": 0.40,
+                "percentile_cutoff": 60
+            }
+        },
+        "cafe_espresso": {
+            "max_episode_length": 200,
+            "pretrain": {
+                "advantage_lookahead": -1,
+                "positive_data_fraction": 0.30,
+                "percentile_cutoff": 70
+            },
+            "finetune": {
+                "advantage_lookahead": 50,
+                "positive_data_fraction": 0.40,
+                "percentile_cutoff": 60
+            }
+        },
+        "box_assembly": {
+            "max_episode_length": 600,
+            "pretrain": {
+                "advantage_lookahead": -1,
+                "positive_data_fraction": 0.30,
+                "percentile_cutoff": 70
+            },
+            "finetune": {
+                "advantage_lookahead": 50,
+                "positive_data_fraction": 0.40,
+                "percentile_cutoff": 60
+            }
+        },
+        "laundry_failure_removal_ablation": {
+            "max_episode_length": 200,
+            "pretrain": {
+                "advantage_lookahead": -1,
+                "positive_data_fraction": 0.30,
+                "percentile_cutoff": 70
+            },
+            "finetune": {
+                "advantage_lookahead": 50,
+                "positive_data_fraction": 0.40,
+                "percentile_cutoff": 60
+            }
+        }
+    },
+    "task_fail_penalty": -10
+}

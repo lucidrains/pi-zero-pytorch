@@ -11,9 +11,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const timelineContainer = document.getElementById('frame-timeline');
     const resetBtn = document.getElementById('reset-btn');
     const calcReturnsBtn = document.getElementById('calc-returns-btn');
+    const taskList = document.getElementById('task-list');
 
     let videos = [];
     let labels = {}; // filename -> {task_completed, marked_timestep}
+    let tasks = [];
     let activeVideo = null;
 
     // Penalty sync
@@ -55,32 +57,22 @@ document.addEventListener('DOMContentLoaded', () => {
     // Calc Returns
     calcReturnsBtn.onclick = async () => {
         if (!activeVideo) return;
-        try {
-            const response = await fetch('/api/returns/calculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: activeVideo.filename })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                labels[activeVideo.filename].returns = data.returns;
-                renderTimeline(activeVideo.frames, activeVideo.filename);
-            }
-        } catch (error) {
-            console.error('Calculation failed:', error);
-        }
+        await calculateReturns(activeVideo.filename);
     };
 
     async function fetchData() {
         try {
-            const [videoRes, labelRes] = await Promise.all([
+            const [videoRes, labelRes, taskRes] = await Promise.all([
                 fetch('/api/videos'),
-                fetch('/api/labels')
+                fetch('/api/labels'),
+                fetch('/api/tasks')
             ]);
             videos = await videoRes.json();
             labels = await labelRes.json();
+            tasks = await taskRes.json();
 
             renderList();
+            renderTasks();
 
             if (videos.length > 0) {
                 playVideo(videos[0]);
@@ -102,6 +94,95 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function renderTasks() {
+        taskList.innerHTML = '';
+        const activeLabel = activeVideo ? labels[activeVideo.filename] : null;
+        const isAssignable = !!activeVideo;
+
+        tasks.forEach(task => {
+            const div = document.createElement('div');
+            const isActive = activeLabel && activeLabel.task_id === task.id;
+            div.className = `task-item ${isActive ? 'active' : ''} ${isAssignable ? 'assignable' : ''}`;
+
+            div.innerHTML = `
+                <div class="task-header">
+                    <div class="task-name emphasis">${task.name}</div>
+                </div>
+                <div class="task-details">
+                    <div class="task-field">
+                        <div class="task-label">Max Duration</div>
+                        <div class="task-value">${task.max_duration} frames</div>
+                    </div>
+                </div>
+                <div class="task-footer">
+                    <div class="task-slug">${task.id}</div>
+                </div>
+                <button class="btn-assign" onclick="event.stopPropagation(); assignTask('${task.id}')">
+                    ${isActive ? 'Re-assign' : 'Assign to Episode'}
+                </button>
+            `;
+            taskList.appendChild(div);
+        });
+    }
+
+    async function assignTask(taskId) {
+        if (!activeVideo) return;
+        try {
+            const response = await fetch('/api/episode/task', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: activeVideo.filename, task_id: taskId })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                if (!labels[activeVideo.filename]) {
+                    labels[activeVideo.filename] = {
+                        task_completed: -1,
+                        marked_timestep: -1,
+                        returns: []
+                    };
+                }
+                labels[activeVideo.filename].task_id = taskId;
+
+                renderList(); // Refresh sidebar to show slug
+
+                // If it was already labelled, we might want to re-calculate returns since normalization might change
+                if (labels[activeVideo.filename].marked_timestep !== -1) {
+                    await calculateReturns(activeVideo.filename);
+                } else {
+                    renderTasks();
+                }
+            }
+        } catch (error) {
+            console.error('Task assignment failed:', error);
+        }
+    }
+
+    // Export assignTask to window so onclick works
+    window.assignTask = assignTask;
+
+    async function calculateReturns(filename) {
+        try {
+            const response = await fetch('/api/returns/calculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                if (labels[filename]) {
+                    labels[filename].returns = data.returns;
+                }
+                if (activeVideo && activeVideo.filename === filename) {
+                    renderTimeline(activeVideo.frames, activeVideo.filename);
+                    renderTasks();
+                }
+            }
+        } catch (error) {
+            console.error('Calculation failed:', error);
+        }
+    }
+
     function renderList() {
         videoList.innerHTML = '';
         videos.forEach((video) => {
@@ -116,8 +197,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const li = document.createElement('li');
             li.className = 'video-item';
             li.dataset.filename = video.filename;
+            li.onclick = () => playVideo(video, li);
+
+            const taskTag = label && label.task_id
+                ? `<span class="task-tag" title="${label.task_id}">${label.task_id}</span>`
+                : '';
+
             li.innerHTML = `
-                <span class="item-name">${video.filename}</span>
+                <span class="item-name">${video.filename} ${taskTag}</span>
                 ${statusHtml}
             `;
             li.onclick = () => playVideo(video, li);
@@ -139,6 +226,10 @@ document.addEventListener('DOMContentLoaded', () => {
         timelineContainer.innerHTML = '';
         const label = labels[filename];
 
+        // Find max absolute return for visualization scaling if needed, 
+        // but the user said "divide by max episode length" which for GAE-like 
+        // (t - marked_timestep) / max_duration results in negative values.
+
         for (let i = 0; i < numFrames; i++) {
             const box = document.createElement('div');
             box.className = 'frame-box';
@@ -147,7 +238,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 const ret = label.returns[i];
                 if (ret !== null && !isNaN(ret)) {
                     const isSuccess = label.task_completed === 1;
-                    const intensity = Math.max(0.1, 1 + ret / 100); // Fade over 100 frames
+
+                    // The returns are now normalized (e.g., -0.5 meaning half way to goal)
+                    // We need to adjust intensity logic. Original was 1 + ret / 100.
+                    // If ret is normalized, we might want to use a different scale.
+                    // Let's assume ret ranges from -1 to 0.
+                    const intensity = Math.max(0.1, 1 + ret);
 
                     if (isSuccess) {
                         box.style.backgroundColor = `rgba(34, 197, 94, ${intensity})`;
@@ -155,7 +251,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         box.style.backgroundColor = `rgba(239, 68, 68, ${intensity})`;
                     }
 
-                    box.title = `Return: ${ret.toFixed(2)}`;
+                    box.title = `Return: ${ret.toFixed(4)}`;
 
                     if (ret === 0) {
                         box.classList.add(isSuccess ? 'success' : 'fail');
@@ -242,11 +338,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 labels[filename] = {
                     task_completed: success ? 1 : 0,
                     marked_timestep: timestep,
+                    task_id: labels[filename]?.task_id, // preserve task_id
                     returns: data.returns
                 };
                 updateHeaderStatus(filename);
                 renderList();
                 renderTimeline(activeVideo.frames, filename);
+                renderTasks(); // update assign buttons visibility
 
                 if (activeVideo && activeVideo.filename === filename) {
                     const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
@@ -289,6 +387,14 @@ document.addEventListener('DOMContentLoaded', () => {
             statusIcon.innerHTML = '';
             timeLabel.style.display = 'none';
         }
+
+        const taskBadge = document.getElementById('current-task');
+        if (label && label.task_id) {
+            taskBadge.textContent = label.task_id;
+            taskBadge.style.display = 'inline-block';
+        } else {
+            taskBadge.style.display = 'none';
+        }
     }
 
     function playVideo(video, element) {
@@ -312,6 +418,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         updateHeaderStatus(video.filename);
         renderTimeline(video.frames, video.filename);
+        renderTasks();
         fetchFrames(video.filename);
     }
 

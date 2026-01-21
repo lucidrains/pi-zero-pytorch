@@ -137,6 +137,18 @@ header {
     font-weight: 600;
 }
 
+.task-badge {
+    background: rgba(56, 189, 248, 0.15);
+    color: var(--accent-color);
+    border: 1px solid var(--accent-color);
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    font-family: monospace;
+    display: none;
+}
+
 .tiny-label {
     background: rgba(255, 255, 255, 0.1);
     color: var(--text-secondary);
@@ -172,6 +184,13 @@ main {
 .sidebar {
     width: var(--sidebar-width);
     border-right: 1px solid var(--glass-border);
+    padding: 1.5rem;
+    overflow-y: auto;
+}
+
+.task-sidebar {
+    width: var(--sidebar-width);
+    border-left: 1px solid var(--glass-border);
     padding: 1.5rem;
     overflow-y: auto;
 }
@@ -231,6 +250,131 @@ main {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.task-tag {
+    font-size: 0.6rem;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid var(--glass-border);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: monospace;
+    max-width: 100px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.task-item {
+    padding: 1.25rem;
+    margin-bottom: 1rem;
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--glass-border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    transition: all 0.2s ease;
+}
+
+.task-item:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.task-item.active {
+    border-color: var(--accent-color);
+    background: rgba(56, 189, 248, 0.05);
+}
+
+.task-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.task-footer {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 4px;
+}
+
+.task-slug {
+    font-size: 0.65rem;
+    color: var(--text-secondary);
+    font-family: monospace;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 2px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--glass-border);
+}
+
+.task-name {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.2;
+}
+
+.task-name.emphasis {
+    color: var(--accent-color);
+}
+
+.task-details {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.task-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.task-label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    font-weight: 600;
+}
+
+.task-value {
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    background: rgba(0, 0, 0, 0.2);
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--glass-border);
+}
+
+.btn-assign {
+    margin-top: 0.5rem;
+    width: 100%;
+    background: rgba(56, 189, 248, 0.1);
+    border: 1px solid var(--accent-color);
+    color: var(--accent-color);
+    padding: 6px;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: none;
+    /* Hidden by default */
+}
+
+.btn-assign:hover {
+    background: var(--accent-color);
+    color: #000;
+}
+
+.task-item.assignable .btn-assign {
+    display: block;
 }
 
 .main-content {

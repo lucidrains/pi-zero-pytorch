@@ -61,6 +61,8 @@ from accelerate import Accelerator
 
 from pydantic import BaseModel, Field, model_validator
 
+import json
+
 from torch_einops_utils import (
     maybe,
     pad_right_ndim,
@@ -3290,76 +3292,10 @@ class RecapConfig(BaseModel):
     tasks: dict[str, TaskConfig]
     task_fail_penalty: float
 
-DEFAULT_RECAP_CONFIG = dict(
-    tasks = dict(
-        laundry_tshirt_shorts = dict(
-            max_episode_length = 200,
-            pretrain = dict(
-                advantage_lookahead = -1,
-                positive_data_fraction = 0.30,
-                percentile_cutoff = 70
-            ),
-            finetune = dict(
-                advantage_lookahead = 50,
-                positive_data_fraction = 0.10,
-                percentile_cutoff = 90
-            )
-        ),
-        laundry_diverse = dict(
-            max_episode_length = 500,
-            pretrain = dict(
-                advantage_lookahead = -1,
-                positive_data_fraction = 0.30,
-                percentile_cutoff = 70
-            ),
-            finetune = dict(
-                advantage_lookahead = 50,
-                positive_data_fraction = 0.40,
-                percentile_cutoff = 60
-            )
-        ),
-        cafe_espresso = dict(
-            max_episode_length = 200,
-            pretrain = dict(
-                advantage_lookahead = -1,
-                positive_data_fraction = 0.30,
-                percentile_cutoff = 70
-            ),
-            finetune = dict(
-                advantage_lookahead = 50,
-                positive_data_fraction = 0.40,
-                percentile_cutoff = 60
-            )
-        ),
-        box_assembly = dict(
-            max_episode_length = 600,
-            pretrain = dict(
-                advantage_lookahead = -1,
-                positive_data_fraction = 0.30,
-                percentile_cutoff = 70
-            ),
-            finetune = dict(
-                advantage_lookahead = 50,
-                positive_data_fraction = 0.40,
-                percentile_cutoff = 60
-            )
-        ),
-        laundry_failure_removal_ablation = dict(
-            max_episode_length = 200,
-            pretrain = dict(
-                advantage_lookahead = -1,
-                positive_data_fraction = 0.30,
-                percentile_cutoff = 70
-            ),
-            finetune = dict(
-                advantage_lookahead = 50,
-                positive_data_fraction = 0.40,
-                percentile_cutoff = 60
-            )
-        )
-    ),
-    task_fail_penalty = -10  # they use a big negative constant for failures, when labeling the experiences - value network is bounded from -1. to 0 anyways so it works out
-)
+# recap config
+
+with open(Path(__file__).parent / 'recap_config.json') as f:
+    DEFAULT_RECAP_CONFIG = json.load(f)
 
 class PiZeroSix(Module):
     def __init__(

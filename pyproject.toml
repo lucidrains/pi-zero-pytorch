@@ -102,3 +102,4 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["pi_zero_pytorch"]
+artifacts = ["pi_zero_pytorch/*.json"]
