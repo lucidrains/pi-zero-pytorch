@@ -4,21 +4,39 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentFilename = document.getElementById('current-filename');
     const currentFrames = document.getElementById('current-frames');
     const carouselTrack = document.getElementById('carousel-track');
+    const statusIcon = document.getElementById('label-status-icon');
+    const timeLabel = document.getElementById('label-time-container');
+    const penaltyInput = document.getElementById('fail-penalty-input');
+    const penaltySlider = document.getElementById('fail-penalty-slider');
 
     let videos = [];
+    let labels = {}; // filename -> {task_completed, marked_timestep}
+    let activeVideo = null;
 
-    async function fetchVideos() {
+    // Penalty sync
+    penaltyInput.oninput = () => {
+        penaltySlider.value = penaltyInput.value;
+    };
+    penaltySlider.oninput = () => {
+        penaltyInput.value = penaltySlider.value;
+    };
+
+    async function fetchData() {
         try {
-            const response = await fetch('/api/videos');
-            videos = await response.json();
+            const [videoRes, labelRes] = await Promise.all([
+                fetch('/api/videos'),
+                fetch('/api/labels')
+            ]);
+            videos = await videoRes.json();
+            labels = await labelRes.json();
+
             renderList();
 
-            // Auto play first video if available
             if (videos.length > 0) {
                 playVideo(videos[0]);
             }
         } catch (error) {
-            console.error('Failed to fetch videos:', error);
+            console.error('Failed to fetch data:', error);
         }
     }
 
@@ -27,7 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch(`/api/video/${filename}/frames`);
             const data = await response.json();
-            renderCarousel(data.frames);
+            renderCarousel(data.frames, filename);
         } catch (error) {
             console.error('Failed to fetch frames:', error);
             carouselTrack.innerHTML = '<div class="error">Error loading frames</div>';
@@ -36,69 +54,151 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderList() {
         videoList.innerHTML = '';
-        videos.forEach((video, index) => {
+        videos.forEach((video) => {
+            const label = labels[video.filename];
+            let statusHtml = '';
+            if (label) {
+                statusHtml = label.task_completed === 1
+                    ? '<span class="video-status-icon status-success">✓</span>'
+                    : '<span class="video-status-icon status-fail">✗</span>';
+            }
+
             const li = document.createElement('li');
             li.className = 'video-item';
-            li.innerHTML = `<span class="item-name">${video.filename}</span>`;
+            li.dataset.filename = video.filename;
+            li.innerHTML = `
+                <span class="item-name">${video.filename}</span>
+                ${statusHtml}
+            `;
             li.onclick = () => playVideo(video, li);
             videoList.appendChild(li);
         });
+
+        // Maintain active state in list
+        if (activeVideo) {
+            const items = document.querySelectorAll('.video-item');
+            items.forEach(item => {
+                if (item.dataset.filename === activeVideo.filename) {
+                    item.classList.add('active');
+                }
+            });
+        }
     }
 
-    function renderCarousel(frames) {
+    function renderCarousel(frames, filename) {
         carouselTrack.innerHTML = '';
+        const label = labels[filename];
+
         frames.forEach((frameUrl, index) => {
             const card = document.createElement('div');
             card.className = 'frame-card';
 
+            const isActiveSuccess = label && label.task_completed === 1 && label.marked_timestep === index;
+            const isActiveFail = label && label.task_completed === 0 && label.marked_timestep === index;
+
             card.innerHTML = `
                 <img src="${frameUrl}" alt="Frame ${index}">
                 <div class="labeller-btns">
-                    <button class="btn btn-up" title="Good">👍</button>
-                    <button class="btn btn-down" title="Bad">👎</button>
+                    <button class="btn btn-up ${isActiveSuccess ? 'active' : ''}" title="Success">✓</button>
+                    <button class="btn btn-down ${isActiveFail ? 'active' : ''}" title="Failure">✗</button>
                 </div>
             `;
 
             const upBtn = card.querySelector('.btn-up');
             const downBtn = card.querySelector('.btn-down');
 
-            upBtn.onclick = () => {
-                upBtn.classList.toggle('active');
-                downBtn.classList.remove('active');
+            upBtn.onclick = async () => {
+                await labelFrame(filename, index, true);
             };
 
-            downBtn.onclick = () => {
-                downBtn.classList.toggle('active');
-                upBtn.classList.remove('active');
+            downBtn.onclick = async () => {
+                await labelFrame(filename, index, false);
             };
 
             carouselTrack.appendChild(card);
         });
     }
 
+    async function labelFrame(filename, timestep, success) {
+        const penalty = parseFloat(penaltyInput.value);
+        try {
+            const response = await fetch('/api/label', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename, timestep, success, penalty })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                labels[filename] = { task_completed: success ? 1 : 0, marked_timestep: timestep };
+                updateHeaderStatus(filename);
+                renderList();
+                // We re-render carousel to update active button
+                // but we should ideally just toggle classes for performance
+                // For now, let's refresh frames if visible
+                if (activeVideo && activeVideo.filename === filename) {
+                    const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
+                    frames.forEach((f, i) => {
+                        const up = f.querySelector('.btn-up');
+                        const down = f.querySelector('.btn-down');
+                        if (i === timestep) {
+                            if (success) {
+                                up.classList.add('active');
+                                down.classList.remove('active');
+                            } else {
+                                down.classList.add('active');
+                                up.classList.remove('active');
+                            }
+                        } else {
+                            up.classList.remove('active');
+                            down.classList.remove('active');
+                        }
+                    });
+                }
+            }
+        } catch (error) {
+            console.error('Labelling failed:', error);
+        }
+    }
+
+    function updateHeaderStatus(filename) {
+        const label = labels[filename];
+        if (label) {
+            if (label.task_completed === 1) {
+                statusIcon.innerHTML = '✓';
+                statusIcon.className = 'status-success';
+            } else {
+                statusIcon.innerHTML = '✗';
+                statusIcon.className = 'status-fail';
+            }
+            timeLabel.textContent = `T=${label.marked_timestep}`;
+            timeLabel.style.display = 'inline-block';
+        } else {
+            statusIcon.innerHTML = '';
+            timeLabel.style.display = 'none';
+        }
+    }
+
     function playVideo(video, element) {
-        // Update active class
+        activeVideo = video;
         document.querySelectorAll('.video-item').forEach(el => el.classList.remove('active'));
         if (element) {
             element.classList.add('active');
         } else {
-            // find by filename if element not provided (initial load)
             const items = document.querySelectorAll('.video-item');
-            const idx = videos.findIndex(v => v.filename === video.filename);
-            if (idx !== -1 && items[idx]) items[idx].classList.add('active');
+            items.forEach(item => {
+                if (item.dataset.filename === video.filename) item.classList.add('active');
+            });
         }
 
-        // Update player
         player.src = video.url;
         player.play();
 
-        // Update info
         currentFilename.textContent = video.filename;
         currentFrames.textContent = `${video.frames} frames`;
 
-        // Load frames
+        updateHeaderStatus(video.filename);
         fetchFrames(video.filename);
     }
 
-    fetchVideos();
+    fetchData();
 });

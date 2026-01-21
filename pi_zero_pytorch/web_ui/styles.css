@@ -59,7 +59,40 @@ header {
 .video-info {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: 0.75rem;
+}
+
+.penalty-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 0.5rem 1rem;
+    border-radius: 12px;
+    border: 1px solid var(--glass-border);
+}
+
+.penalty-controls label {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    font-weight: 600;
+}
+
+#fail-penalty-input {
+    width: 60px;
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    padding: 2px 4px;
+    font-size: 0.9rem;
+    text-align: center;
+}
+
+#fail-penalty-slider {
+    width: 120px;
+    cursor: pointer;
 }
 
 #current-filename {
@@ -74,6 +107,15 @@ header {
     border-radius: 20px;
     font-size: 0.8rem;
     font-weight: 600;
+}
+
+.tiny-label {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-secondary);
+    padding: 1px 8px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-family: monospace;
 }
 
 main {
@@ -109,6 +151,21 @@ main {
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid transparent;
     transition: all 0.2s ease;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.video-status-icon {
+    font-size: 0.9rem;
+}
+
+.status-success {
+    color: #22c55e;
+}
+
+.status-fail {
+    color: #ef4444;
 }
 
 .video-item:hover {
@@ -124,7 +181,7 @@ main {
 }
 
 .item-name {
-    display: block;
+    flex: 1;
     font-size: 0.95rem;
     white-space: nowrap;
     overflow: hidden;

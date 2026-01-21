@@ -16,8 +16,15 @@
         <header>
             <div class="logo">π0 Labeller</div>
             <div id="video-info" class="video-info">
+                <span id="label-status-icon"></span>
                 <span class="filename" id="current-filename">Select a video</span>
                 <span class="badge" id="current-frames">0 frames</span>
+                <span id="label-time-container" class="tiny-label"></span>
+            </div>
+            <div class="penalty-controls">
+                <label for="fail-penalty">Penalty:</label>
+                <input type="number" id="fail-penalty-input" value="-50" step="1">
+                <input type="range" id="fail-penalty-slider" min="-200" max="0" value="-50">
             </div>
         </header>
 
