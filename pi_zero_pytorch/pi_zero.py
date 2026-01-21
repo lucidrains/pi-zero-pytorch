@@ -1433,7 +1433,11 @@ class PiZero(Module):
         self.num_tasks = num_tasks
         self.has_task_cond = exists(num_tasks) and num_tasks > 0
 
-        self.task_emb = nn.Embedding(num_tasks, dim) if self.has_task_cond else None
+        if self.has_task_cond:
+            self.task_emb = nn.Embedding(num_tasks, dim)
+            
+            # Add a Null Task Token
+            self.null_task_token = nn.Parameter(torch.randn(dim))
 
         # to task status prediction
 
@@ -1489,6 +1493,8 @@ class PiZero(Module):
 
         self.reward_tokens_dropout_prob = reward_tokens_dropout_prob
 
+        self.null_reward_token = nn.Parameter(torch.randn(dim))
+        
         # advantage tokens and cfg related
 
         self.num_advantage_tokens = num_advantage_tokens
@@ -1496,6 +1502,7 @@ class PiZero(Module):
 
         if self.can_advantage_token_cond:
             self.advantage_embed = nn.Embedding(num_advantage_tokens, dim)
+            self.null_advantage_token = nn.Parameter(torch.randn(dim))
 
         self.advantage_tokens_dropout_prob = 0.
 
@@ -2377,37 +2384,41 @@ class PiZero(Module):
             # maybe reward tokens
 
             if not exists(reward_tokens):
-                reward_tokens = empty_token
+                reward_tokens = repeat(self.null_reward_token, 'd -> b 1 d', b = batch)
 
             # maybe advantage tokens
 
-            if exists(advantage_ids):
-                assert self.can_advantage_token_cond
+            if self.can_advantage_token_cond:
+                if exists(advantage_ids):
+                    if isinstance(advantage_ids, int):
+                        advantage_ids = full((batch,), advantage_ids, device = self.device)
 
-                if isinstance(advantage_ids, int):
-                    advantage_ids = full((batch,), advantage_ids, device = self.device)
-
-                advantage_tokens = self.advantage_embed(advantage_ids)
+                    advantage_tokens = self.advantage_embed(advantage_ids)
+                else:
+                    advantage_tokens = repeat(self.null_advantage_token, 'd -> b 1 d', b = batch)
             else:
                 advantage_tokens = empty_token
 
             # maybe dropout reward or advantage tokens for cfg
 
             if self.training and sample(self.reward_tokens_dropout_prob):
-                reward_tokens = empty_token
+                reward_tokens = repeat(self.null_reward_token, 'd -> b 1 d', b = batch)
 
             if self.training and sample(self.advantage_tokens_dropout_prob):
-                advantage_tokens = empty_token
+                advantage_tokens = repeat(self.null_advantage_token, 'd -> b 1 d', b = batch)
 
             # maybe task token
 
-            task_token = empty_token
+            if self.has_task_cond:
+                if exists(task_id):
+                    if isinstance(task_id, int):
+                        task_id = full((batch,), task_id, device = self.device)
+                    task_token = self.task_emb(task_id)
+                else:
+                    task_token = repeat(self.null_task_token, 'd -> b 1 d', b = batch)
 
-            if self.has_task_cond and exists(task_id):
-                if isinstance(task_id, int):
-                    task_id = full((batch,), task_id, device = self.device)
-
-                task_token = self.task_emb(task_id)
+            else:
+                task_token = empty_token
 
             # handle maybe discretized action prediction
 
