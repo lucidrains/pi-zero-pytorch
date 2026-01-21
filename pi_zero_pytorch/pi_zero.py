@@ -2386,15 +2386,16 @@ class PiZero(Module):
 
             # maybe advantage tokens
 
-            if exists(advantage_ids):
-                assert self.can_advantage_token_cond
+            if self.can_advantage_token_cond:
+                if exists(advantage_ids):
+                    if isinstance(advantage_ids, int):
+                        advantage_ids = full((batch,), advantage_ids, device = self.device)
 
-                if isinstance(advantage_ids, int):
-                    advantage_ids = full((batch,), advantage_ids, device = self.device)
-
-                advantage_tokens = self.advantage_embed(advantage_ids)
+                    advantage_tokens = self.advantage_embed(advantage_ids)
+                else:
+                    advantage_tokens = repeat(self.null_advantage_token, 'd -> b 1 d', b = batch)
             else:
-                advantage_tokens = repeat(self.null_advantage_token, 'd -> b 1 d', b = batch)
+                advantage_tokens = empty_token
 
             # maybe dropout reward or advantage tokens for cfg
 
