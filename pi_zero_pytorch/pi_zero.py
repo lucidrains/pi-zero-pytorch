@@ -4260,6 +4260,18 @@ class PiZeroSix(Module):
             datapoint = True
         )
 
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'task_completed',
+            datapoint = 0
+        )
+
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'marked_timestep',
+            datapoint = timestep
+        )
+
         return experiences
 
     @beartype
@@ -4287,6 +4299,18 @@ class PiZeroSix(Module):
             episode_id,
             name = 'fail',
             datapoint = False
+        )
+
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'task_completed',
+            datapoint = 1
+        )
+
+        experiences.store_meta_datapoint(
+            episode_id,
+            name = 'marked_timestep',
+            datapoint = timestep
         )
 
         return experiences
@@ -4362,10 +4386,12 @@ class PiZeroSix(Module):
             max_timesteps = steps,
             overwrite = True,
             meta_fields = dict(
-                task_id     = ('int', (), -1),
-                fail        = 'bool',
-                invalidated = 'bool',
-                recap_step  = ('int', (), -1) # -1 stands for base pretraining dataset
+                task_id        = ('int', (), -1),
+                fail           = 'bool',
+                task_completed = ('int', (), -1),
+                marked_timestep = ('int', (), -1),
+                invalidated    = 'bool',
+                recap_step     = ('int', (), -1) # -1 stands for base pretraining dataset
             ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),
