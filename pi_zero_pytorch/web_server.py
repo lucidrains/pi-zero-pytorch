@@ -12,6 +12,7 @@ import numpy as np
 import shutil
 from typing import List
 from memmap_replay_buffer import ReplayBuffer
+from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate
 
 app = FastAPI()
 
@@ -98,7 +99,8 @@ def init_replay_buffer(video_dir: Path):
         ),
         fields = dict(
             images = ('float', (c, 1, h, w)), # matching (c, num_images, h, w) pattern
-            reward = 'float'
+            reward = 'float',
+            returns = ('float', (), float('nan'))
         )
     )
 
@@ -169,9 +171,15 @@ async def get_all_labels():
         marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
         
         if task_completed != -1:
+            # Also get returns if they exist
+            returns = REPLAY_BUFFER.data['returns'][episode_id].tolist()
+            # replace nan with None for JSON compliance
+            returns = [r if not np.isnan(r) else None for r in returns]
+            
             result[filename] = {
                 "task_completed": task_completed,
-                "marked_timestep": marked_timestep
+                "marked_timestep": marked_timestep,
+                "returns": returns
             }
     return result
 
@@ -189,6 +197,9 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'fail', False)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_completed', -1)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', -1)
+    
+    # Reset returns to NaN
+    REPLAY_BUFFER.data['returns'][episode_id] = float('nan')
     
     # Optional: also clear reward at the marked timestep if we wanted to be thorough
     # but since task_completed is -1, it's effectively reset.
@@ -217,8 +228,52 @@ async def label_video(req: LabelRequest):
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_completed', 0)
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', req.timestep)
     
+    # Calculate returns
+  
+    timesteps = REPLAY_BUFFER.data['returns'].shape[1]
+    returns = torch.full((timesteps,), float('nan'))
+    
+    for t in range(req.timestep + 1):
+        returns[t] = float(t - req.timestep)
+    
+    REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
+    
     REPLAY_BUFFER.flush()
-    return {"status": "ok"}
+    
+    returns_list = returns.tolist()
+    returns_list = [r if not np.isnan(r) else None for r in returns_list]
+    
+    return {"status": "ok", "returns": returns_list}
+
+@app.post("/api/returns/calculate")
+async def calculate_returns(req: dict):
+    filename = req.get("filename")
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    task_completed = REPLAY_BUFFER.meta_data['task_completed'][episode_id].item()
+    marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
+
+    if task_completed == -1:
+        return {"error": "Video not labelled yet"}
+
+    timesteps = REPLAY_BUFFER.data['returns'].shape[1]
+    returns = torch.full((timesteps,), float('nan'))
+    
+    for t in range(marked_timestep + 1):
+        returns[t] = float(t - marked_timestep)
+    
+    REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
+    REPLAY_BUFFER.flush()
+    
+    returns_list = returns.tolist()
+    returns_list = [r if not np.isnan(r) else None for r in returns_list]
+    
+    return {"status": "ok", "returns": returns_list}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():

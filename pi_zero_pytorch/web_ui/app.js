@@ -10,6 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const penaltySlider = document.getElementById('fail-penalty-slider');
     const timelineContainer = document.getElementById('frame-timeline');
     const resetBtn = document.getElementById('reset-btn');
+    const calcReturnsBtn = document.getElementById('calc-returns-btn');
 
     let videos = [];
     let labels = {}; // filename -> {task_completed, marked_timestep}
@@ -48,6 +49,25 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (error) {
             console.error('Reset failed:', error);
+        }
+    };
+
+    // Calc Returns
+    calcReturnsBtn.onclick = async () => {
+        if (!activeVideo) return;
+        try {
+            const response = await fetch('/api/returns/calculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: activeVideo.filename })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                labels[activeVideo.filename].returns = data.returns;
+                renderTimeline(activeVideo.frames, activeVideo.filename);
+            }
+        } catch (error) {
+            console.error('Calculation failed:', error);
         }
     };
 
@@ -122,7 +142,26 @@ document.addEventListener('DOMContentLoaded', () => {
         for (let i = 0; i < numFrames; i++) {
             const box = document.createElement('div');
             box.className = 'frame-box';
-            if (label && label.marked_timestep === i) {
+
+            if (label && label.returns) {
+                const ret = label.returns[i];
+                if (ret !== null && !isNaN(ret)) {
+                    const isSuccess = label.task_completed === 1;
+                    const intensity = Math.max(0.1, 1 + ret / 100); // Fade over 100 frames
+
+                    if (isSuccess) {
+                        box.style.backgroundColor = `rgba(34, 197, 94, ${intensity})`;
+                    } else {
+                        box.style.backgroundColor = `rgba(239, 68, 68, ${intensity})`;
+                    }
+
+                    box.title = `Return: ${ret.toFixed(2)}`;
+
+                    if (ret === 0) {
+                        box.classList.add(isSuccess ? 'success' : 'fail');
+                    }
+                }
+            } else if (label && label.marked_timestep === i) {
                 box.classList.add(label.task_completed === 1 ? 'success' : 'fail');
             }
 
@@ -200,7 +239,11 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
-                labels[filename] = { task_completed: success ? 1 : 0, marked_timestep: timestep };
+                labels[filename] = {
+                    task_completed: success ? 1 : 0,
+                    marked_timestep: timestep,
+                    returns: data.returns
+                };
                 updateHeaderStatus(filename);
                 renderList();
                 renderTimeline(activeVideo.frames, filename);
