@@ -175,6 +175,27 @@ async def get_all_labels():
             }
     return result
 
+@app.post("/api/label/reset")
+async def reset_label(req: dict):
+    filename = req.get("filename")
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    # Clear metadata
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'fail', False)
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_completed', -1)
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', -1)
+    
+    # Optional: also clear reward at the marked timestep if we wanted to be thorough
+    # but since task_completed is -1, it's effectively reset.
+    
+    REPLAY_BUFFER.flush()
+    return {"status": "ok"}
+
 @app.post("/api/label")
 async def label_video(req: LabelRequest):
     if REPLAY_BUFFER is None:

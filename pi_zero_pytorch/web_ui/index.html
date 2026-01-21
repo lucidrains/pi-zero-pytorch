@@ -14,7 +14,8 @@
 <body>
     <div class="glass-container">
         <header>
-            <div class="logo">π0 Labeller</div>
+            <div class="logo">π0 Labeller <button id="reset-btn" class="btn-reset" title="Reset labelling">↺</button>
+            </div>
             <div id="video-info" class="video-info">
                 <span id="label-status-icon"></span>
                 <span class="filename" id="current-filename">Select a video</span>
@@ -37,6 +38,7 @@
             </div>
 
             <div class="main-content">
+                <div id="frame-timeline" class="timeline-container"></div>
                 <div class="player-container">
                     <div class="video-wrapper">
                         <video id="main-player" controls>

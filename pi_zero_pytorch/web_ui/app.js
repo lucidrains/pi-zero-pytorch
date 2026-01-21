@@ -8,6 +8,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const timeLabel = document.getElementById('label-time-container');
     const penaltyInput = document.getElementById('fail-penalty-input');
     const penaltySlider = document.getElementById('fail-penalty-slider');
+    const timelineContainer = document.getElementById('frame-timeline');
+    const resetBtn = document.getElementById('reset-btn');
 
     let videos = [];
     let labels = {}; // filename -> {task_completed, marked_timestep}
@@ -19,6 +21,34 @@ document.addEventListener('DOMContentLoaded', () => {
     };
     penaltySlider.oninput = () => {
         penaltyInput.value = penaltySlider.value;
+    };
+
+    // Reset Label
+    resetBtn.onclick = async () => {
+        if (!activeVideo) return;
+        try {
+            const response = await fetch('/api/label/reset', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: activeVideo.filename })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                delete labels[activeVideo.filename];
+                updateHeaderStatus(activeVideo.filename);
+                renderList();
+                renderTimeline(activeVideo.frames, activeVideo.filename);
+
+                // Refresh carousel active states
+                const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
+                frames.forEach(f => {
+                    f.querySelector('.btn-up').classList.remove('active');
+                    f.querySelector('.btn-down').classList.remove('active');
+                });
+            }
+        } catch (error) {
+            console.error('Reset failed:', error);
+        }
     };
 
     async function fetchData() {
@@ -57,7 +87,7 @@ document.addEventListener('DOMContentLoaded', () => {
         videos.forEach((video) => {
             const label = labels[video.filename];
             let statusHtml = '';
-            if (label) {
+            if (label && label.task_completed !== -1) {
                 statusHtml = label.task_completed === 1
                     ? '<span class="video-status-icon status-success">✓</span>'
                     : '<span class="video-status-icon status-fail">✗</span>';
@@ -85,6 +115,42 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function renderTimeline(numFrames, filename) {
+        timelineContainer.innerHTML = '';
+        const label = labels[filename];
+
+        for (let i = 0; i < numFrames; i++) {
+            const box = document.createElement('div');
+            box.className = 'frame-box';
+            if (label && label.marked_timestep === i) {
+                box.classList.add(label.task_completed === 1 ? 'success' : 'fail');
+            }
+
+            box.onclick = () => {
+                jumpToFrame(i);
+            };
+            timelineContainer.appendChild(box);
+        }
+    }
+
+    function jumpToFrame(index) {
+        if (!activeVideo || !player.duration) return;
+
+        // Accurate seek using frames / duration ratio
+        const seekTime = (index / activeVideo.frames) * player.duration;
+        player.currentTime = seekTime;
+
+        // Autoscroll carousel
+        const cards = carouselTrack.querySelectorAll('.frame-card');
+        if (cards[index]) {
+            cards[index].scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+            // Highlight current frame in timeline
+            document.querySelectorAll('.frame-box').forEach((box, i) => {
+                box.classList.toggle('current', i === index);
+            });
+        }
+    }
+
     function renderCarousel(frames, filename) {
         carouselTrack.innerHTML = '';
         const label = labels[filename];
@@ -92,6 +158,7 @@ document.addEventListener('DOMContentLoaded', () => {
         frames.forEach((frameUrl, index) => {
             const card = document.createElement('div');
             card.className = 'frame-card';
+            card.dataset.index = index;
 
             const isActiveSuccess = label && label.task_completed === 1 && label.marked_timestep === index;
             const isActiveFail = label && label.task_completed === 0 && label.marked_timestep === index;
@@ -107,13 +174,17 @@ document.addEventListener('DOMContentLoaded', () => {
             const upBtn = card.querySelector('.btn-up');
             const downBtn = card.querySelector('.btn-down');
 
-            upBtn.onclick = async () => {
+            upBtn.onclick = async (e) => {
+                e.stopPropagation();
                 await labelFrame(filename, index, true);
             };
 
-            downBtn.onclick = async () => {
+            downBtn.onclick = async (e) => {
+                e.stopPropagation();
                 await labelFrame(filename, index, false);
             };
+
+            card.onclick = () => jumpToFrame(index);
 
             carouselTrack.appendChild(card);
         });
@@ -132,9 +203,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 labels[filename] = { task_completed: success ? 1 : 0, marked_timestep: timestep };
                 updateHeaderStatus(filename);
                 renderList();
-                // We re-render carousel to update active button
-                // but we should ideally just toggle classes for performance
-                // For now, let's refresh frames if visible
+                renderTimeline(activeVideo.frames, filename);
+
                 if (activeVideo && activeVideo.filename === filename) {
                     const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
                     frames.forEach((f, i) => {
@@ -162,7 +232,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateHeaderStatus(filename) {
         const label = labels[filename];
-        if (label) {
+        if (label && label.task_completed !== -1) {
             if (label.task_completed === 1) {
                 statusIcon.innerHTML = '✓';
                 statusIcon.className = 'status-success';
@@ -191,12 +261,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         player.src = video.url;
+        player.load();
         player.play();
 
         currentFilename.textContent = video.filename;
         currentFrames.textContent = `${video.frames} frames`;
 
         updateHeaderStatus(video.filename);
+        renderTimeline(video.frames, video.filename);
         fetchFrames(video.filename);
     }
 
