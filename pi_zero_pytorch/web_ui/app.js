@@ -18,6 +18,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const advantageChartContainer = document.getElementById('advantage-chart-container');
     const chartTooltip = document.getElementById('chart-tooltip');
 
+    const loadingOverlay = document.getElementById('loading-overlay');
+    const loadingStatus = document.getElementById('loading-status');
+    const loadingProgress = document.getElementById('loading-progress');
+    const loadingDetail = document.getElementById('loading-detail');
+
     const gaeGammaInput = document.getElementById('gae-gamma-input');
     const gaeGammaSlider = document.getElementById('gae-gamma-slider');
     const gaeLamInput = document.getElementById('gae-lam-input');
@@ -601,5 +606,29 @@ document.addEventListener('DOMContentLoaded', () => {
         fetchFrames(video.filename);
     }
 
-    fetchData();
+    async function checkConversionStatus() {
+        try {
+            const response = await fetch('/api/status');
+            const status = await response.json();
+
+            if (status.is_converting) {
+                loadingOverlay.classList.remove('hidden');
+                const percent = status.total > 0 ? (status.progress / status.total) * 100 : 0;
+                loadingProgress.style.width = `${percent}%`;
+                loadingStatus.textContent = `Converting videos... (${status.progress}/${status.total})`;
+                loadingDetail.textContent = status.current_video;
+
+                setTimeout(checkConversionStatus, 1000);
+            } else {
+                loadingOverlay.classList.add('hidden');
+                // Only fetch data once conversion is complete
+                await fetchData();
+            }
+        } catch (error) {
+            console.error('Failed to check status:', error);
+            setTimeout(checkConversionStatus, 2000);
+        }
+    }
+
+    checkConversionStatus();
 });

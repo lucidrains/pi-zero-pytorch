@@ -16,6 +16,14 @@ from memmap_replay_buffer import ReplayBuffer
 from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate, SigLIP, BinnedValueLayer
 import json
 import tqdm
+import threading
+
+CONVERSION_STATUS = {
+    "is_converting": False,
+    "progress": 0,
+    "total": 0,
+    "current_video": ""
+}
 
 recap_config_path = Path(__file__).parent / "recap_config.json"
 RECAP_CONFIG = {}
@@ -105,7 +113,10 @@ def extract_frames(video_path: Path, cache_path: Path):
     cap.release()
 
 def init_replay_buffer(video_dir: Path):
-    global REPLAY_BUFFER, VIDEO_TO_EPISODE
+    global REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS
+    
+    CONVERSION_STATUS["is_converting"] = True
+    CONVERSION_STATUS["progress"] = 0
     
     tmp_buffer_dir = Path("tmp/replay_buffer")
     if tmp_buffer_dir.exists():
@@ -154,8 +165,12 @@ def init_replay_buffer(video_dir: Path):
     )
 
     print(f"Initializing ReplayBuffer from {len(video_files)} videos...")
+    CONVERSION_STATUS["total"] = len(video_files)
 
     for i, video_path in enumerate(video_files):
+        CONVERSION_STATUS["current_video"] = video_path.name
+        CONVERSION_STATUS["progress"] = i
+        
         VIDEO_TO_EPISODE[video_path.name] = i
         cap = cv2.VideoCapture(str(video_path))
         
@@ -172,7 +187,13 @@ def init_replay_buffer(video_dir: Path):
                 REPLAY_BUFFER.store(images = frame_tensor, reward = 0.0)
         cap.release()
     
+    CONVERSION_STATUS["is_converting"] = False
+    CONVERSION_STATUS["progress"] = len(video_files)
     print("ReplayBuffer initialization complete.")
+
+@app.get("/api/status")
+async def get_status():
+    return CONVERSION_STATUS
 
 @app.get("/api/tasks")
 async def get_tasks():
@@ -521,8 +542,8 @@ def main(folder, port):
         print(f"Error: Folder {folder} does not exist.")
         return
 
-    # Initialize ReplayBuffer
-    init_replay_buffer(VIDEO_DIR)
+    # Initialize ReplayBuffer in background
+    threading.Thread(target=init_replay_buffer, args=(VIDEO_DIR,), daemon=True).start()
 
     # Initialize Value Network
     global VALUE_NETWORK
