@@ -1914,11 +1914,15 @@ class PiZero(Module):
 
         assert self.can_cfg, 'you need to train with reward token dropout'
 
+        uncond_kwargs = kwargs.copy()
+        uncond_kwargs.pop('advantage_ids', None)
+        uncond_kwargs.pop('task_id', None)
+
         action_flow_without_reward, without_reward_cache_kv = self.forward(
             *args,
             cached_state_keys_values = without_reward_cache,
             **forward_kwargs,
-            **kwargs
+            **uncond_kwargs
         )
 
         update = action_flow_with_reward - action_flow_without_reward
