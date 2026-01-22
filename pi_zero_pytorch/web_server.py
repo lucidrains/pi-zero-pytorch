@@ -8,12 +8,14 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from pydantic import BaseModel
 import torch
+import torchvision.transforms.functional as TF
 import numpy as np
 import shutil
 from typing import List
 from memmap_replay_buffer import ReplayBuffer
-from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate
+from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate, SigLIP, BinnedValueLayer
 import json
+import tqdm
 
 recap_config_path = Path(__file__).parent / "recap_config.json"
 RECAP_CONFIG = {}
@@ -21,6 +23,41 @@ if recap_config_path.exists():
     with open(recap_config_path) as f:
         RECAP_CONFIG = json.load(f)
 
+# small value network for introspecting on reward/returns in web server
+
+class SmallValueNetwork(torch.nn.Module):
+    def __init__(
+        self,
+        image_size = 224,
+        patch_size = 14,
+        dim = 256,
+        depth = 4,
+        heads = 8,
+        min_value = -1.,
+        max_value = 0.,
+        num_bins = 201
+    ):
+        super().__init__()
+
+        self.siglip = SigLIP(
+            image_size = image_size,
+            patch_size = patch_size,
+            dim = dim,
+            depth = depth,
+            heads = heads
+        )
+
+        self.to_value = BinnedValueLayer(
+            dim = dim,
+            min_value = min_value,
+            max_value = max_value,
+            num_bins = num_bins
+        )
+
+    def forward(self, images):
+        embeds = self.siglip(images)
+        pooled = embeds.mean(dim = 1)
+        return self.to_value(pooled)
 app = FastAPI()
 
 # will be set via CLI
@@ -28,6 +65,8 @@ VIDEO_DIR = Path(".")
 CACHE_DIR = Path(".cache/frames")
 REPLAY_BUFFER = None
 VIDEO_TO_EPISODE = {}
+VALUE_NETWORK = None
+DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
 class LabelRequest(BaseModel):
     filename: str
@@ -107,7 +146,8 @@ def init_replay_buffer(video_dir: Path):
         fields = dict(
             images = ('float', (c, 1, h, w)), # matching (c, num_images, h, w) pattern
             reward = 'float',
-            returns = ('float', (), float('nan'))
+            returns = ('float', (), float('nan')),
+            value = ('float', (), float('nan'))
         )
     )
 
@@ -239,8 +279,18 @@ async def get_all_labels():
                 "task_completed": -1,
                 "marked_timestep": -1,
                 "task_id": task_id,
-                "returns": []
+                "returns": [],
+                "value": []
             }
+
+    # Add value data if it exists
+    for filename, episode_id in VIDEO_TO_EPISODE.items():
+        if filename in result:
+            value = REPLAY_BUFFER.data['value'][episode_id].tolist()
+            # replace nan with None for JSON compliance
+            value = [v if not np.isnan(v) else None for v in value]
+            result[filename]["value"] = value
+
     return result
 
 @app.post("/api/label/reset")
@@ -259,8 +309,9 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', -1)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_id', torch.tensor(-1))
     
-    # Reset returns to NaN
+    # Reset returns and value to NaN
     REPLAY_BUFFER.data['returns'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     
     REPLAY_BUFFER.flush()
     return {"status": "ok"}
@@ -349,6 +400,59 @@ async def calculate_returns(req: dict):
     
     return {"status": "ok", "returns": returns_list}
 
+@app.post("/api/episode/value/calculate")
+async def calculate_episode_value(req: dict):
+    filename = req.get("filename")
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    if VALUE_NETWORK is None:
+        return {"error": "Value network not initialized"}
+
+    # Get images for this episode
+    # images shape: (max_episodes, max_timesteps, c, 1, h, w)
+    images = REPLAY_BUFFER.data['images'][episode_id] # (max_timesteps, c, 1, h, w)
+    
+    # We need to know the actual number of frames since max_timesteps might be larger
+    # Let's find out how many frames were actually stored by checking if we have non-zero images
+    # or better, use the get_frame_count or store the length
+    # For now, let's assume we can use the length of images which is max_timesteps, 
+    # but we should only process up to the actual frame count.
+    
+    # Let's get the video path to get the exact frame count
+    video_path = VIDEO_DIR / filename
+    num_frames = get_frame_count(video_path)
+    
+    values = []
+    VALUE_NETWORK.eval()
+    
+    batch_size = 8
+    with torch.no_grad():
+        for i in tqdm.tqdm(range(0, num_frames, batch_size)):
+            batch_images = images[i : i + batch_size]
+            batch_images = torch.from_numpy(batch_images).to(DEVICE)
+            # batch_images: (batch, c, 1, h, w) -> remove num_images dim for SigLIP/resize
+            batch_images = batch_images.squeeze(2)
+            
+            # Resize to 224x224 for SigLIP
+            if batch_images.shape[-2:] != (224, 224):
+                batch_images = TF.resize(batch_images, (224, 224), antialias = True)
+            
+            batch_values = VALUE_NETWORK(batch_images)
+            values.extend(batch_values.cpu().tolist())
+
+    # Store values back to replay buffer
+    final_values = torch.full((images.shape[0],), float('nan'))
+    final_values[:len(values)] = torch.tensor(values)
+    REPLAY_BUFFER.data['value'][episode_id] = final_values.numpy()
+    REPLAY_BUFFER.flush()
+
+    return {"status": "ok", "value": values}
+
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
     index_path = Path(__file__).parent / "web_ui" / "index.html"
@@ -367,6 +471,11 @@ def main(folder, port):
 
     # Initialize ReplayBuffer
     init_replay_buffer(VIDEO_DIR)
+
+    # Initialize Value Network
+    global VALUE_NETWORK
+    print(f"Initializing SmallValueNetwork on {DEVICE}...")
+    VALUE_NETWORK = SmallValueNetwork().to(DEVICE)
 
     # Mount the video directory to serve files
     app.mount("/videos", StaticFiles(directory=str(VIDEO_DIR)), name="videos")

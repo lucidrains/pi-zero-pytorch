@@ -11,7 +11,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const timelineContainer = document.getElementById('frame-timeline');
     const resetBtn = document.getElementById('reset-btn');
     const calcReturnsBtn = document.getElementById('calc-returns-btn');
+    const calcValueBtn = document.getElementById('calc-value-btn');
     const taskList = document.getElementById('task-list');
+    const chartContainer = document.getElementById('value-chart-container');
 
     let videos = [];
     let labels = {}; // filename -> {task_completed, marked_timestep}
@@ -58,6 +60,12 @@ document.addEventListener('DOMContentLoaded', () => {
     calcReturnsBtn.onclick = async () => {
         if (!activeVideo) return;
         await calculateReturns(activeVideo.filename);
+    };
+
+    // Calc Value
+    calcValueBtn.onclick = async () => {
+        if (!activeVideo) return;
+        await calculateValue(activeVideo.filename);
     };
 
     async function fetchData() {
@@ -183,6 +191,32 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    async function calculateValue(filename) {
+        calcValueBtn.disabled = true;
+        calcValueBtn.textContent = 'Calculating...';
+        try {
+            const response = await fetch('/api/episode/value/calculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                if (labels[filename]) {
+                    labels[filename].value = data.value;
+                }
+                if (activeVideo && activeVideo.filename === filename) {
+                    renderValueChart(filename, data.value);
+                }
+            }
+        } catch (error) {
+            console.error('Value calculation failed:', error);
+        } finally {
+            calcValueBtn.disabled = false;
+            calcValueBtn.textContent = 'Calc Value';
+        }
+    }
+
     function renderList() {
         videoList.innerHTML = '';
         videos.forEach((video) => {
@@ -221,14 +255,9 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
     }
-
     function renderTimeline(numFrames, filename) {
         timelineContainer.innerHTML = '';
         const label = labels[filename];
-
-        // Find max absolute return for visualization scaling if needed, 
-        // but the user said "divide by max episode length" which for GAE-like 
-        // (t - marked_timestep) / max_duration results in negative values.
 
         for (let i = 0; i < numFrames; i++) {
             const box = document.createElement('div');
@@ -238,11 +267,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 const ret = label.returns[i];
                 if (ret !== null && !isNaN(ret)) {
                     const isSuccess = label.task_completed === 1;
-
-                    // The returns are now normalized (e.g., -0.5 meaning half way to goal)
-                    // We need to adjust intensity logic. Original was 1 + ret / 100.
-                    // If ret is normalized, we might want to use a different scale.
-                    // Let's assume ret ranges from -1 to 0.
                     const intensity = Math.max(0.1, 1 + ret);
 
                     if (isSuccess) {
@@ -266,6 +290,48 @@ document.addEventListener('DOMContentLoaded', () => {
             };
             timelineContainer.appendChild(box);
         }
+    }
+
+    function renderValueChart(filename, values) {
+        if (!values || values.length === 0) {
+            chartContainer.innerHTML = '';
+            chartContainer.classList.remove('active');
+            return;
+        }
+
+        chartContainer.classList.add('active');
+        chartContainer.innerHTML = '';
+
+        // Filter out nulls/NaNs to find min/max
+        const validValues = values.filter(v => v !== null && !isNaN(v));
+        if (validValues.length === 0) {
+            chartContainer.classList.remove('active');
+            return;
+        }
+
+        const min = Math.min(...validValues);
+        const max = Math.max(...validValues);
+        const range = max - min || 0.1;
+
+        const width = chartContainer.clientWidth - 40; // padding
+        const height = 60;
+
+        const points = values.map((v, i) => {
+            if (v === null || isNaN(v)) return null;
+            const x = (i / (values.length - 1)) * width;
+            const y = height - ((v - min) / range) * height;
+            return `${x},${y}`;
+        }).filter(p => p !== null).join(' ');
+
+        const areaPoints = `0,${height} ${points} ${width},${height}`;
+
+        chartContainer.innerHTML = `
+            <svg class="chart-svg" viewBox="0 0 ${width} ${height}">
+                <line class="chart-axis" x1="0" y1="${height}" x2="${width}" y2="${height}" />
+                <polyline class="chart-area" points="${areaPoints}" />
+                <polyline class="chart-line" points="${points}" />
+            </svg>
+        `;
     }
 
     function jumpToFrame(index) {
@@ -418,6 +484,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         updateHeaderStatus(video.filename);
         renderTimeline(video.frames, video.filename);
+        renderValueChart(video.filename, labels[video.filename]?.value);
         renderTasks();
         fetchFrames(video.filename);
     }

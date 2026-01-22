@@ -537,3 +537,36 @@ video {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--text-secondary);
 }
+.chart-container {
+    width: 100%;
+    height: 80px;
+    margin-top: 20px;
+    padding: 0 2rem;
+    box-sizing: border-box;
+    display: none; /* hidden by default */
+}
+
+.chart-container.active {
+    display: block;
+}
+
+.chart-svg {
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+}
+
+.chart-line {
+    fill: none;
+    stroke: #38bdf8;
+    stroke-width: 2;
+}
+
+.chart-axis {
+    stroke: rgba(255, 255, 255, 0.2);
+    stroke-width: 1;
+}
+
+.chart-area {
+    fill: rgba(56, 189, 248, 0.1);
+}
