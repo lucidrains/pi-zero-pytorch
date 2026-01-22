@@ -12,8 +12,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const resetBtn = document.getElementById('reset-btn');
     const calcReturnsBtn = document.getElementById('calc-returns-btn');
     const calcValueBtn = document.getElementById('calc-value-btn');
+    const calcAdvBtn = document.getElementById('calc-advantage-btn');
     const taskList = document.getElementById('task-list');
-    const chartContainer = document.getElementById('value-chart-container');
+    const valueChartContainer = document.getElementById('value-chart-container');
+    const advantageChartContainer = document.getElementById('advantage-chart-container');
+    const chartTooltip = document.getElementById('chart-tooltip');
+
+    const gaeGammaInput = document.getElementById('gae-gamma-input');
+    const gaeGammaSlider = document.getElementById('gae-gamma-slider');
+    const gaeLamInput = document.getElementById('gae-lam-input');
+    const gaeLamSlider = document.getElementById('gae-lam-slider');
 
     let videos = [];
     let labels = {}; // filename -> {task_completed, marked_timestep}
@@ -67,6 +75,21 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!activeVideo) return;
         await calculateValue(activeVideo.filename);
     };
+
+    // Calc Advantage
+    calcAdvBtn.onclick = async () => {
+        if (!activeVideo) return;
+        await calculateAdvantage(activeVideo.filename);
+    };
+
+    // Hyperparameter Sync
+    function setupSync(input, slider) {
+        input.oninput = () => { slider.value = input.value; };
+        slider.oninput = () => { input.value = slider.value; };
+    }
+
+    setupSync(gaeGammaInput, gaeGammaSlider);
+    setupSync(gaeLamInput, gaeLamSlider);
 
     async function fetchData() {
         try {
@@ -202,11 +225,9 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
-                if (labels[filename]) {
-                    labels[filename].value = data.value;
-                }
+                labels[filename].value = data.value;
                 if (activeVideo && activeVideo.filename === filename) {
-                    renderValueChart(filename, data.value);
+                    renderCharts(activeVideo.filename);
                 }
             }
         } catch (error) {
@@ -215,6 +236,40 @@ document.addEventListener('DOMContentLoaded', () => {
             calcValueBtn.disabled = false;
             calcValueBtn.textContent = 'Calc Value';
         }
+    }
+
+    async function calculateAdvantage(filename) {
+        calcAdvBtn.disabled = true;
+        calcAdvBtn.textContent = 'Calculating...';
+        try {
+            const response = await fetch('/api/episode/advantage/calculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    filename,
+                    gamma: parseFloat(gaeGammaInput.value),
+                    lam: parseFloat(gaeLamInput.value)
+                })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                // Update all labels to get the newly calculated advantages/values
+                await fetchLabels();
+                if (activeVideo && activeVideo.filename === filename) {
+                    renderCharts(activeVideo.filename);
+                }
+            }
+        } catch (error) {
+            console.error('Advantage calculation failed:', error);
+        } finally {
+            calcAdvBtn.disabled = false;
+            calcAdvBtn.textContent = 'Calc Advantage';
+        }
+    }
+
+    async function fetchLabels() {
+        const res = await fetch('/api/labels');
+        labels = await res.json();
     }
 
     function renderList() {
@@ -292,46 +347,103 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function renderValueChart(filename, values) {
-        if (!values || values.length === 0) {
-            chartContainer.innerHTML = '';
-            chartContainer.classList.remove('active');
+    function renderCharts(filename) {
+        const label = labels[filename];
+        if (!label) return;
+
+        renderChart(valueChartContainer, label.value, 'Value', 'value');
+        renderChart(advantageChartContainer, label.advantages, 'Advantage', 'advantage');
+    }
+
+    function renderChart(container, data, title, type) {
+        if (!data || data.length === 0) {
+            container.style.display = 'none';
             return;
         }
 
-        chartContainer.classList.add('active');
-        chartContainer.innerHTML = '';
+        container.style.display = 'block';
+        container.innerHTML = `<div class="chart-title">${title}</div>`;
 
-        // Filter out nulls/NaNs to find min/max
-        const validValues = values.filter(v => v !== null && !isNaN(v));
-        if (validValues.length === 0) {
-            chartContainer.classList.remove('active');
-            return;
-        }
+        const validData = data.filter(v => v !== null && !isNaN(v));
+        if (validData.length === 0) return;
 
-        const min = Math.min(...validValues);
-        const max = Math.max(...validValues);
+        const min = Math.min(...validData);
+        const max = Math.max(...validData);
         const range = max - min || 0.1;
 
-        const width = chartContainer.clientWidth - 40; // padding
-        const height = 60;
+        const width = container.clientWidth - 80; // horizontal padding (2rem each side)
+        const height = container.clientHeight;
 
-        const points = values.map((v, i) => {
+        const points = data.map((v, i) => {
             if (v === null || isNaN(v)) return null;
-            const x = (i / (values.length - 1)) * width;
-            const y = height - ((v - min) / range) * height;
-            return `${x},${y}`;
-        }).filter(p => p !== null).join(' ');
+            const x = (i / (data.length - 1)) * width;
+            const y = height - ((v - min) / range) * (height - 20) - 10;
+            return { x, y, value: v, index: i };
+        });
 
-        const areaPoints = `0,${height} ${points} ${width},${height}`;
+        const pointsStr = points.filter(p => p !== null).map(p => `${p.x},${p.y}`).join(' ');
+        const areaPoints = `0,${height} ${pointsStr} ${width},${height}`;
 
-        chartContainer.innerHTML = `
-            <svg class="chart-svg" viewBox="0 0 ${width} ${height}">
-                <line class="chart-axis" x1="0" y1="${height}" x2="${width}" y2="${height}" />
-                <polyline class="chart-area" points="${areaPoints}" />
-                <polyline class="chart-line" points="${points}" />
-            </svg>
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("class", "chart-svg");
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+
+        svg.innerHTML = `
+            <line class="chart-axis" x1="0" y1="${height - 1}" x2="${width}" y2="${height - 1}" />
+            <polyline class="chart-area-${type}" points="${areaPoints}" />
+            <polyline class="chart-line-${type}" points="${pointsStr}" />
+            <line id="${type}-guide" class="chart-guide" x1="0" y1="0" x2="0" y2="${height}" />
         `;
+
+        container.appendChild(svg);
+
+        const guide = svg.querySelector(`#${type}-guide`);
+
+        const handleMove = (e) => {
+            const rect = svg.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const frameIdx = Math.round((x / width) * (data.length - 1));
+
+            if (frameIdx >= 0 && frameIdx < data.length) {
+                const p = points[frameIdx];
+                if (p) {
+                    showGlobalTooltip(e, frameIdx, p.value, title);
+                    syncGuides(frameIdx, width, data.length);
+                }
+            }
+        };
+
+        const handleLeave = () => {
+            chartTooltip.style.display = 'none';
+            document.querySelectorAll('.chart-guide').forEach(g => g.style.display = 'none');
+        };
+
+        svg.addEventListener('mousemove', handleMove);
+        svg.addEventListener('mouseleave', handleLeave);
+        container.addEventListener('click', (e) => {
+            const rect = svg.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const frameIdx = Math.round((x / width) * (data.length - 1));
+            if (frameIdx >= 0 && frameIdx < data.length) {
+                jumpToFrame(frameIdx);
+            }
+        });
+    }
+
+    function showGlobalTooltip(e, frameIdx, value, title) {
+        chartTooltip.style.display = 'block';
+        chartTooltip.style.left = `${e.clientX + 15}px`;
+        chartTooltip.style.top = `${e.clientY - 40}px`;
+        chartTooltip.innerHTML = `<strong>Frame ${frameIdx}</strong><br/>${title}: ${value.toFixed(4)}`;
+    }
+
+    function syncGuides(frameIdx, width, totalFrames) {
+        const x = (frameIdx / (totalFrames - 1)) * width;
+        document.querySelectorAll('.chart-guide').forEach(g => {
+            g.setAttribute('x1', x);
+            g.setAttribute('x2', x);
+            g.style.display = 'block';
+        });
     }
 
     function jumpToFrame(index) {
@@ -484,7 +596,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         updateHeaderStatus(video.filename);
         renderTimeline(video.frames, video.filename);
-        renderValueChart(video.filename, labels[video.filename]?.value);
+        renderCharts(video.filename);
         renderTasks();
         fetchFrames(video.filename);
     }

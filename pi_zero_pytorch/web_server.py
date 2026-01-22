@@ -58,6 +58,7 @@ class SmallValueNetwork(torch.nn.Module):
         embeds = self.siglip(images)
         pooled = embeds.mean(dim = 1)
         return self.to_value(pooled)
+
 app = FastAPI()
 
 # will be set via CLI
@@ -147,7 +148,8 @@ def init_replay_buffer(video_dir: Path):
             images = ('float', (c, 1, h, w)), # matching (c, num_images, h, w) pattern
             reward = 'float',
             returns = ('float', (), float('nan')),
-            value = ('float', (), float('nan'))
+            value = ('float', (), float('nan')),
+            advantages = ('float', (), float('nan'))
         )
     )
 
@@ -280,16 +282,20 @@ async def get_all_labels():
                 "marked_timestep": -1,
                 "task_id": task_id,
                 "returns": [],
-                "value": []
+                "value": [],
+                "advantages": []
             }
 
-    # Add value data if it exists
+    # Add value/advantage data if it exists
     for filename, episode_id in VIDEO_TO_EPISODE.items():
         if filename in result:
             value = REPLAY_BUFFER.data['value'][episode_id].tolist()
+            adv = REPLAY_BUFFER.data['advantages'][episode_id].tolist()
             # replace nan with None for JSON compliance
             value = [v if not np.isnan(v) else None for v in value]
+            adv = [a if not np.isnan(a) else None for a in adv]
             result[filename]["value"] = value
+            result[filename]["advantages"] = adv
 
     return result
 
@@ -309,9 +315,10 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', -1)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_id', torch.tensor(-1))
     
-    # Reset returns and value to NaN
+    # Reset returns, value, and advantages to NaN
     REPLAY_BUFFER.data['returns'][episode_id] = float('nan')
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
     
     REPLAY_BUFFER.flush()
     return {"status": "ok"}
@@ -400,30 +407,13 @@ async def calculate_returns(req: dict):
     
     return {"status": "ok", "returns": returns_list}
 
-@app.post("/api/episode/value/calculate")
-async def calculate_episode_value(req: dict):
-    filename = req.get("filename")
-    if REPLAY_BUFFER is None:
-        return {"error": "ReplayBuffer not initialized"}
-    
-    episode_id = VIDEO_TO_EPISODE.get(filename)
-    if episode_id is None:
-        return {"error": "Video not found in buffer"}
-
+async def _calculate_episode_value_internal(episode_id: int, filename: str):
     if VALUE_NETWORK is None:
-        return {"error": "Value network not initialized"}
+        raise ValueError("Value network not initialized")
 
     # Get images for this episode
-    # images shape: (max_episodes, max_timesteps, c, 1, h, w)
     images = REPLAY_BUFFER.data['images'][episode_id] # (max_timesteps, c, 1, h, w)
     
-    # We need to know the actual number of frames since max_timesteps might be larger
-    # Let's find out how many frames were actually stored by checking if we have non-zero images
-    # or better, use the get_frame_count or store the length
-    # For now, let's assume we can use the length of images which is max_timesteps, 
-    # but we should only process up to the actual frame count.
-    
-    # Let's get the video path to get the exact frame count
     video_path = VIDEO_DIR / filename
     num_frames = get_frame_count(video_path)
     
@@ -435,10 +425,9 @@ async def calculate_episode_value(req: dict):
         for i in tqdm.tqdm(range(0, num_frames, batch_size)):
             batch_images = images[i : i + batch_size]
             batch_images = torch.from_numpy(batch_images).to(DEVICE)
-            # batch_images: (batch, c, 1, h, w) -> remove num_images dim for SigLIP/resize
             batch_images = batch_images.squeeze(2)
             
-            # Resize to 224x224 for SigLIP
+            # Resize if needed
             if batch_images.shape[-2:] != (224, 224):
                 batch_images = TF.resize(batch_images, (224, 224), antialias = True)
             
@@ -450,8 +439,71 @@ async def calculate_episode_value(req: dict):
     final_values[:len(values)] = torch.tensor(values)
     REPLAY_BUFFER.data['value'][episode_id] = final_values.numpy()
     REPLAY_BUFFER.flush()
+    return values
 
-    return {"status": "ok", "value": values}
+@app.post("/api/episode/value/calculate")
+async def calculate_episode_value(req: dict):
+    filename = req.get("filename")
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    try:
+        values = await _calculate_episode_value_internal(episode_id, filename)
+        return {"status": "ok", "value": values}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/episode/advantage/calculate")
+async def calculate_episode_advantage(req: dict):
+    filename = req.get("filename")
+    gamma = req.get("gamma", 0.99)
+    lam = req.get("lam", 0.95)
+
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    # Check if values exist, otherwise calculate them
+    values_np = REPLAY_BUFFER.data['value'][episode_id]
+    if np.isnan(values_np).any():
+        print(f"Values not found for {filename}, calculating first...")
+        await _calculate_episode_value_internal(episode_id, filename)
+        values_np = REPLAY_BUFFER.data['value'][episode_id]
+
+    # Get actual frame count
+    video_path = VIDEO_DIR / filename
+    num_frames = get_frame_count(video_path)
+
+    # Prepare inputs for GAE
+    rewards = torch.from_numpy(REPLAY_BUFFER.data['reward'][episode_id][:num_frames])
+    values = torch.from_numpy(values_np[:num_frames])
+    masks = torch.ones_like(rewards) # Assume all frames are valid for now
+
+    # Calculate GAE
+    gae_return = calc_generalized_advantage_estimate(
+        rewards = rewards,
+        values = values,
+        masks = masks,
+        gamma = gamma,
+        lam = lam
+    )
+
+    advantages = gae_return.advantages.tolist()
+
+    # Store advantages back
+    final_advantages = torch.full((REPLAY_BUFFER.data['advantages'].shape[1],), float('nan'))
+    final_advantages[:len(advantages)] = torch.tensor(advantages)
+    REPLAY_BUFFER.data['advantages'][episode_id] = final_advantages.numpy()
+    REPLAY_BUFFER.flush()
+
+    return {"status": "ok", "advantages": advantages}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():

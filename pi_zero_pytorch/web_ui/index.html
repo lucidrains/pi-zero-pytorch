@@ -14,21 +14,43 @@
 <body>
     <div class="glass-container">
         <header>
-            <div class="logo">π0 Labeller <button id="reset-btn" class="btn-reset" title="Reset labelling">↺</button>
+            <div class="header-row header-row-1">
+                <div class="logo">π0 Labeller <button id="reset-btn" class="btn-reset" title="Reset labelling">↺</button></div>
+                <div class="header-info">
+                    <span id="label-status-icon"></span>
+                    <span class="filename" id="current-filename">Select a video</span>
+                    <span class="badge" id="current-frames">0 frames</span>
+                    <span id="current-task" class="task-badge"></span>
+                    <span id="label-time-container" class="tiny-label"></span>
+                </div>
             </div>
-            <div id="video-info" class="video-info">
-                <span id="label-status-icon"></span>
-                <span class="filename" id="current-filename">Select a video</span>
-                <span class="badge" id="current-frames">0 frames</span>
-                <span id="current-task" class="task-badge"></span>
-                <span id="label-time-container" class="tiny-label"></span>
-                <button id="calc-returns-btn" class="btn-action" title="Calculate GAE Returns">Calc Returns</button>
-                <button id="calc-value-btn" class="btn-action" title="Estimate Values">Calc Value</button>
-            </div>
-            <div class="penalty-controls">
-                <label for="fail-penalty">Penalty:</label>
-                <input type="number" id="fail-penalty-input" value="-50" step="1">
-                <input type="range" id="fail-penalty-slider" min="-200" max="0" value="-50">
+            
+            <div class="header-row header-row-2">
+                <div class="action-group">
+                    <button id="calc-returns-btn" class="btn-action" title="Calculate GAE Returns">Calc Returns</button>
+                    <button id="calc-value-btn" class="btn-action" title="Estimate Values">Calc Value</button>
+                    <button id="calc-advantage-btn" class="btn-action" title="Calculate GAE Advantages">Calc Advantage</button>
+                </div>
+                
+                <div class="controls-wrapper">
+                    <div class="gae-controls">
+                        <div class="control-group">
+                            <label>γ (Gamma):</label>
+                            <input type="number" id="gae-gamma-input" value="0.99" step="0.001" min="0.8" max="1.0">
+                            <input type="range" id="gae-gamma-slider" min="0.8" max="1.0" step="0.001" value="0.99">
+                        </div>
+                        <div class="control-group">
+                            <label>λ (Lambda):</label>
+                            <input type="number" id="gae-lam-input" value="0.95" step="0.001" min="0.8" max="1.0">
+                            <input type="range" id="gae-lam-slider" min="0.8" max="1.0" step="0.001" value="0.95">
+                        </div>
+                    </div>
+                    <div class="penalty-controls">
+                        <label for="fail-penalty">Penalty:</label>
+                        <input type="number" id="fail-penalty-input" value="-50" step="1">
+                        <input type="range" id="fail-penalty-slider" min="-200" max="0" value="-50">
+                    </div>
+                </div>
             </div>
         </header>
 
@@ -43,6 +65,8 @@
             <div class="main-content">
                 <div id="frame-timeline" class="timeline-container"></div>
                 <div id="value-chart-container" class="chart-container"></div>
+                <div id="advantage-chart-container" class="chart-container"></div>
+                <div id="chart-tooltip" class="chart-tooltip"></div>
                 <div class="player-container">
                     <div class="video-wrapper">
                         <video id="main-player" controls>
