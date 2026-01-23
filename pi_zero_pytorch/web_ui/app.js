@@ -18,6 +18,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const advantageChartContainer = document.getElementById('advantage-chart-container');
     const chartTooltip = document.getElementById('chart-tooltip');
 
+    const calcStatsBtn = document.getElementById('calc-stats-btn');
+    const binarizeBtn = document.getElementById('binarize-btn');
+    const statsQuantileInput = document.getElementById('stats-quantile-input');
+    const statsResult = document.getElementById('stats-result');
+
     const loadingOverlay = document.getElementById('loading-overlay');
     const loadingStatus = document.getElementById('loading-status');
     const loadingProgress = document.getElementById('loading-progress');
@@ -29,9 +34,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const gaeLamSlider = document.getElementById('gae-lam-slider');
 
     let videos = [];
-    let labels = {}; // filename -> {task_completed, marked_timestep}
+    let labels = {}; // filename -> {task_completed, marked_timestep, returns, value, advantages, advantage_ids}
     let tasks = [];
     let activeVideo = null;
+    let currentCutoff = null;
 
     // Penalty sync
     penaltyInput.oninput = () => {
@@ -56,6 +62,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 updateHeaderStatus(activeVideo.filename);
                 renderList();
                 renderTimeline(activeVideo.frames, activeVideo.filename);
+                renderCharts(activeVideo.filename);
 
                 // Refresh carousel active states
                 const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
@@ -85,6 +92,59 @@ document.addEventListener('DOMContentLoaded', () => {
     calcAdvBtn.onclick = async () => {
         if (!activeVideo) return;
         await calculateAdvantage(activeVideo.filename);
+    };
+
+    calcStatsBtn.onclick = async () => {
+        const percentile = parseFloat(statsQuantileInput.value);
+        calcStatsBtn.disabled = true;
+        calcStatsBtn.textContent = 'Calculating...';
+        try {
+            const response = await fetch('/api/advantage/stats', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ percentile })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                statsResult.textContent = `Cutoff (${data.count} pts): ${data.cutoff.toFixed(6)}`;
+                currentCutoff = data.cutoff;
+            } else {
+                statsResult.textContent = `Error: ${data.error}`;
+            }
+        } catch (error) {
+            console.error('Stats calculation failed:', error);
+            statsResult.textContent = 'Error: Check console';
+        } finally {
+            calcStatsBtn.disabled = false;
+            calcStatsBtn.textContent = 'Calc Global Stats';
+        }
+    };
+
+    binarizeBtn.onclick = async () => {
+        if (!activeVideo || currentCutoff === null) return;
+
+        binarizeBtn.disabled = true;
+        try {
+            const response = await fetch('/api/advantage/binarize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    filename: activeVideo.filename,
+                    cutoff: currentCutoff
+                })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                if (labels[activeVideo.filename]) {
+                    labels[activeVideo.filename].advantage_ids = data.advantage_ids;
+                }
+                renderTimeline(activeVideo.frames, activeVideo.filename);
+            }
+        } catch (error) {
+            console.error('Binarization failed:', error);
+        } finally {
+            binarizeBtn.disabled = false;
+        }
     };
 
     // Hyperparameter Sync
@@ -208,10 +268,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.status === 'ok') {
                 if (labels[filename]) {
                     labels[filename].returns = data.returns;
+                    labels[filename].value = null;
+                    labels[filename].advantages = null;
                 }
                 if (activeVideo && activeVideo.filename === filename) {
                     renderTimeline(activeVideo.frames, activeVideo.filename);
                     renderTasks();
+                    renderCharts(filename);
                 }
             }
         } catch (error) {
@@ -230,9 +293,11 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
-                labels[filename].value = data.value;
-                if (activeVideo && activeVideo.filename === filename) {
-                    renderCharts(activeVideo.filename);
+                if (labels[filename]) {
+                    labels[filename].value = data.value;
+                    if (activeVideo && activeVideo.filename === filename) {
+                        renderCharts(filename);
+                    }
                 }
             }
         } catch (error) {
@@ -258,10 +323,12 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
-                // Update all labels to get the newly calculated advantages/values
-                await fetchLabels();
-                if (activeVideo && activeVideo.filename === filename) {
-                    renderCharts(activeVideo.filename);
+                if (labels[filename]) {
+                    labels[filename].advantages = data.advantages;
+                    labels[filename].value = data.value;
+                    if (activeVideo && activeVideo.filename === filename) {
+                        renderCharts(filename);
+                    }
                 }
             }
         } catch (error) {
@@ -320,6 +387,18 @@ document.addEventListener('DOMContentLoaded', () => {
         const label = labels[filename];
 
         for (let i = 0; i < numFrames; i++) {
+            const container = document.createElement('div');
+            container.className = 'frame-container';
+
+            const indicator = document.createElement('div');
+            indicator.className = 'advantage-indicator';
+
+            if (label && label.advantage_ids && label.advantage_ids[i] !== -1) {
+                const advId = label.advantage_ids[i];
+                indicator.classList.add(advId === 1 ? 'pos' : 'neg');
+                indicator.title = `Advantage ID: ${advId}`;
+            }
+
             const box = document.createElement('div');
             box.className = 'frame-box';
 
@@ -348,20 +427,22 @@ document.addEventListener('DOMContentLoaded', () => {
             box.onclick = () => {
                 jumpToFrame(i);
             };
-            timelineContainer.appendChild(box);
+
+            container.appendChild(indicator);
+            container.appendChild(box);
+            timelineContainer.appendChild(container);
         }
     }
 
     function renderCharts(filename) {
         const label = labels[filename];
-        if (!label) return;
-
-        renderChart(valueChartContainer, label.value, 'Value', 'value');
-        renderChart(advantageChartContainer, label.advantages, 'Advantage', 'advantage');
+        renderChart(valueChartContainer, label?.value, 'Value', 'value');
+        renderChart(advantageChartContainer, label?.advantages, 'Advantage', 'advantage');
     }
 
     function renderChart(container, data, title, type) {
         if (!data || data.length === 0) {
+            container.innerHTML = '';
             container.style.display = 'none';
             return;
         }
@@ -370,13 +451,18 @@ document.addEventListener('DOMContentLoaded', () => {
         container.innerHTML = `<div class="chart-title">${title}</div>`;
 
         const validData = data.filter(v => v !== null && !isNaN(v));
-        if (validData.length === 0) return;
+        if (validData.length === 0) {
+            container.innerHTML = '';
+            container.style.display = 'none';
+            return;
+        }
 
         const min = Math.min(...validData);
         const max = Math.max(...validData);
         const range = max - min || 0.1;
 
-        const width = container.clientWidth - 80; // horizontal padding (2rem each side)
+        const containerWidth = container.clientWidth;
+        const width = Math.max(100, containerWidth - 80); // horizontal padding (2rem each side)
         const height = container.clientHeight;
 
         const points = data.map((v, i) => {
@@ -386,23 +472,95 @@ document.addEventListener('DOMContentLoaded', () => {
             return { x, y, value: v, index: i };
         });
 
-        const pointsStr = points.filter(p => p !== null).map(p => `${p.x},${p.y}`).join(' ');
-        const areaPoints = `0,${height} ${pointsStr} ${width},${height}`;
-
         const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.setAttribute("class", "chart-svg");
         svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
 
-        svg.innerHTML = `
-            <line class="chart-axis" x1="0" y1="${height - 1}" x2="${width}" y2="${height - 1}" />
-            <polyline class="chart-area-${type}" points="${areaPoints}" />
-            <polyline class="chart-line-${type}" points="${pointsStr}" />
-            <line id="${type}-guide" class="chart-guide" x1="0" y1="0" x2="0" y2="${height}" />
-        `;
+        // Axis
+        const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        axis.setAttribute("class", "chart-axis");
+        axis.setAttribute("x1", "0");
+        axis.setAttribute("y1", (height - 1).toString());
+        axis.setAttribute("x2", width.toString());
+        axis.setAttribute("y2", (height - 1).toString());
+        svg.appendChild(axis);
+
+        // Group points into continuous segments (islands)
+        const segments = [];
+        let currentSegment = [];
+
+        points.forEach(p => {
+            if (p) {
+                currentSegment.push(p);
+            } else {
+                if (currentSegment.length > 0) {
+                    segments.push(currentSegment);
+                    currentSegment = [];
+                }
+            }
+        });
+        if (currentSegment.length > 0) segments.push(currentSegment);
+
+        // Render each segment
+        segments.forEach(seg => {
+            if (seg.length < 1) return;
+
+            const pointsStr = seg.map(p => `${p.x},${p.y}`).join(' ');
+
+            if (seg.length > 1) {
+                // Area fill
+                const first = seg[0];
+                const last = seg[seg.length - 1];
+                const areaPoints = `${first.x},${height} ${pointsStr} ${last.x},${height}`;
+
+                const area = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+                area.setAttribute("class", `chart-area-${type}`);
+                area.setAttribute("points", areaPoints);
+                svg.appendChild(area);
+
+                // Line
+                const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+                line.setAttribute("class", `chart-line-${type}`);
+                line.setAttribute("points", pointsStr);
+                svg.appendChild(line);
+
+                // Dots at each point
+                seg.forEach(p => {
+                    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                    circle.setAttribute("class", `chart-line-${type}`);
+                    circle.setAttribute("cx", p.x.toString());
+                    circle.setAttribute("cy", p.y.toString());
+                    circle.setAttribute("r", "2.5");
+                    circle.setAttribute("fill", type === 'value' ? '#38bdf8' : '#ef4444');
+                    circle.setAttribute("stroke", "#fff");
+                    circle.setAttribute("stroke-width", "0.5");
+                    svg.appendChild(circle);
+                });
+            } else {
+                // Single point case - render a slightly larger circle
+                const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                dot.setAttribute("class", `chart-line-${type}`);
+                dot.setAttribute("cx", seg[0].x.toString());
+                dot.setAttribute("cy", seg[0].y.toString());
+                dot.setAttribute("r", "3.0");
+                dot.setAttribute("fill", type === 'value' ? '#38bdf8' : '#ef4444');
+                dot.setAttribute("stroke", "#fff");
+                dot.setAttribute("stroke-width", "1");
+                svg.appendChild(dot);
+            }
+        });
+
+        // Guide line
+        const guide = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        guide.setAttribute("id", `${type}-guide`);
+        guide.setAttribute("class", "chart-guide");
+        guide.setAttribute("x1", 0);
+        guide.setAttribute("y1", 0);
+        guide.setAttribute("x2", 0);
+        guide.setAttribute("y2", height);
+        svg.appendChild(guide);
 
         container.appendChild(svg);
-
-        const guide = svg.querySelector(`#${type}-guide`);
 
         const handleMove = (e) => {
             const rect = svg.getBoundingClientRect();
@@ -522,12 +680,15 @@ document.addEventListener('DOMContentLoaded', () => {
                     task_completed: success ? 1 : 0,
                     marked_timestep: timestep,
                     task_id: labels[filename]?.task_id, // preserve task_id
-                    returns: data.returns
+                    returns: data.returns,
+                    value: null,
+                    advantages: null
                 };
                 updateHeaderStatus(filename);
                 renderList();
                 renderTimeline(activeVideo.frames, filename);
                 renderTasks(); // update assign buttons visibility
+                renderCharts(filename);
 
                 if (activeVideo && activeVideo.filename === filename) {
                     const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));

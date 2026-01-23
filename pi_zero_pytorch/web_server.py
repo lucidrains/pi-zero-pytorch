@@ -160,7 +160,8 @@ def init_replay_buffer(video_dir: Path):
             reward = 'float',
             returns = ('float', (), float('nan')),
             value = ('float', (), float('nan')),
-            advantages = ('float', (), float('nan'))
+            advantages = ('float', (), float('nan')),
+            advantage_ids = ('int', (), -1)
         )
     )
 
@@ -304,7 +305,8 @@ async def get_all_labels():
                 "task_id": task_id,
                 "returns": [],
                 "value": [],
-                "advantages": []
+                "advantages": [],
+                "advantage_ids": []
             }
 
     # Add value/advantage data if it exists
@@ -312,11 +314,13 @@ async def get_all_labels():
         if filename in result:
             value = REPLAY_BUFFER.data['value'][episode_id].tolist()
             adv = REPLAY_BUFFER.data['advantages'][episode_id].tolist()
+            adv_ids = REPLAY_BUFFER.data['advantage_ids'][episode_id].tolist()
             # replace nan with None for JSON compliance
             value = [v if not np.isnan(v) else None for v in value]
             adv = [a if not np.isnan(a) else None for a in adv]
             result[filename]["value"] = value
             result[filename]["advantages"] = adv
+            result[filename]["advantage_ids"] = adv_ids
 
     return result
 
@@ -364,6 +368,10 @@ async def label_video(req: LabelRequest):
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'fail', True)
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_completed', 0)
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', req.timestep)
+    
+    # Reset value and advantages to NaN as they are now stale
+    REPLAY_BUFFER.data['value'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
     
     # Calculate returns
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
@@ -421,6 +429,11 @@ async def calculate_returns(req: dict):
         returns[t] = float(t - marked_timestep) / max_duration
     
     REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
+    
+    # Reset value and advantages to NaN as they are now stale
+    REPLAY_BUFFER.data['value'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
+
     REPLAY_BUFFER.flush()
     
     returns_list = returns.tolist()
@@ -428,7 +441,7 @@ async def calculate_returns(req: dict):
     
     return {"status": "ok", "returns": returns_list}
 
-async def _calculate_episode_value_internal(episode_id: int, filename: str):
+async def _calculate_episode_value_internal(episode_id: int, filename: str, max_t: int = None):
     if VALUE_NETWORK is None:
         raise ValueError("Value network not initialized")
 
@@ -438,13 +451,17 @@ async def _calculate_episode_value_internal(episode_id: int, filename: str):
     video_path = VIDEO_DIR / filename
     num_frames = get_frame_count(video_path)
     
+    calc_to_t = num_frames
+    if max_t is not None:
+        calc_to_t = min(num_frames, max_t)
+
     values = []
     VALUE_NETWORK.eval()
     
     batch_size = 8
     with torch.no_grad():
-        for i in tqdm.tqdm(range(0, num_frames, batch_size)):
-            batch_images = images[i : i + batch_size]
+        for i in tqdm.tqdm(range(0, calc_to_t, batch_size)):
+            batch_images = images[i : min(i + batch_size, calc_to_t)]
             batch_images = torch.from_numpy(batch_images).to(DEVICE)
             batch_images = batch_images.squeeze(2)
             
@@ -473,7 +490,13 @@ async def calculate_episode_value(req: dict):
         return {"error": "Video not found in buffer"}
 
     try:
-        values = await _calculate_episode_value_internal(episode_id, filename)
+        # Check for marked_timestep
+        marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
+        max_t = None
+        if marked_timestep != -1:
+            max_t = marked_timestep + 1
+
+        values = await _calculate_episode_value_internal(episode_id, filename, max_t = max_t)
         return {"status": "ok", "value": values}
     except Exception as e:
         return {"error": str(e)}
@@ -491,16 +514,20 @@ async def calculate_episode_advantage(req: dict):
     if episode_id is None:
         return {"error": "Video not found in buffer"}
 
-    # Check if values exist, otherwise calculate them
-    values_np = REPLAY_BUFFER.data['value'][episode_id]
-    if np.isnan(values_np).any():
-        print(f"Values not found for {filename}, calculating first...")
-        await _calculate_episode_value_internal(episode_id, filename)
-        values_np = REPLAY_BUFFER.data['value'][episode_id]
-
     # Get actual frame count
     video_path = VIDEO_DIR / filename
     num_frames = get_frame_count(video_path)
+    
+    marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
+    if marked_timestep != -1:
+        num_frames = min(num_frames, marked_timestep + 1)
+
+    # Check if values exist, otherwise calculate them
+    values_np = REPLAY_BUFFER.data['value'][episode_id]
+    if np.isnan(values_np[:num_frames]).any():
+        print(f"Values not found for {filename}, calculating first...")
+        await _calculate_episode_value_internal(episode_id, filename, max_t = num_frames)
+        values_np = REPLAY_BUFFER.data['value'][episode_id]
 
     # Prepare inputs for GAE
     rewards = torch.from_numpy(REPLAY_BUFFER.data['reward'][episode_id][:num_frames])
@@ -524,7 +551,54 @@ async def calculate_episode_advantage(req: dict):
     REPLAY_BUFFER.data['advantages'][episode_id] = final_advantages.numpy()
     REPLAY_BUFFER.flush()
 
-    return {"status": "ok", "advantages": advantages}
+    return {"status": "ok", "advantages": advantages, "value": values.tolist()}
+
+@app.post("/api/advantage/stats")
+async def calculate_global_advantage_stats(req: dict):
+    percentile = req.get("percentile", 90)
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+
+    # Get all advantages across all episodes
+    all_advs = REPLAY_BUFFER.data['advantages']
+    
+    # Filter valid ones (not NaN)
+    valid_advs = all_advs[~np.isnan(all_advs)]
+    
+    if len(valid_advs) == 0:
+        return {"error": "No advantages calculated yet"}
+    
+    cutoff = np.percentile(valid_advs, percentile)
+    
+    return {
+        "status": "ok",
+        "cutoff": float(cutoff),
+        "count": len(valid_advs)
+    }
+
+@app.post("/api/advantage/binarize")
+async def binarize_advantages(req: dict):
+    filename = req.get("filename")
+    cutoff = req.get("cutoff")
+
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    advs = REPLAY_BUFFER.data['advantages'][episode_id]
+    
+    # Calculate binarized IDs: 1 if >= cutoff, 0 if < cutoff, -1 if NaN
+    adv_ids = np.full(advs.shape, -1, dtype=int)
+    valid_mask = ~np.isnan(advs)
+    adv_ids[valid_mask] = (advs[valid_mask] >= cutoff).astype(int)
+
+    REPLAY_BUFFER.data['advantage_ids'][episode_id] = adv_ids
+    REPLAY_BUFFER.flush()
+
+    return {"status": "ok", "advantage_ids": adv_ids.tolist()}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
