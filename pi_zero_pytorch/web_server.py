@@ -75,7 +75,9 @@ CACHE_DIR = Path(".cache/frames")
 REPLAY_BUFFER = None
 VIDEO_TO_EPISODE = {}
 VALUE_NETWORK = None
+RECAP_WORKSPACE = None  # Set via --recap-workspace CLI option
 DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+
 
 class LabelRequest(BaseModel):
     filename: str
@@ -123,25 +125,31 @@ def init_replay_buffer(video_dir: Path):
         shutil.rmtree(tmp_buffer_dir)
     tmp_buffer_dir.mkdir(parents=True, exist_ok = True)
 
-    # Get all videos
     extensions = {".mp4", ".webm", ".avi", ".mov"}
-    video_files = sorted([f for f in video_dir.iterdir() if f.suffix.lower() in extensions])
+    video_files = sorted([f for f in video_dir.iterdir() if f.suffix.lower() in extensions and f.stat().st_size > 0])
     
     if not video_files:
+        print("No valid video files found")
+        CONVERSION_STATUS["is_converting"] = False
         return
 
-    # For simplicity, we need to know the image size and max frames
-    # Let's peek at the first video
-    cap = cv2.VideoCapture(str(video_files[0]))
-    ret, frame = cap.read()
-    if not ret:
+    h, w, c, max_frames = None, None, None, 0
+    for vf in video_files:
+        cap = cv2.VideoCapture(str(vf))
+        ret, frame = cap.read()
         cap.release()
+        if ret:
+            h, w, c = frame.shape
+            break
+    
+    if h is None:
+        print("Could not read any video files")
+        CONVERSION_STATUS["is_converting"] = False
         return
-    h, w, c = frame.shape
-    max_frames = 0
+    
     for vf in video_files:
         max_frames = max(max_frames, get_frame_count(vf))
-    cap.release()
+
 
     REPLAY_BUFFER = ReplayBuffer(
         str(tmp_buffer_dir),
@@ -224,7 +232,6 @@ async def assign_task(req: dict):
     if episode_id is None:
         return {"error": "Video not found in buffer"}
 
-    # Task IDs are indices in the recap config task keys
     task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
     try:
         task_idx = task_keys.index(task_id_str)
@@ -246,17 +253,19 @@ async def list_videos():
         return []
 
     for file in VIDEO_DIR.iterdir():
-        if file.suffix.lower() in extensions:
+        if file.suffix.lower() in extensions and file.stat().st_size > 0:
             frames = get_frame_count(file)
-            videos.append(VideoInfo(
-                filename=file.name,
-                frames=frames,
-                url=f"/videos/{file.name}"
-            ))
+            if frames > 0:  # Only include videos with valid frames
+                videos.append(VideoInfo(
+                    filename=file.name,
+                    frames=frames,
+                    url=f"/videos/{file.name}"
+                ))
     
     # sort by filename
     videos.sort(key=lambda x: x.filename)
     return videos
+
 
 @app.get("/api/video/{filename}/frames")
 async def get_video_frames(filename: str):
@@ -605,12 +614,197 @@ async def get_index():
     index_path = Path(__file__).parent / "web_ui" / "index.html"
     return HTMLResponse(content=index_path.read_text(), status_code=200)
 
+@app.get("/api/recap/state")
+async def get_recap_state():
+    """Returns the current state of the RECAP workspace for UI introspection."""
+    if not RECAP_WORKSPACE or not RECAP_WORKSPACE.exists():
+        return {"enabled": False}
+
+    state = {
+        "enabled": True,
+        "workspace": str(RECAP_WORKSPACE),
+        "pretrained": {
+            "actor": (RECAP_WORKSPACE / "pretrained-actor.pt").exists(),
+            "critic": (RECAP_WORKSPACE / "pretrained-critic.pt").exists()
+        },
+        "tasks": []
+    }
+
+    # Get tasks from config
+    for task_name, task_config in RECAP_CONFIG.get("tasks", {}).items():
+        task_dir = RECAP_WORKSPACE / task_name
+        task_state = {
+            "name": task_name,
+            "max_episode_length": task_config.get("max_episode_length", 200),
+            "exists": task_dir.exists(),
+            "iterations": []
+        }
+
+        if task_dir.exists():
+            # Find iterations (numbered folders: 0, 1, 2...)
+            for iter_dir in sorted(task_dir.iterdir(), key=lambda x: int(x.name) if x.name.isdigit() else -1):
+                if iter_dir.is_dir() and iter_dir.name.isdigit():
+                    iter_id = int(iter_dir.name)
+                    # Find data folders (data.0, data.1, ...)
+                    data_folders = sorted([d.name for d in iter_dir.glob("data.*") if d.is_dir()])
+                    task_state["iterations"].append({
+                        "id": iter_id,
+                        "actor": (iter_dir / "actor.pt").exists(),
+                        "critic": (iter_dir / "critic.pt").exists(),
+                        "data": data_folders
+                    })
+
+        state["tasks"].append(task_state)
+
+    return state
+
+@app.post("/api/recap/pretrain")
+async def recap_pretrain():
+    """Simulates generalist pretraining - creates pretrained weights."""
+    if not RECAP_WORKSPACE:
+        return {"error": "RECAP workspace not configured"}
+
+    # In simulation, we just create marker files
+    actor_path = RECAP_WORKSPACE / "pretrained-actor.pt"
+    critic_path = RECAP_WORKSPACE / "pretrained-critic.pt"
+    
+    if actor_path.exists():
+        return {"error": "Already pretrained"}
+    
+    # Create dummy weight files to simulate pretraining
+    torch.save({"simulated": True}, str(actor_path))
+    torch.save({"simulated": True}, str(critic_path))
+    
+    return {"status": "ok"}
+
+@app.post("/api/recap/specialize")
+async def recap_specialize(req: dict):
+    """Creates iteration 0 (SFT) for a specific task."""
+    if not RECAP_WORKSPACE:
+        return {"error": "RECAP workspace not configured"}
+    
+    task_name = req.get("task_name")
+    if not task_name:
+        return {"error": "Missing task_name"}
+    
+    # Check that pretrained weights exist
+    if not (RECAP_WORKSPACE / "pretrained-actor.pt").exists():
+        return {"error": "Must pretrain first"}
+    
+    # Create iteration 0 (SFT)
+    iter_dir = RECAP_WORKSPACE / task_name / "0"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Simulate creating specialized weights
+    torch.save({"simulated": True, "task": task_name, "iteration": 0}, str(iter_dir / "actor.pt"))
+    torch.save({"simulated": True, "task": task_name, "iteration": 0}, str(iter_dir / "critic.pt"))
+    
+    return {"status": "ok"}
+
+@app.post("/api/recap/collect")
+async def recap_collect(req: dict):
+    """Simulates data collection - creates a new data folder with sample videos."""
+    if not RECAP_WORKSPACE:
+        return {"error": "RECAP workspace not configured"}
+    
+    task_name = req.get("task_name")
+    iter_id = req.get("iter_id", 0)
+    
+    if not task_name:
+        return {"error": "Missing task_name"}
+    
+    iter_dir = RECAP_WORKSPACE / task_name / str(iter_id)
+    if not iter_dir.exists():
+        return {"error": f"Iteration {iter_id} does not exist for {task_name}"}
+    
+    # Find next data folder index
+    existing_data = list(iter_dir.glob("data.*"))
+    next_idx = len(existing_data)
+    
+    data_dir = iter_dir / f"data.{next_idx}"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Import and use simulation engine to generate sample trajectories
+    try:
+        from recap_sim_engine import generate_trajectories
+        generate_trajectories(data_dir, num_episodes=3, steps=20)
+    except ImportError:
+        # If no sim engine, create empty folder
+        pass
+    
+    return {"status": "ok", "data_folder": f"data.{next_idx}"}
+
+@app.post("/api/recap/iterate")
+async def recap_iterate(req: dict):
+    """Advances to the next iteration after finetuning on collected data."""
+    if not RECAP_WORKSPACE:
+        return {"error": "RECAP workspace not configured"}
+    
+    task_name = req.get("task_name")
+    iter_id = req.get("iter_id", 0)
+    
+    if not task_name:
+        return {"error": "Missing task_name"}
+    
+    current_iter_dir = RECAP_WORKSPACE / task_name / str(iter_id)
+    if not current_iter_dir.exists():
+        return {"error": f"Iteration {iter_id} does not exist"}
+    
+    # Check that data was collected
+    data_folders = list(current_iter_dir.glob("data.*"))
+    if not data_folders:
+        return {"error": "No data collected for this iteration"}
+    
+    # Create next iteration
+    next_iter_id = iter_id + 1
+    next_iter_dir = RECAP_WORKSPACE / task_name / str(next_iter_id)
+    next_iter_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Simulate creating updated weights
+    torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "actor.pt"))
+    torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "critic.pt"))
+    
+    return {"status": "ok", "new_iteration": next_iter_id}
+
+@app.post("/api/recap/load_data")
+async def recap_load_data(req: dict):
+    """Mounts a specific data folder to view in the labeller."""
+    global VIDEO_DIR, REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS
+    
+    task_name = req.get("task_name")
+    iter_id = req.get("iter_id")
+    data_id = req.get("data_id")
+    
+    if not all([task_name, iter_id is not None, data_id]):
+        return {"error": "Missing required parameters"}
+    
+    target_dir = RECAP_WORKSPACE / task_name / str(iter_id) / data_id
+    if not target_dir.exists():
+        return {"error": f"Data directory {target_dir} does not exist"}
+    
+    # Reset current state
+    VIDEO_DIR = target_dir
+    REPLAY_BUFFER = None
+    VIDEO_TO_EPISODE = {}
+    
+    # Start conversion in background
+    threading.Thread(target=init_replay_buffer, args=(VIDEO_DIR,), daemon=True).start()
+    
+    return {"status": "ok", "video_dir": str(VIDEO_DIR)}
+
 @click.command()
 @click.option('--folder', default='./video-rollout', help='Folder containing the videos.')
 @click.option('--port', default=8000, help='Port to run the server on.')
-def main(folder, port):
-    global VIDEO_DIR
+@click.option('--recap-workspace', default=None, help='Path to RECAP algorithm workspace folder.')
+def main(folder, port, recap_workspace):
+    global VIDEO_DIR, RECAP_WORKSPACE
     VIDEO_DIR = Path(folder)
+    
+    # Initialize RECAP workspace if provided
+    if recap_workspace:
+        RECAP_WORKSPACE = Path(recap_workspace)
+        RECAP_WORKSPACE.mkdir(parents=True, exist_ok=True)
+        print(f"RECAP workspace enabled: {RECAP_WORKSPACE}")
     
     if not VIDEO_DIR.exists():
         print(f"Error: Folder {folder} does not exist.")
@@ -637,6 +831,7 @@ def main(folder, port):
 
     print(f"Starting Video Labeller at http://localhost:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 if __name__ == "__main__":
     main()

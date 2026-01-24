@@ -791,5 +791,202 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    const recapSidebar = document.getElementById('recap-sidebar');
+    const recapTaskList = document.getElementById('recap-task-list');
+    const recapGeneralistStatus = document.getElementById('recap-generalist-status');
+    const btnPretrain = document.getElementById('btn-pretrain');
+
+    let recapState = null;
+
+    async function fetchRecapState() {
+        try {
+            const response = await fetch('/api/recap/state');
+            recapState = await response.json();
+
+            if (recapState.enabled) {
+                recapSidebar.style.display = 'block';
+                renderRecapSidebar();
+            } else {
+                recapSidebar.style.display = 'none';
+            }
+        } catch (error) {
+            console.error('Failed to fetch RECAP state:', error);
+        }
+    }
+
+    function renderRecapSidebar() {
+        if (!recapState || !recapState.enabled) return;
+
+        // Update generalist status
+        const isReady = recapState.pretrained.actor && recapState.pretrained.critic;
+        recapGeneralistStatus.textContent = isReady ? 'Ready' : 'Not Ready';
+        recapGeneralistStatus.className = `recap-status-value ${isReady ? 'success' : 'fail'}`;
+        btnPretrain.style.display = isReady ? 'none' : 'block';
+
+        // Render task list
+        recapTaskList.innerHTML = '';
+        for (const task of recapState.tasks) {
+            const taskGroup = document.createElement('div');
+            taskGroup.className = 'recap-task-group';
+
+            const taskHeader = document.createElement('div');
+            taskHeader.className = 'recap-task-header';
+            taskHeader.innerHTML = `
+                <span class="recap-task-name">${task.name.replace(/_/g, ' ').toUpperCase()}</span>
+                ${isReady && task.iterations.length === 0 ?
+                    `<button class="btn-recap-mini" onclick="recapSpecialize('${task.name}')">SFT</button>` : ''}
+            `;
+            taskGroup.appendChild(taskHeader);
+
+            // Render iterations
+            for (const iter of task.iterations) {
+                const iterRow = document.createElement('div');
+                iterRow.className = 'recap-iteration';
+
+                const isTrained = iter.actor && iter.critic;
+                const hasData = iter.data.length > 0;
+                const indicatorClass = isTrained ? 'indicator-trained' : (hasData ? 'indicator-data' : 'indicator-none');
+                const statusText = isTrained ? 'Trained' : (hasData ? 'Collecting' : 'Init');
+
+                iterRow.innerHTML = `
+                    <div class="iteration-num">${iter.id}</div>
+                    <div class="iteration-status">
+                        <div class="iteration-info">
+                            <div class="iteration-indicator ${indicatorClass}"></div>
+                            <span>${statusText}</span>
+                        </div>
+                        <div class="iteration-actions">
+                            <button class="btn-recap-mini" onclick="recapCollect('${task.name}', ${iter.id})">Collect</button>
+                            ${hasData ? `<button class="btn-recap-mini" onclick="recapIterate('${task.name}', ${iter.id})">Iterate</button>` : ''}
+                        </div>
+                    </div>
+                `;
+                taskGroup.appendChild(iterRow);
+
+                // Render data folders
+                if (iter.data.length > 0) {
+                    const dataList = document.createElement('div');
+                    dataList.className = 'recap-data-list';
+                    for (const dataId of iter.data) {
+                        const dataItem = document.createElement('div');
+                        dataItem.className = 'recap-data-item';
+                        dataItem.textContent = `📁 ${dataId}`;
+                        dataItem.onclick = () => loadRecapData(task.name, iter.id, dataId);
+                        dataList.appendChild(dataItem);
+                    }
+                    taskGroup.appendChild(dataList);
+                }
+            }
+
+            recapTaskList.appendChild(taskGroup);
+        }
+    }
+
+    window.recapSpecialize = async function (taskName) {
+        try {
+            const response = await fetch('/api/recap/specialize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_name: taskName })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                await fetchRecapState();
+            } else {
+                console.error('Specialize failed:', data.error);
+            }
+        } catch (error) {
+            console.error('Specialize failed:', error);
+        }
+    };
+
+    window.recapCollect = async function (taskName, iterId) {
+        try {
+            const response = await fetch('/api/recap/collect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_name: taskName, iter_id: iterId })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                await fetchRecapState();
+            } else {
+                console.error('Collect failed:', data.error);
+            }
+        } catch (error) {
+            console.error('Collect failed:', error);
+        }
+    };
+
+    window.recapIterate = async function (taskName, iterId) {
+        try {
+            const response = await fetch('/api/recap/iterate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_name: taskName, iter_id: iterId })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                await fetchRecapState();
+            } else {
+                console.error('Iterate failed:', data.error);
+            }
+        } catch (error) {
+            console.error('Iterate failed:', error);
+        }
+    };
+
+    async function loadRecapData(taskName, iterId, dataId) {
+        loadingOverlay.classList.remove('hidden');
+        loadingStatus.textContent = 'Loading RECAP data...';
+        loadingDetail.textContent = `${taskName} / iter ${iterId} / ${dataId}`;
+
+        try {
+            const response = await fetch('/api/recap/load_data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_name: taskName, iter_id: iterId, data_id: dataId })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                // Clear current state
+                videos = [];
+                labels = {};
+                activeVideo = null;
+                videoList.innerHTML = '';
+                carouselTrack.innerHTML = '';
+                timelineContainer.innerHTML = '';
+                // Check conversion status which will trigger fetchData when done
+                checkConversionStatus();
+            } else {
+                console.error('Load failed:', data.error);
+                loadingOverlay.classList.add('hidden');
+            }
+        } catch (error) {
+            console.error('Load failed:', error);
+            loadingOverlay.classList.add('hidden');
+        }
+    }
+
+    // Pretrain button handler
+    btnPretrain.onclick = async () => {
+        try {
+            const response = await fetch('/api/recap/pretrain', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                await fetchRecapState();
+            } else {
+                console.error('Pretrain failed:', data.error);
+            }
+        } catch (error) {
+            console.error('Pretrain failed:', error);
+        }
+    };
+
+    // Initialize
     checkConversionStatus();
+    fetchRecapState();
 });

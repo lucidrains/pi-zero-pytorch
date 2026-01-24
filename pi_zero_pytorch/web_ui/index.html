@@ -84,6 +84,24 @@
         </header>
 
         <main>
+            <div class="recap-sidebar" id="recap-sidebar" style="display: none;">
+                <h2>⚡ RECAP State</h2>
+
+                <!-- Generalist Status -->
+                <div class="recap-status-card">
+                    <div class="recap-status-item">
+                        <span class="recap-status-label">Generalist</span>
+                        <span id="recap-generalist-status" class="recap-status-value">Not Ready</span>
+                    </div>
+                    <button id="btn-pretrain" class="btn-recap-action">Start Pretraining</button>
+                </div>
+
+                <!-- Task List -->
+                <div id="recap-task-list">
+                    <!-- Tasks will be populated by JS -->
+                </div>
+            </div>
+
             <div class="sidebar">
                 <h2>Rollouts</h2>
                 <ul id="video-list">
