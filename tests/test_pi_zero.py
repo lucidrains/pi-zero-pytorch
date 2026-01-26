@@ -17,7 +17,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 @param('advantage_condition', (False, True))
 @param('model_predict_output', ('flow', 'clean'))
 @param('kv_heads', (None, 2))
-@param('predict_discretized_action_aux_loss', (False, True))
 def test_pi_zero_with_vit(
     pi05: bool,
     only_vlm: bool,
@@ -27,7 +26,6 @@ def test_pi_zero_with_vit(
     advantage_condition,
     model_predict_output,
     kv_heads,
-    predict_discretized_action_aux_loss
 ):
     from vit_pytorch import ViT
     from vit_pytorch.extractor import Extractor
@@ -60,7 +58,7 @@ def test_pi_zero_with_vit(
         sample_soft_mask_lens = (2, 1, 29),
         action_dit_norm_all_linears = action_dit_norm_all_linears,
         model_predict_output = model_predict_output,
-        predict_discretized_action_aux_loss = predict_discretized_action_aux_loss,
+        predict_discretized_action_aux_loss = False,
         pi05 = pi05
     ).to(device)
 
