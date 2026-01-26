@@ -23,6 +23,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const statsQuantileInput = document.getElementById('stats-quantile-input');
     const statsResult = document.getElementById('stats-result');
 
+    const invalidateBtn = document.getElementById('invalidate-btn');
+    const invalidateCutoffInput = document.getElementById('invalidate-cutoff-input');
+    const invalidateCutoffSlider = document.getElementById('invalidate-cutoff-slider');
+
     const loadingOverlay = document.getElementById('loading-overlay');
     const loadingStatus = document.getElementById('loading-status');
     const loadingProgress = document.getElementById('loading-progress');
@@ -34,7 +38,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const gaeLamSlider = document.getElementById('gae-lam-slider');
 
     let videos = [];
-    let labels = {}; // filename -> {task_completed, marked_timestep, returns, value, advantages, advantage_ids}
+    let labels = {}; // filename -> {task_completed, marked_timestep, returns, value, advantages, advantage_ids, invalidated}
     let tasks = [];
     let activeVideo = null;
     let currentCutoff = null;
@@ -147,6 +151,36 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
+    invalidateBtn.onclick = async () => {
+        if (!activeVideo) return;
+        const cutoff = parseFloat(invalidateCutoffInput.value);
+        invalidateBtn.disabled = true;
+        invalidateBtn.textContent = 'Invalidating...';
+
+        try {
+            const response = await fetch('/api/episode/invalidate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    filename: activeVideo.filename,
+                    cutoff: cutoff
+                })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                if (labels[activeVideo.filename]) {
+                    labels[activeVideo.filename].invalidated = data.invalidated;
+                }
+                renderTimeline(activeVideo.frames, activeVideo.filename);
+            }
+        } catch (error) {
+            console.error('Invalidation failed:', error);
+        } finally {
+            invalidateBtn.disabled = false;
+            invalidateBtn.textContent = 'Invalidate';
+        }
+    };
+
     // Hyperparameter Sync
     function setupSync(input, slider) {
         input.oninput = () => { slider.value = input.value; };
@@ -155,6 +189,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     setupSync(gaeGammaInput, gaeGammaSlider);
     setupSync(gaeLamInput, gaeLamSlider);
+    setupSync(invalidateCutoffInput, invalidateCutoffSlider);
 
     async function fetchData() {
         try {
@@ -393,6 +428,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const indicator = document.createElement('div');
             indicator.className = 'advantage-indicator';
 
+            const invalidIndicator = document.createElement('div');
+            invalidIndicator.className = 'invalidated-indicator';
+            invalidIndicator.style.visibility = (label && label.invalidated && label.invalidated[i]) ? 'visible' : 'hidden';
+
             if (label && label.advantage_ids && label.advantage_ids[i] !== -1) {
                 const advId = label.advantage_ids[i];
                 indicator.classList.add(advId === 1 ? 'pos' : 'neg');
@@ -429,7 +468,13 @@ document.addEventListener('DOMContentLoaded', () => {
             };
 
             container.appendChild(indicator);
+            container.appendChild(invalidIndicator);
             container.appendChild(box);
+
+            if (label && label.invalidated && label.invalidated[i]) {
+                box.classList.add('invalidated');
+            }
+
             timelineContainer.appendChild(container);
         }
     }

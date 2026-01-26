@@ -169,7 +169,8 @@ def init_replay_buffer(video_dir: Path):
             returns = ('float', (), float('nan')),
             value = ('float', (), float('nan')),
             advantages = ('float', (), float('nan')),
-            advantage_ids = ('int', (), -1)
+            advantage_ids = ('int', (), -1),
+            invalidated = 'bool'
         )
     )
 
@@ -305,7 +306,8 @@ async def get_all_labels():
                 "task_completed": task_completed,
                 "marked_timestep": marked_timestep,
                 "task_id": task_id,
-                "returns": returns
+                "returns": returns,
+                "invalidated": REPLAY_BUFFER.data['invalidated'][episode_id].tolist()
             }
         elif task_id:
             result[filename] = {
@@ -315,7 +317,8 @@ async def get_all_labels():
                 "returns": [],
                 "value": [],
                 "advantages": [],
-                "advantage_ids": []
+                "advantage_ids": [],
+                "invalidated": REPLAY_BUFFER.data['invalidated'][episode_id].tolist()
             }
 
     # Add value/advantage data if it exists
@@ -353,6 +356,7 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.data['returns'][episode_id] = float('nan')
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['invalidated'][episode_id] = False
     
     REPLAY_BUFFER.flush()
     return {"status": "ok"}
@@ -381,6 +385,7 @@ async def label_video(req: LabelRequest):
     # Reset value and advantages to NaN as they are now stale
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['invalidated'][episode_id] = False
     
     # Calculate returns
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
@@ -442,6 +447,7 @@ async def calculate_returns(req: dict):
     # Reset value and advantages to NaN as they are now stale
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
+    REPLAY_BUFFER.data['invalidated'][episode_id] = False
 
     REPLAY_BUFFER.flush()
     
@@ -485,6 +491,7 @@ async def _calculate_episode_value_internal(episode_id: int, filename: str, max_
     final_values = torch.full((images.shape[0],), float('nan'))
     final_values[:len(values)] = torch.tensor(values)
     REPLAY_BUFFER.data['value'][episode_id] = final_values.numpy()
+    REPLAY_BUFFER.data['invalidated'][episode_id] = False
     REPLAY_BUFFER.flush()
     return values
 
@@ -558,6 +565,7 @@ async def calculate_episode_advantage(req: dict):
     final_advantages = torch.full((REPLAY_BUFFER.data['advantages'].shape[1],), float('nan'))
     final_advantages[:len(advantages)] = torch.tensor(advantages)
     REPLAY_BUFFER.data['advantages'][episode_id] = final_advantages.numpy()
+    REPLAY_BUFFER.data['invalidated'][episode_id] = False
     REPLAY_BUFFER.flush()
 
     return {"status": "ok", "advantages": advantages, "value": values.tolist()}
@@ -608,6 +616,30 @@ async def binarize_advantages(req: dict):
     REPLAY_BUFFER.flush()
 
     return {"status": "ok", "advantage_ids": adv_ids.tolist()}
+
+@app.post("/api/episode/invalidate")
+async def invalidate_episode_timesteps(req: dict):
+    filename = req.get("filename")
+    cutoff = req.get("cutoff", 0.0)
+
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+
+    advs = REPLAY_BUFFER.data['advantages'][episode_id]
+    
+    # Calculate invalidated mask: True if advantage <= cutoff and not NaN
+    valid_mask = ~np.isnan(advs)
+    invalidated = np.zeros(advs.shape, dtype=bool)
+    invalidated[valid_mask] = (advs[valid_mask] <= cutoff)
+
+    REPLAY_BUFFER.data['invalidated'][episode_id] = invalidated
+    REPLAY_BUFFER.flush()
+
+    return {"status": "ok", "invalidated": invalidated.tolist()}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
