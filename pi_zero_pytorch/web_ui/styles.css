@@ -15,6 +15,10 @@
     font-family: 'Outfit', sans-serif;
 }
 
+.hidden-element {
+    display: none !important;
+}
+
 body {
     background: #000;
     color: var(--text-primary);

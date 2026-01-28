@@ -43,6 +43,48 @@ document.addEventListener('DOMContentLoaded', () => {
     let activeVideo = null;
     let currentCutoff = null;
 
+    // Initial UI state
+    function updateUIVisibility() {
+        const mainContentElements = [
+            timelineContainer,
+            valueChartContainer,
+            advantageChartContainer,
+            document.querySelector('.player-container'),
+            document.querySelector('.carousel-container')
+        ];
+
+        const isVisible = activeVideo !== null;
+        mainContentElements.forEach(el => {
+            if (el) {
+                if (isVisible) {
+                    el.classList.remove('hidden-element');
+                } else {
+                    el.classList.add('hidden-element');
+                }
+            }
+        });
+
+        // Also header info
+        const headerInfoElements = [
+            resetBtn,
+            document.getElementById('current-frames'),
+            document.getElementById('current-task'),
+            timeLabel,
+            document.querySelector('.action-group')
+        ];
+        headerInfoElements.forEach(el => {
+            if (el) {
+                if (isVisible) {
+                    el.classList.remove('hidden-element');
+                } else {
+                    el.classList.add('hidden-element');
+                }
+            }
+        });
+    }
+
+    updateUIVisibility();
+
     // Penalty sync
     penaltyInput.oninput = () => {
         penaltySlider.value = penaltyInput.value;
@@ -806,6 +848,7 @@ document.addEventListener('DOMContentLoaded', () => {
         currentFrames.textContent = `${video.frames} frames`;
 
         updateHeaderStatus(video.filename);
+        updateUIVisibility();
         renderTimeline(video.frames, video.filename);
         renderCharts(video.filename);
         renderTasks();
@@ -912,11 +955,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (iter.data.length > 0) {
                     const dataList = document.createElement('div');
                     dataList.className = 'recap-data-list';
-                    for (const dataId of iter.data) {
+                    for (const dataObj of iter.data) {
                         const dataItem = document.createElement('div');
                         dataItem.className = 'recap-data-item';
-                        dataItem.textContent = `📁 ${dataId}`;
-                        dataItem.onclick = () => loadRecapData(task.name, iter.id, dataId);
+                        dataItem.textContent = `📁 ${dataObj.id} (${dataObj.video_count} videos)`;
+                        dataItem.onclick = () => loadRecapData(task.name, iter.id, dataObj.id);
                         dataList.appendChild(dataItem);
                     }
                     taskGroup.appendChild(dataList);
@@ -998,6 +1041,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 videos = [];
                 labels = {};
                 activeVideo = null;
+                updateUIVisibility();
                 videoList.innerHTML = '';
                 carouselTrack.innerHTML = '';
                 timelineContainer.innerHTML = '';

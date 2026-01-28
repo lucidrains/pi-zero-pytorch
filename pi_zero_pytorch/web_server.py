@@ -250,7 +250,7 @@ async def list_videos():
     # common video extensions
     extensions = {".mp4", ".webm", ".avi", ".mov"}
     
-    if not VIDEO_DIR.exists():
+    if VIDEO_DIR is None or not VIDEO_DIR.exists():
         return []
 
     for file in VIDEO_DIR.iterdir():
@@ -266,6 +266,15 @@ async def list_videos():
     # sort by filename
     videos.sort(key=lambda x: x.filename)
     return videos
+
+@app.get("/videos/{filename}")
+async def serve_video(filename: str):
+    if VIDEO_DIR is None:
+        return {"error": "Video directory not set"}
+    video_path = VIDEO_DIR / filename
+    if not video_path.exists():
+         return {"error": "Video not found"}
+    return FileResponse(video_path)
 
 
 @app.get("/api/video/{filename}/frames")
@@ -663,6 +672,7 @@ async def get_recap_state():
     }
 
     # Get tasks from config
+    extensions = {".mp4", ".webm", ".avi", ".mov"}
     for task_name, task_config in RECAP_CONFIG.get("tasks", {}).items():
         task_dir = RECAP_WORKSPACE / task_name
         task_state = {
@@ -678,7 +688,15 @@ async def get_recap_state():
                 if iter_dir.is_dir() and iter_dir.name.isdigit():
                     iter_id = int(iter_dir.name)
                     # Find data folders (data.0, data.1, ...)
-                    data_folders = sorted([d.name for d in iter_dir.glob("data.*") if d.is_dir()])
+                    data_folders = []
+                    for d in sorted(iter_dir.glob("data.*")):
+                        if d.is_dir():
+                            video_count = len([f for f in d.iterdir() if f.suffix.lower() in extensions and f.stat().st_size > 0])
+                            data_folders.append({
+                                "id": d.name,
+                                "video_count": video_count
+                            })
+
                     task_state["iterations"].append({
                         "id": iter_id,
                         "actor": (iter_dir / "actor.pt").exists(),
@@ -825,33 +843,38 @@ async def recap_load_data(req: dict):
     return {"status": "ok", "video_dir": str(VIDEO_DIR)}
 
 @click.command()
-@click.option('--folder', default='./video-rollout', help='Folder containing the videos.')
+@click.option('--folder', default=None, help='Folder containing the videos.')
 @click.option('--port', default=8000, help='Port to run the server on.')
 @click.option('--recap-workspace', default=None, help='Path to RECAP algorithm workspace folder.')
 def main(folder, port, recap_workspace):
     global VIDEO_DIR, RECAP_WORKSPACE
-    VIDEO_DIR = Path(folder)
-    
+
+    if (folder is not None) and (recap_workspace is not None):
+        print("Error: Cannot provide both --folder and --recap-workspace. Please provide only one.")
+        return
+
+    if (folder is None) and (recap_workspace is None):
+        folder = './video-rollout'
+
     # Initialize RECAP workspace if provided
     if recap_workspace:
         RECAP_WORKSPACE = Path(recap_workspace)
         RECAP_WORKSPACE.mkdir(parents=True, exist_ok=True)
         print(f"RECAP workspace enabled: {RECAP_WORKSPACE}")
-    
-    if not VIDEO_DIR.exists():
-        print(f"Error: Folder {folder} does not exist.")
-        return
-
-    # Initialize ReplayBuffer in background
-    threading.Thread(target=init_replay_buffer, args=(VIDEO_DIR,), daemon=True).start()
+        VIDEO_DIR = None
+    else:
+        VIDEO_DIR = Path(folder)
+        if not VIDEO_DIR.exists():
+            print(f"Error: Folder {folder} does not exist.")
+            return
+        
+        # Initialize ReplayBuffer in background
+        threading.Thread(target=init_replay_buffer, args=(VIDEO_DIR,), daemon=True).start()
 
     # Initialize Value Network
     global VALUE_NETWORK
     print(f"Initializing SmallValueNetwork on {DEVICE}...")
     VALUE_NETWORK = SmallValueNetwork().to(DEVICE)
-
-    # Mount the video directory to serve files
-    app.mount("/videos", StaticFiles(directory=str(VIDEO_DIR)), name="videos")
     
     # Mount the cache directory for frames
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
