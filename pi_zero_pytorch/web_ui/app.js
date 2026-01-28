@@ -32,6 +32,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const loadingProgress = document.getElementById('loading-progress');
     const loadingDetail = document.getElementById('loading-detail');
 
+    // Force hide overlay immediately on script load to be safe
+    if (loadingOverlay) loadingOverlay.classList.add('hidden-element');
+
     const gaeGammaInput = document.getElementById('gae-gamma-input');
     const gaeGammaSlider = document.getElementById('gae-gamma-slider');
     const gaeLamInput = document.getElementById('gae-lam-input');
@@ -42,6 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let tasks = [];
     let activeVideo = null;
     let currentCutoff = null;
+    let recapState = null;
 
     // Initial UI state
     function updateUIVisibility() {
@@ -81,6 +85,36 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
         });
+
+        // Persistent actions (like training) should be visible if we have data, even if no active video
+        const persistentGroup = document.querySelector('.action-group-persistent');
+        if (persistentGroup) {
+            // Check if ReplayBuffer exists or if we've loaded a data folder
+            // Watch for recapState - if enabled, show persistent actions
+            const hasDataLoaded = videos.length > 0 || (recapState && recapState.enabled);
+            if (hasDataLoaded) {
+                persistentGroup.classList.remove('hidden-element');
+            } else {
+                persistentGroup.classList.add('hidden-element');
+            }
+        }
+
+        // Also sidebars
+        const rolloutsSidebar = document.querySelector('.sidebar');
+        const tasksSidebar = document.querySelector('.task-sidebar');
+
+        if (rolloutsSidebar && tasksSidebar) {
+            // In RECAP mode, hide sidebars if no data loaded
+            const hasData = videos.length > 0;
+
+            if (!hasData) {
+                rolloutsSidebar.style.display = 'none';
+                tasksSidebar.style.display = 'none';
+            } else {
+                rolloutsSidebar.style.display = 'block';
+                tasksSidebar.style.display = 'block';
+            }
+        }
     }
 
     updateUIVisibility();
@@ -530,16 +564,19 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderChart(container, data, title, type) {
         if (!data || data.length === 0) {
             container.innerHTML = '';
+            container.classList.remove('active');
             container.style.display = 'none';
             return;
         }
 
+        container.classList.add('active');
         container.style.display = 'block';
         container.innerHTML = `<div class="chart-title">${title}</div>`;
 
         const validData = data.filter(v => v !== null && !isNaN(v));
         if (validData.length === 0) {
             container.innerHTML = '';
+            container.classList.remove('active');
             container.style.display = 'none';
             return;
         }
@@ -562,6 +599,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
         svg.setAttribute("class", "chart-svg");
         svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.setAttribute("preserveAspectRatio", "none");
 
         // Axis
         const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
@@ -856,12 +894,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function checkConversionStatus() {
+        // If in RECAP mode and no video dir is set, skip conversion check
+        if (recapState && recapState.enabled && loadingOverlay.dataset.recapLoading !== 'true') {
+            console.log("RECAP mode: skipping checkConversionStatus");
+            loadingOverlay.classList.add('hidden-element');
+            return;
+        }
+
         try {
             const response = await fetch('/api/status');
             const status = await response.json();
 
             if (status.is_converting) {
-                loadingOverlay.classList.remove('hidden');
+                loadingOverlay.classList.remove('hidden-element');
                 const percent = status.total > 0 ? (status.progress / status.total) * 100 : 0;
                 loadingProgress.style.width = `${percent}%`;
                 loadingStatus.textContent = `Converting videos... (${status.progress}/${status.total})`;
@@ -869,7 +914,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 setTimeout(checkConversionStatus, 1000);
             } else {
-                loadingOverlay.classList.add('hidden');
+                loadingOverlay.classList.add('hidden-element');
                 // Only fetch data once conversion is complete
                 await fetchData();
             }
@@ -884,7 +929,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const recapGeneralistStatus = document.getElementById('recap-generalist-status');
     const btnPretrain = document.getElementById('btn-pretrain');
 
-    let recapState = null;
+
 
     async function fetchRecapState() {
         try {
@@ -897,6 +942,7 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 recapSidebar.style.display = 'none';
             }
+            updateUIVisibility();
         } catch (error) {
             console.error('Failed to fetch RECAP state:', error);
         }
@@ -1025,7 +1071,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     async function loadRecapData(taskName, iterId, dataId) {
-        loadingOverlay.classList.remove('hidden');
+        loadingOverlay.classList.remove('hidden-element');
         loadingStatus.textContent = 'Loading RECAP data...';
         loadingDetail.textContent = `${taskName} / iter ${iterId} / ${dataId}`;
 
@@ -1046,14 +1092,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 carouselTrack.innerHTML = '';
                 timelineContainer.innerHTML = '';
                 // Check conversion status which will trigger fetchData when done
+                loadingOverlay.dataset.recapLoading = 'true';
                 checkConversionStatus();
             } else {
                 console.error('Load failed:', data.error);
-                loadingOverlay.classList.add('hidden');
+                loadingOverlay.classList.add('hidden-element');
             }
         } catch (error) {
             console.error('Load failed:', error);
-            loadingOverlay.classList.add('hidden');
+            loadingOverlay.classList.add('hidden-element');
         }
     }
 
@@ -1075,7 +1122,210 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
-    // Initialize
-    checkConversionStatus();
-    fetchRecapState();
+    // Initialize - check RECAP mode first
+    async function initialize() {
+        console.log("Starting initialization...");
+        await fetchRecapState();
+        console.log("RECAP state fetched:", recapState);
+
+        // If in RECAP mode, don't start conversion polling
+        // Just show the RECAP sidebar and wait for user to load data
+        if (recapState && recapState.enabled) {
+            console.log("RECAP mode active, explicit hide overlay");
+            loadingOverlay.classList.add('hidden-element');
+            updateUIVisibility();
+            await fetchValueNetworks();
+            return;
+        }
+
+        // Otherwise, check conversion status for legacy folder mode
+        console.log("Legacy mode: checking conversion status");
+        checkConversionStatus();
+    }
+
+    initialize();
+
+    // Training UI logic
+    const trainValueBtn = document.getElementById('train-value-btn');
+    const trainingModal = document.getElementById('training-modal');
+    const startTrainBtn = document.getElementById('btn-start-train');
+    const cancelTrainBtn = document.getElementById('btn-cancel-train');
+    const configOptions = document.querySelectorAll('.config-option');
+    const trainingProgressView = document.getElementById('training-progress-view');
+    const trainEpoch = document.getElementById('train-epoch');
+    const trainLoss = document.getElementById('train-loss');
+    const trainProgressBar = document.getElementById('train-progress-bar');
+    const trainStepDetail = document.getElementById('train-step-detail');
+    const trainingSuccessView = document.getElementById('training-success-view');
+    const recapValueNetworks = document.getElementById('recap-value-networks');
+    const summaryConfig = document.getElementById('summary-config');
+    const summaryEpochs = document.getElementById('summary-epochs');
+    const summaryLoss = document.getElementById('summary-loss');
+
+    let selectedConfig = 'mock';
+    let trainingSocket = null;
+    let activeValueNetwork = null;
+
+    function setupTrainingSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const socketUrl = `${protocol}//${window.location.host}/ws/training`;
+
+        trainingSocket = new WebSocket(socketUrl);
+
+        trainingSocket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === 'training_update') {
+                updateTrainingUI(data.state);
+            }
+        };
+
+        trainingSocket.onerror = () => {
+            console.error('Training WebSocket error');
+        };
+
+        trainingSocket.onclose = () => {
+            setTimeout(setupTrainingSocket, 3000);
+        };
+    }
+
+    function updateTrainingUI(state) {
+        if (!state.is_training) {
+            if (state.current_step > 0 && state.current_step >= state.total_steps) {
+                // Show Success View
+                trainingProgressView.classList.add('hidden-element');
+                trainingSuccessView.classList.remove('hidden-element');
+
+                summaryConfig.textContent = selectedConfig.toUpperCase();
+                summaryEpochs.textContent = state.current_epoch;
+                summaryLoss.textContent = state.last_loss.toFixed(6);
+
+                startTrainBtn.disabled = false;
+                startTrainBtn.textContent = 'Train Again';
+
+                fetchValueNetworks(); // Refresh list
+            }
+            return;
+        }
+
+        trainingProgressView.classList.remove('hidden-element');
+        trainingSuccessView.classList.add('hidden-element');
+        document.querySelector('.config-selection').classList.add('hidden-element');
+        startTrainBtn.disabled = true;
+        startTrainBtn.textContent = 'Training...';
+
+        trainEpoch.textContent = state.current_epoch;
+        trainLoss.textContent = state.last_loss.toFixed(6);
+
+        const progress = (state.current_step / state.total_steps) * 100;
+        trainProgressBar.style.width = `${progress}%`;
+        trainStepDetail.textContent = `Step ${state.current_step} / ${state.total_steps}`;
+    }
+
+    async function fetchValueNetworks() {
+        try {
+            const response = await fetch('/api/value/networks/list');
+            const networks = await response.json();
+            renderValueNetworks(networks);
+        } catch (error) {
+            console.error('Failed to fetch value networks:', error);
+        }
+    }
+
+    function renderValueNetworks(networks) {
+        recapValueNetworks.innerHTML = '';
+        if (networks.length === 0) {
+            recapValueNetworks.innerHTML = '<p class="tiny-label">No models trained yet.</p>';
+        } else {
+            networks.forEach(net => {
+                const item = document.createElement('div');
+                item.className = 'recap-value-item';
+                if (activeValueNetwork === net.filename) {
+                    item.classList.add('active');
+                }
+
+                const timestamp = net.timestamp.replace('_', ' ');
+                item.innerHTML = `
+                    <div class="value-item-header">
+                        <span class="model-name">${net.config_name.toUpperCase()}</span>
+                        <span class="model-loss">Loss: ${net.final_loss.toFixed(6)}</span>
+                    </div>
+                    <div class="value-item-meta">
+                        <span>${timestamp}</span>
+                        <span>${net.epochs} epochs</span>
+                    </div>
+                `;
+
+                item.onclick = () => loadValueNetwork(net.filename);
+                recapValueNetworks.appendChild(item);
+            });
+        }
+    }
+
+    async function loadValueNetwork(filename) {
+        try {
+            const response = await fetch('/api/value/networks/load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                activeValueNetwork = filename;
+                calcValueBtn.disabled = false;
+                fetchValueNetworks(); // Refresh to update active state
+            } else {
+                alert('Load failed: ' + data.error);
+            }
+        } catch (error) {
+            console.error('Load failed:', error);
+        }
+    }
+
+    trainValueBtn.onclick = () => {
+        trainingModal.classList.remove('hidden-element');
+        trainingProgressView.classList.add('hidden-element');
+        trainingSuccessView.classList.add('hidden-element');
+        document.querySelector('.config-selection').classList.remove('hidden-element');
+        startTrainBtn.disabled = false;
+        startTrainBtn.textContent = 'Start Training';
+    };
+
+    const sidebarTrainBtn = document.getElementById('sidebar-train-btn');
+    if (sidebarTrainBtn) {
+        sidebarTrainBtn.onclick = trainValueBtn.onclick;
+    }
+
+    cancelTrainBtn.onclick = () => {
+        trainingModal.classList.add('hidden-element');
+    };
+
+    configOptions.forEach(opt => {
+        opt.onclick = () => {
+            configOptions.forEach(o => o.classList.remove('selected'));
+            opt.classList.add('selected');
+            selectedConfig = opt.dataset.config;
+        };
+    });
+
+    startTrainBtn.onclick = async () => {
+        try {
+            const response = await fetch('/api/value/train', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ config: selectedConfig })
+            });
+            const result = await response.json();
+            if (result.error) {
+                alert(result.error);
+            } else {
+                trainingProgressView.classList.remove('hidden-element');
+                document.querySelector('.config-selection').classList.add('hidden-element');
+            }
+        } catch (error) {
+            console.error('Training failed:', error);
+        }
+    };
+
+    setupTrainingSocket();
+    fetchValueNetworks();
 });

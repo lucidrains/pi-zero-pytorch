@@ -12,7 +12,7 @@
 </head>
 
 <body>
-    <div id="loading-overlay" class="loading-overlay">
+    <div id="loading-overlay" class="loading-overlay hidden-element">
         <div class="loader-content">
             <h1 class="logo">π0 Labeller</h1>
             <div class="spinner"></div>
@@ -40,9 +40,14 @@
             <div class="header-row header-row-2">
                 <div class="action-group">
                     <button id="calc-returns-btn" class="btn-action" title="Calculate GAE Returns">Calc Returns</button>
-                    <button id="calc-value-btn" class="btn-action" title="Estimate Values">Calc Value</button>
+                    <button id="calc-value-btn" class="btn-action" title="Estimate Values" disabled>Calc Value</button>
                     <button id="calc-advantage-btn" class="btn-action" title="Calculate GAE Advantages">Calc
                         Advantage</button>
+                </div>
+
+                <div class="action-group-persistent">
+                    <button id="train-value-btn" class="btn-action pulse" title="Train Value Network on Returns">Train
+                        Value Network</button>
                 </div>
 
                 <div class="controls-wrapper">
@@ -89,7 +94,8 @@
                                 <input type="range" id="invalidate-cutoff-slider" min="-5.0" max="0.0" step="0.01"
                                     value="0.0">
                             </div>
-                            <button id="invalidate-btn" class="btn-action" title="Invalidate Timesteps">Invalidate</button>
+                            <button id="invalidate-btn" class="btn-action"
+                                title="Invalidate Timesteps">Invalidate</button>
                         </div>
                     </div>
                 </div>
@@ -112,6 +118,16 @@
                 <!-- Task List -->
                 <div id="recap-task-list">
                     <!-- Tasks will be populated by JS -->
+                </div>
+
+                <!-- Value Network Selection -->
+                <div class="recap-section">
+                    <div class="section-title">Value Networks
+                        <button id="sidebar-train-btn" class="btn-recap-mini" style="margin-left: auto;">Train</button>
+                    </div>
+                    <div id="recap-value-networks" class="recap-value-list">
+                        <!-- Networks will be populated by JS -->
+                    </div>
                 </div>
             </div>
 
@@ -149,6 +165,65 @@
                 </div>
             </div>
         </main>
+    </div>
+
+    <!-- Training Modal -->
+    <div id="training-modal" class="modal hidden-element">
+        <div class="modal-content glass-container">
+            <h3>Train Value Network</h3>
+            <p class="tiny-label">Select configuration and train on calculated returns.</p>
+
+            <div class="config-selection">
+                <div class="config-option selected" data-config="mock">
+                    <span class="config-name">Mock (Ultra Fast)</span>
+                    <span class="config-detail">16 dim, 1 depth, 2 heads, 32x32px</span>
+                </div>
+                <div class="config-option" data-config="small">
+                    <span class="config-name">Small</span>
+                    <span class="config-detail">64 dim, 2 depth, 4 heads (Extremely Small)</span>
+                </div>
+                <div class="config-option" data-config="medium">
+                    <span class="config-name">Medium</span>
+                    <span class="config-detail">128 dim, 4 depth, 8 heads</span>
+                </div>
+                <div class="config-option" data-config="large">
+                    <span class="config-name">Large</span>
+                    <span class="config-detail">256 dim, 6 depth, 8 heads</span>
+                </div>
+            </div>
+
+            <div id="training-progress-view" class="hidden-element">
+                <div class="training-stats">
+                    <div class="stat-item">
+                        <span class="stat-label">Epoch</span>
+                        <span id="train-epoch">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Loss</span>
+                        <span id="train-loss">-</span>
+                    </div>
+                </div>
+                <div class="progress-container">
+                    <div id="train-progress-bar" class="progress-bar"></div>
+                </div>
+                <p id="train-step-detail" class="tiny-label"></p>
+            </div>
+
+            <div id="training-success-view" class="hidden-element">
+                <div class="success-icon">✓</div>
+                <h4>Training Complete!</h4>
+                <div class="training-summary">
+                    <p>Model: <span id="summary-config">-</span></p>
+                    <p>Epochs: <span id="summary-epochs">-</span></p>
+                    <p>Final Loss: <span id="summary-loss">-</span></p>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="btn-cancel-train" class="btn-secondary">Close</button>
+                <button id="btn-start-train" class="btn-primary">Start Training</button>
+            </div>
+        </div>
     </div>
 
     <script src="/ui/app.js"></script>

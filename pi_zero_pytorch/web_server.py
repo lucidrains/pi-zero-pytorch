@@ -17,6 +17,8 @@ from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate, SigLIP,
 import json
 import tqdm
 import threading
+import asyncio
+from fastapi import WebSocket, WebSocketDisconnect
 
 CONVERSION_STATUS = {
     "is_converting": False,
@@ -46,6 +48,8 @@ class SmallValueNetwork(torch.nn.Module):
         num_bins = 201
     ):
         super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
 
         self.siglip = SigLIP(
             image_size = image_size,
@@ -62,10 +66,46 @@ class SmallValueNetwork(torch.nn.Module):
             num_bins = num_bins
         )
 
-    def forward(self, images):
+    def forward(self, images, return_value_and_logits = False):
         embeds = self.siglip(images)
         pooled = embeds.mean(dim = 1)
-        return self.to_value(pooled)
+        return self.to_value(pooled, return_value_and_logits = return_value_and_logits)
+
+VALUE_NETWORK_CONFIGS = {
+    "mock": {"dim": 16, "depth": 1, "heads": 2, "image_size": 32, "patch_size": 4},
+    "small": {"dim": 64, "depth": 2, "heads": 4, "image_size": 224, "patch_size": 14},
+    "medium": {"dim": 128, "depth": 4, "heads": 8, "image_size": 224, "patch_size": 14},
+    "large": {"dim": 256, "depth": 6, "heads": 8, "image_size": 224, "patch_size": 14}
+}
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except:
+                pass
+
+manager = ConnectionManager()
+TRAINING_STATE = {
+    "is_training": False,
+    "current_epoch": 0,
+    "total_epochs": 0,
+    "current_step": 0,
+    "total_steps": 0,
+    "last_loss": 0.0
+}
 
 app = FastAPI()
 
@@ -489,9 +529,10 @@ async def _calculate_episode_value_internal(episode_id: int, filename: str, max_
             batch_images = torch.from_numpy(batch_images).to(DEVICE)
             batch_images = batch_images.squeeze(2)
             
-            # Resize if needed
-            if batch_images.shape[-2:] != (224, 224):
-                batch_images = TF.resize(batch_images, (224, 224), antialias = True)
+            # Use model's expected image size
+            target_size = (VALUE_NETWORK.image_size, VALUE_NETWORK.image_size)
+            if batch_images.shape[-2:] != target_size:
+                batch_images = TF.resize(batch_images, target_size, antialias = True)
             
             batch_values = VALUE_NETWORK(batch_images)
             values.extend(batch_values.cpu().tolist())
@@ -539,45 +580,49 @@ async def calculate_episode_advantage(req: dict):
     if episode_id is None:
         return {"error": "Video not found in buffer"}
 
-    # Get actual frame count
-    video_path = VIDEO_DIR / filename
-    num_frames = get_frame_count(video_path)
-    
-    marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
-    if marked_timestep != -1:
-        num_frames = min(num_frames, marked_timestep + 1)
+    try:
+        # Get actual frame count
+        video_path = VIDEO_DIR / filename
+        num_frames = get_frame_count(video_path)
+        
+        marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
+        if marked_timestep != -1:
+            num_frames = min(num_frames, marked_timestep + 1)
 
-    # Check if values exist, otherwise calculate them
-    values_np = REPLAY_BUFFER.data['value'][episode_id]
-    if np.isnan(values_np[:num_frames]).any():
-        print(f"Values not found for {filename}, calculating first...")
-        await _calculate_episode_value_internal(episode_id, filename, max_t = num_frames)
+        # Check if values exist, otherwise calculate them
         values_np = REPLAY_BUFFER.data['value'][episode_id]
+        if np.isnan(values_np[:num_frames]).any():
+            print(f"Values not found for {filename}, calculating first...")
+            await _calculate_episode_value_internal(episode_id, filename, max_t = num_frames)
+            values_np = REPLAY_BUFFER.data['value'][episode_id]
 
-    # Prepare inputs for GAE
-    rewards = torch.from_numpy(REPLAY_BUFFER.data['reward'][episode_id][:num_frames])
-    values = torch.from_numpy(values_np[:num_frames])
-    masks = torch.ones_like(rewards) # Assume all frames are valid for now
+        # Prepare inputs for GAE
+        rewards = torch.from_numpy(REPLAY_BUFFER.data['reward'][episode_id][:num_frames])
+        values = torch.from_numpy(values_np[:num_frames])
+        masks = torch.ones_like(rewards) # Assume all frames are valid for now
 
-    # Calculate GAE
-    gae_return = calc_generalized_advantage_estimate(
-        rewards = rewards,
-        values = values,
-        masks = masks,
-        gamma = gamma,
-        lam = lam
-    )
+        # Calculate GAE
+        gae_return = calc_generalized_advantage_estimate(
+            rewards = rewards,
+            values = values,
+            masks = masks,
+            gamma = gamma,
+            lam = lam
+        )
 
-    advantages = gae_return.advantages.tolist()
+        advantages = gae_return.advantages.tolist()
 
-    # Store advantages back
-    final_advantages = torch.full((REPLAY_BUFFER.data['advantages'].shape[1],), float('nan'))
-    final_advantages[:len(advantages)] = torch.tensor(advantages)
-    REPLAY_BUFFER.data['advantages'][episode_id] = final_advantages.numpy()
-    REPLAY_BUFFER.data['invalidated'][episode_id] = False
-    REPLAY_BUFFER.flush()
+        # Store advantages back
+        final_advantages = torch.full((REPLAY_BUFFER.data['advantages'].shape[1],), float('nan'))
+        final_advantages[:len(advantages)] = torch.tensor(advantages)
+        REPLAY_BUFFER.data['advantages'][episode_id] = final_advantages.numpy()
+        REPLAY_BUFFER.data['invalidated'][episode_id] = False
+        REPLAY_BUFFER.flush()
 
-    return {"status": "ok", "advantages": advantages, "value": values.tolist()}
+        return {"status": "ok", "advantages": advantages, "value": values.tolist()}
+    except Exception as e:
+        print(f"Error calculating advantage for {filename}: {str(e)}")
+        return {"error": str(e)}
 
 @app.post("/api/advantage/stats")
 async def calculate_global_advantage_stats(req: dict):
@@ -816,6 +861,180 @@ async def recap_iterate(req: dict):
     
     return {"status": "ok", "new_iteration": next_iter_id}
 
+@app.websocket("/ws/training")
+async def training_websocket(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text() # Just keep alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+def _broadcast_training_update(loop):
+    asyncio.run_coroutine_threadsafe(
+        manager.broadcast(json.dumps({
+            "type": "training_update",
+            "state": TRAINING_STATE
+        })),
+        loop
+    )
+
+def train_value_network_thread(config_name: str, loop):
+    global VALUE_NETWORK, TRAINING_STATE
+    
+    # 1. Prepare data
+    all_images = []
+    all_returns = []
+    
+    for i in range(len(REPLAY_BUFFER)):
+        returns = REPLAY_BUFFER.data['returns'][i]
+        valid_mask = ~np.isnan(returns)
+        if valid_mask.any():
+            images = REPLAY_BUFFER.data['images'][i][valid_mask]
+            all_images.append(torch.from_numpy(images))
+            all_returns.append(torch.from_numpy(returns[valid_mask]))
+    
+    if not all_images:
+        TRAINING_STATE["is_training"] = False
+        _broadcast_training_update(loop)
+        return
+
+    dataset = torch.utils.data.TensorDataset(torch.cat(all_images), torch.cat(all_returns))
+    batch_size = 16
+    loader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = True)
+
+    # 2. Initialize model
+    config = VALUE_NETWORK_CONFIGS.get(config_name, VALUE_NETWORK_CONFIGS["small"])
+    model = SmallValueNetwork(**config).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr = 3e-4)
+    model.train()
+
+    num_epochs = 10
+    TRAINING_STATE.update({
+        "is_training": True,
+        "current_epoch": 0,
+        "total_epochs": num_epochs,
+        "current_step": 0,
+        "total_steps": len(loader) * num_epochs,
+        "last_loss": 0.0
+    })
+    _broadcast_training_update(loop)
+
+    # 3. Training loop
+    target_size = (config.get('image_size', 224), config.get('image_size', 224))
+    
+    for epoch in range(num_epochs):
+        TRAINING_STATE["current_epoch"] = epoch + 1
+        for i, (images, returns) in enumerate(loader):
+            images = images.to(DEVICE).squeeze(2)
+            if images.shape[-2:] != target_size:
+                images = TF.resize(images, target_size, antialias = True)
+            
+            returns = returns.to(DEVICE)
+            
+            values, logits = model(images, return_value_and_logits = True)
+            loss = model.to_value.loss_fn(logits, returns).mean()
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            TRAINING_STATE["current_step"] += 1
+            TRAINING_STATE["last_loss"] = float(loss.item())
+            
+            if i % 5 == 0:
+                _broadcast_training_update(loop)
+        
+        _broadcast_training_update(loop)
+
+    # 4. Finalize
+    VALUE_NETWORK = model
+    
+    # Save the model
+    if RECAP_WORKSPACE:
+        networks_dir = RECAP_WORKSPACE / "value_networks"
+        networks_dir.mkdir(parents=True, exist_ok=True)
+        
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_filename = f"{config_name}_{timestamp}.pt"
+        model_path = networks_dir / model_filename
+        
+        torch.save({
+            "state_dict": model.state_dict(),
+            "config": config,
+            "config_name": config_name,
+            "epochs": num_epochs,
+            "final_loss": TRAINING_STATE["last_loss"],
+            "timestamp": timestamp
+        }, str(model_path))
+        print(f"Value network saved to {model_path}")
+
+    TRAINING_STATE["is_training"] = False
+    _broadcast_training_update(loop)
+
+@app.get("/api/value/networks/list")
+async def list_value_networks():
+    if not RECAP_WORKSPACE:
+        return []
+    
+    networks_dir = RECAP_WORKSPACE / "value_networks"
+    if not networks_dir.exists():
+        return []
+    
+    networks = []
+    for f in networks_dir.glob("*.pt"):
+        try:
+            checkpoint = torch.load(str(f), map_location='cpu', weights_only=False)
+            networks.append({
+                "filename": f.name,
+                "config_name": checkpoint.get("config_name", "unknown"),
+                "epochs": checkpoint.get("epochs", 0),
+                "final_loss": checkpoint.get("final_loss", 0.0),
+                "timestamp": checkpoint.get("timestamp", "")
+            })
+        except Exception as e:
+            print(f"Error loading checkpoint {f}: {e}")
+            
+    # sort by timestamp descending
+    networks.sort(key=lambda x: x['timestamp'], reverse=True)
+    return networks
+
+@app.post("/api/value/networks/load")
+async def load_value_network(req: dict):
+    global VALUE_NETWORK
+    filename = req.get("filename")
+    if not filename or not RECAP_WORKSPACE:
+        return {"error": "Missing filename or RECAP_WORKSPACE"}
+    
+    model_path = RECAP_WORKSPACE / "value_networks" / filename
+    if not model_path.exists():
+        return {"error": "Model file not found"}
+    
+    try:
+        checkpoint = torch.load(str(model_path), map_location=DEVICE, weights_only=False)
+        config = checkpoint["config"]
+        model = SmallValueNetwork(**config).to(DEVICE)
+        model.load_state_dict(checkpoint["state_dict"])
+        VALUE_NETWORK = model
+        return {"status": "ok", "config_name": checkpoint.get("config_name")}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/value/train")
+async def start_training(req: dict):
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    if TRAINING_STATE["is_training"]:
+        return {"error": "Training already in progress"}
+        
+    config_name = req.get("config", "small")
+    loop = asyncio.get_event_loop()
+    threading.Thread(target=train_value_network_thread, args=(config_name, loop), daemon=True).start()
+    
+    return {"status": "ok"}
+
 @app.post("/api/recap/load_data")
 async def recap_load_data(req: dict):
     """Mounts a specific data folder to view in the labeller."""
@@ -843,33 +1062,27 @@ async def recap_load_data(req: dict):
     return {"status": "ok", "video_dir": str(VIDEO_DIR)}
 
 @click.command()
-@click.option('--folder', default=None, help='Folder containing the videos.')
 @click.option('--port', default=8000, help='Port to run the server on.')
-@click.option('--recap-workspace', default=None, help='Path to RECAP algorithm workspace folder.')
-def main(folder, port, recap_workspace):
+@click.option('--recap-workspace', required=True, help='Path to RECAP algorithm workspace folder.')
+def main(port, recap_workspace):
     global VIDEO_DIR, RECAP_WORKSPACE
 
-    if (folder is not None) and (recap_workspace is not None):
-        print("Error: Cannot provide both --folder and --recap-workspace. Please provide only one.")
-        return
-
-    if (folder is None) and (recap_workspace is None):
-        folder = './video-rollout'
-
-    # Initialize RECAP workspace if provided
-    if recap_workspace:
-        RECAP_WORKSPACE = Path(recap_workspace)
-        RECAP_WORKSPACE.mkdir(parents=True, exist_ok=True)
-        print(f"RECAP workspace enabled: {RECAP_WORKSPACE}")
-        VIDEO_DIR = None
-    else:
-        VIDEO_DIR = Path(folder)
-        if not VIDEO_DIR.exists():
-            print(f"Error: Folder {folder} does not exist.")
-            return
-        
-        # Initialize ReplayBuffer in background
-        threading.Thread(target=init_replay_buffer, args=(VIDEO_DIR,), daemon=True).start()
+    # Initialize RECAP workspace
+    RECAP_WORKSPACE = Path(recap_workspace)
+    RECAP_WORKSPACE.mkdir(parents=True, exist_ok=True)
+    print(f"RECAP workspace enabled: {RECAP_WORKSPACE}")
+    
+    # VIDEO_DIR will be set dynamically when loading a data folder
+    VIDEO_DIR = None
+    
+    # Initialize CONVERSION_STATUS as not converting
+    global CONVERSION_STATUS
+    CONVERSION_STATUS = {
+        "is_converting": False,
+        "progress": 0,
+        "total": 0,
+        "current_video": ""
+    }
 
     # Initialize Value Network
     global VALUE_NETWORK
