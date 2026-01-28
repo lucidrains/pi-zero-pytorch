@@ -175,6 +175,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     calcStatsBtn.onclick = async () => {
+        statsResult.classList.remove('hidden-element');
         const percentile = parseFloat(statsQuantileInput.value);
         calcStatsBtn.disabled = true;
         calcStatsBtn.textContent = 'Calculating...';
@@ -201,6 +202,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     binarizeBtn.onclick = async () => {
+        statsResult.classList.remove('hidden-element');
         if (!activeVideo || currentCutoff === null) return;
 
         binarizeBtn.disabled = true;
@@ -219,9 +221,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     labels[activeVideo.filename].advantage_ids = data.advantage_ids;
                 }
                 renderTimeline(activeVideo.frames, activeVideo.filename);
+                renderRecapSidebar();
+                statsResult.textContent = `Binarized with cutoff: ${currentCutoff.toFixed(6)}`;
             }
         } catch (error) {
             console.error('Binarization failed:', error);
+            statsResult.textContent = 'Error: Binarization failed';
         } finally {
             binarizeBtn.disabled = false;
         }
@@ -404,11 +409,13 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
-                if (labels[filename]) {
-                    labels[filename].value = data.value;
-                    if (activeVideo && activeVideo.filename === filename) {
-                        renderCharts(filename);
-                    }
+                if (!labels[filename]) {
+                    labels[filename] = { value: [], advantages: [], returns: [], task_completed: -1 };
+                }
+                labels[filename].value = data.value;
+                if (activeVideo && activeVideo.filename === filename) {
+                    renderCharts(filename);
+                    calcAdvBtn.disabled = false; // Enable advantage calc after value succeeds
                 }
             }
         } catch (error) {
@@ -434,12 +441,15 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
-                if (labels[filename]) {
-                    labels[filename].advantages = data.advantages;
-                    labels[filename].value = data.value;
-                    if (activeVideo && activeVideo.filename === filename) {
-                        renderCharts(filename);
-                    }
+                if (!labels[filename]) {
+                    labels[filename] = { value: [], advantages: [], returns: [], task_completed: -1 };
+                }
+                labels[filename].advantages = data.advantages;
+                labels[filename].value = data.value; // Keep existing line
+                labels[filename].advantage_ids = data.advantage_ids;
+                if (activeVideo && activeVideo.filename === filename) {
+                    renderCharts(filename);
+                    renderTimeline(activeVideo.frames, activeVideo.filename); // Changed to use activeVideo.frames
                 }
             }
         } catch (error) {
@@ -556,12 +566,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderCharts(filename) {
-        const label = labels[filename];
-        renderChart(valueChartContainer, label?.value, 'Value', 'value');
-        renderChart(advantageChartContainer, label?.advantages, 'Advantage', 'advantage');
+        if (!activeVideo || activeVideo.filename !== filename) return;
+        const info = labels[filename];
+        if (!info) return;
+
+        // Use activeVideo.frames for total length to ensure correct alignment
+        renderChart(valueChartContainer, info.value, 'Value', 'value', activeVideo.frames);
+        renderChart(advantageChartContainer, info.advantages, 'Advantage', 'advantage', activeVideo.frames);
     }
 
-    function renderChart(container, data, title, type) {
+    function renderChart(container, data, title, type, totalLength) {
         if (!data || data.length === 0) {
             container.innerHTML = '';
             container.classList.remove('active');
@@ -585,13 +599,16 @@ document.addEventListener('DOMContentLoaded', () => {
         const max = Math.max(...validData);
         const range = max - min || 0.1;
 
-        const containerWidth = container.clientWidth;
-        const width = Math.max(100, containerWidth - 80); // horizontal padding (2rem each side)
-        const height = container.clientHeight;
+        const containerWidth = container.clientWidth || 800;
+        const width = Math.max(100, containerWidth - 80);
+        const height = container.clientHeight || 100;
+
+        // Alignment fix: use totalLength to map index to X coordinate correctly
+        const denom = (totalLength && totalLength > 1) ? (totalLength - 1) : (data.length - 1 || 1);
 
         const points = data.map((v, i) => {
             if (v === null || isNaN(v)) return null;
-            const x = (i / (data.length - 1)) * width;
+            const x = (i / denom) * width;
             const y = height - ((v - min) / range) * (height - 20) - 10;
             return { x, y, value: v, index: i };
         });
@@ -609,6 +626,21 @@ document.addEventListener('DOMContentLoaded', () => {
         axis.setAttribute("x2", width.toString());
         axis.setAttribute("y2", (height - 1).toString());
         svg.appendChild(axis);
+
+        // Zero-line for advantages
+        if (type === 'advantage') {
+            const zeroY = height - ((0 - min) / range) * (height - 20) - 10;
+            if (zeroY >= 0 && zeroY <= height) {
+                const zeroLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                zeroLine.setAttribute("x1", "0");
+                zeroLine.setAttribute("y1", zeroY.toString());
+                zeroLine.setAttribute("x2", width.toString());
+                zeroLine.setAttribute("y2", zeroY.toString());
+                zeroLine.setAttribute("stroke", "rgba(255, 255, 255, 0.15)");
+                zeroLine.setAttribute("stroke-dasharray", "4 4");
+                svg.appendChild(zeroLine);
+            }
+        }
 
         // Group points into continuous segments (islands)
         const segments = [];
@@ -927,7 +959,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const recapSidebar = document.getElementById('recap-sidebar');
     const recapTaskList = document.getElementById('recap-task-list');
     const recapGeneralistStatus = document.getElementById('recap-generalist-status');
+    const recapPolicyStatus = document.getElementById('recap-policy-status');
     const btnPretrain = document.getElementById('btn-pretrain');
+    const btnFinetunePolicy = document.getElementById('btn-finetune-policy');
 
 
 
@@ -956,6 +990,21 @@ document.addEventListener('DOMContentLoaded', () => {
         recapGeneralistStatus.textContent = isReady ? 'Ready' : 'Not Ready';
         recapGeneralistStatus.className = `recap-status-value ${isReady ? 'success' : 'fail'}`;
         btnPretrain.style.display = isReady ? 'none' : 'block';
+
+        // Update policy status - check if iteration 0 has weights and if we have binarized data
+        // For simplicity, we'll just check if actor.pt exists in iterate 0 or 1 etc.
+        // But the user specifically wants a button that triggers finetuning.
+        // We'll enable the button if we have loaded data and have binarized advantages.
+        const activeLabel = activeVideo ? labels[activeVideo.filename] : null;
+        const hasBinarized = activeLabel && activeLabel.advantage_ids && activeLabel.advantage_ids.some(id => id !== -1);
+
+        btnFinetunePolicy.disabled = !hasBinarized;
+
+        // Check if any iteration > 0 has weights or if iter 0 has been "finetuned"
+        // Actually, let's just use a simple flag or check the workspace
+        const isFinetuned = recapState.tasks.some(t => t.iterations.some(i => i.id > 0 && i.actor));
+        recapPolicyStatus.textContent = isFinetuned ? 'Ready' : 'Not Ready';
+        recapPolicyStatus.className = `recap-status-value ${isFinetuned ? 'success' : 'fail'}`;
 
         // Render task list
         recapTaskList.innerHTML = '';
@@ -1103,6 +1152,39 @@ document.addEventListener('DOMContentLoaded', () => {
             loadingOverlay.classList.add('hidden-element');
         }
     }
+
+    // Finetune Policy button handler
+    btnFinetunePolicy.onclick = async () => {
+        if (btnFinetunePolicy.disabled) return;
+
+        trainingModal.classList.remove('hidden-element');
+        trainingProgressView.classList.add('hidden-element');
+        trainingSuccessView.classList.add('hidden-element');
+        document.querySelector('.config-selection').classList.add('hidden-element'); // Hide config for policy
+
+        startTrainBtn.disabled = true;
+        startTrainBtn.textContent = 'Preparing Policy Training...';
+
+        try {
+            const response = await fetch('/api/recap/finetune', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ config: 'mock' }) // default to mock for feedback
+            });
+            const result = await response.json();
+            if (result.error) {
+                alert(result.error);
+                trainingModal.classList.add('hidden-element');
+            } else {
+                trainingProgressView.classList.remove('hidden-element');
+                startTrainBtn.disabled = true;
+                startTrainBtn.textContent = 'Training...';
+            }
+        } catch (error) {
+            console.error('Policy fine-tuning failed:', error);
+            trainingModal.classList.add('hidden-element');
+        }
+    };
 
     // Pretrain button handler
     btnPretrain.onclick = async () => {

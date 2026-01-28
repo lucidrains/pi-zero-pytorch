@@ -64,6 +64,19 @@
                 "positive_data_fraction": 0.40,
                 "percentile_cutoff": 60
             }
+        },
+        "mock_task": {
+            "max_episode_length": 200,
+            "pretrain": {
+                "advantage_lookahead": -1,
+                "positive_data_fraction": 0.30,
+                "percentile_cutoff": 70
+            },
+            "finetune": {
+                "advantage_lookahead": 50,
+                "positive_data_fraction": 0.40,
+                "percentile_cutoff": 90
+            }
         }
     },
     "task_fail_penalty": -10

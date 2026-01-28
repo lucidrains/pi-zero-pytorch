@@ -73,15 +73,18 @@
 
                     <div class="controls-row">
                         <div class="stats-controls">
-                            <div class="control-group">
-                                <label>Adv Quantile (%):</label>
-                                <input type="number" id="stats-quantile-input" value="90" min="0" max="100" step="1">
+                            <div class="stats-actions">
+                                <div class="control-group">
+                                    <label>Adv Quantile (%):</label>
+                                    <input type="number" id="stats-quantile-input" value="90" min="0" max="100"
+                                        step="1">
+                                </div>
+                                <button id="calc-stats-btn" class="btn-action"
+                                    title="Calculate Global Advantage Statistics">Calc Global Stats</button>
+                                <button id="binarize-btn" class="btn-action"
+                                    title="Binarize Advantages based on Cutoff">Binarize</button>
                             </div>
-                            <button id="calc-stats-btn" class="btn-action"
-                                title="Calculate Global Advantage Statistics">Calc Global Stats</button>
-                            <button id="binarize-btn" class="btn-action"
-                                title="Binarize Advantages based on Cutoff">Binarize</button>
-                            <span id="stats-result" class="tiny-label stats-result"></span>
+                            <span id="stats-result" class="tiny-label stats-result hidden-element"></span>
                         </div>
                     </div>
 
@@ -113,6 +116,16 @@
                         <span id="recap-generalist-status" class="recap-status-value">Not Ready</span>
                     </div>
                     <button id="btn-pretrain" class="btn-recap-action">Start Pretraining</button>
+                </div>
+
+                <!-- Policy Status -->
+                <div class="recap-status-card">
+                    <div class="recap-status-item">
+                        <span class="recap-status-label">Finetuned Policy</span>
+                        <span id="recap-policy-status" class="recap-status-value">Not Ready</span>
+                    </div>
+                    <button id="btn-finetune-policy" class="btn-recap-action" disabled>Fine-tune Policy Network</button>
+                    <p class="tiny-label" style="margin-top: 4px; opacity: 0.7;">Trains small π0 on binarized advantages</p>
                 </div>
 
                 <!-- Task List -->

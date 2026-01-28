@@ -1234,8 +1234,9 @@ video {
 
 .stats-controls {
     display: flex;
-    align-items: center;
-    gap: 0.75rem;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
     background: rgba(255, 255, 255, 0.05);
     padding: 0.5rem 1rem;
     border-radius: 12px;
@@ -1243,11 +1244,17 @@ video {
     margin-left: 0.5rem;
 }
 
+.stats-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
 .stats-result {
     color: var(--accent-color);
     font-weight: 600;
     font-family: monospace;
-    min-width: 140px;
+    min-height: 1.2rem;
 }
 
 .chart-line-value {

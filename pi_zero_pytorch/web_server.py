@@ -13,7 +13,7 @@ import numpy as np
 import shutil
 from typing import List
 from memmap_replay_buffer import ReplayBuffer
-from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate, SigLIP, BinnedValueLayer
+from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate, SigLIP, BinnedValueLayer, PiZero, LinearNoBias
 import json
 import tqdm
 import threading
@@ -76,6 +76,66 @@ VALUE_NETWORK_CONFIGS = {
     "small": {"dim": 64, "depth": 2, "heads": 4, "image_size": 224, "patch_size": 14},
     "medium": {"dim": 128, "depth": 4, "heads": 8, "image_size": 224, "patch_size": 14},
     "large": {"dim": 256, "depth": 6, "heads": 8, "image_size": 224, "patch_size": 14}
+}
+
+# small mock pi-zero for specialized fine-tuning in recap loop
+
+class SmallPiZero(torch.nn.Module):
+    def __init__(
+        self,
+        dim = 32,
+        dim_action = 32, 
+        dim_action_input = 6,
+        dim_joint_state = 32,
+        num_tokens = 256,
+        depth = 2,
+        heads = 4,
+        image_size = 32,
+        patch_size = 4,
+        max_text_len = 32,
+        num_advantage_tokens = 2
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.max_text_len = max_text_len
+
+        # minimal vit
+        self.vit = SigLIP(
+            image_size = image_size,
+            patch_size = patch_size,
+            dim = dim,
+            depth = depth,
+            heads = heads
+        )
+
+        # minimal pizero
+        self.pizero = PiZero(
+            dim = dim,
+            num_tokens = num_tokens,
+            dim_action_input = dim_action_input,
+            dim_joint_state = dim_joint_state,
+            dim_action = dim_action,
+            depth = depth,
+            heads = heads,
+            vit = self.vit,
+            vit_dim = dim,
+            num_advantage_tokens = num_advantage_tokens
+        )
+
+    def forward(self, images, token_ids, joint_state, actions, advantage_ids = None, **kwargs):
+        return self.pizero(
+            images = images,
+            token_ids = token_ids,
+            joint_state = joint_state,
+            actions = actions,
+            advantage_ids = advantage_ids,
+            **kwargs
+        )
+
+PI_ZERO_CONFIGS = {
+    "mock": {"dim": 8, "depth": 1, "heads": 1, "image_size": 32, "patch_size": 16},
+    "small": {"dim": 16, "depth": 1, "heads": 2, "image_size": 32, "patch_size": 8}
 }
 
 class ConnectionManager:
@@ -205,6 +265,9 @@ def init_replay_buffer(video_dir: Path):
         ),
         fields = dict(
             images = ('float', (c, 1, h, w)), # matching (c, num_images, h, w) pattern
+            text = ('int', (32,)), # dummy text len
+            internal = ('float', (32,)), # matches dim_joint_state
+            actions = ('float', (16, 6)), # dummy trajectory
             reward = 'float',
             returns = ('float', (), float('nan')),
             value = ('float', (), float('nan')),
@@ -234,7 +297,19 @@ def init_replay_buffer(video_dir: Path):
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
                 frame_tensor = frame_tensor.unsqueeze(1) # Add num_images dim
-                REPLAY_BUFFER.store(images = frame_tensor, reward = 0.0)
+                
+                # mock other fields
+                mock_text = torch.randint(0, 100, (32,))
+                mock_internal = torch.randn(32)
+                mock_actions = torch.randn(16, 6)
+                
+                REPLAY_BUFFER.store(
+                    images = frame_tensor,
+                    text = mock_text,
+                    internal = mock_internal,
+                    actions = mock_actions,
+                    reward = 0.0
+                )
         cap.release()
     
     CONVERSION_STATUS["is_converting"] = False
@@ -345,44 +420,27 @@ async def get_all_labels():
         
         task_id = task_keys[task_idx] if 0 <= task_idx < len(task_keys) else None
         
-        if task_completed != -1:
-            # Also get returns if they exist
-            returns = REPLAY_BUFFER.data['returns'][episode_id].tolist()
-            # replace nan with None for JSON compliance
-            returns = [r if not np.isnan(r) else None for r in returns]
-            
-            result[filename] = {
-                "task_completed": task_completed,
-                "marked_timestep": marked_timestep,
-                "task_id": task_id,
-                "returns": returns,
-                "invalidated": REPLAY_BUFFER.data['invalidated'][episode_id].tolist()
-            }
-        elif task_id:
-            result[filename] = {
-                "task_completed": -1,
-                "marked_timestep": -1,
-                "task_id": task_id,
-                "returns": [],
-                "value": [],
-                "advantages": [],
-                "advantage_ids": [],
-                "invalidated": REPLAY_BUFFER.data['invalidated'][episode_id].tolist()
-            }
+        # Get returns, values, advantages
+        returns = REPLAY_BUFFER.data['returns'][episode_id].tolist()
+        value = REPLAY_BUFFER.data['value'][episode_id].tolist()
+        advantages = REPLAY_BUFFER.data['advantages'][episode_id].tolist()
+        advantage_ids = REPLAY_BUFFER.data['advantage_ids'][episode_id].tolist()
 
-    # Add value/advantage data if it exists
-    for filename, episode_id in VIDEO_TO_EPISODE.items():
-        if filename in result:
-            value = REPLAY_BUFFER.data['value'][episode_id].tolist()
-            adv = REPLAY_BUFFER.data['advantages'][episode_id].tolist()
-            adv_ids = REPLAY_BUFFER.data['advantage_ids'][episode_id].tolist()
-            # replace nan with None for JSON compliance
-            value = [v if not np.isnan(v) else None for v in value]
-            adv = [a if not np.isnan(a) else None for a in adv]
-            result[filename]["value"] = value
-            result[filename]["advantages"] = adv
-            result[filename]["advantage_ids"] = adv_ids
-
+        # replace nan with None for JSON compliance
+        returns = [r if not (isinstance(r, float) and np.isnan(r)) else None for r in returns]
+        value = [v if not (isinstance(v, float) and np.isnan(v)) else None for v in value]
+        advantages = [a if not (isinstance(a, float) and np.isnan(a)) else None for a in advantages]
+        
+        result[filename] = {
+            "task_completed": task_completed,
+            "marked_timestep": marked_timestep,
+            "task_id": task_id,
+            "returns": returns,
+            "value": value,
+            "advantages": advantages,
+            "advantage_ids": advantage_ids,
+            "invalidated": REPLAY_BUFFER.data['invalidated'][episode_id].tolist()
+        }
     return result
 
 @app.post("/api/label/reset")
@@ -855,8 +913,16 @@ async def recap_iterate(req: dict):
     next_iter_dir = RECAP_WORKSPACE / task_name / str(next_iter_id)
     next_iter_dir.mkdir(parents=True, exist_ok=True)
     
-    # Simulate creating updated weights
-    torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "actor.pt"))
+    # If policy fine-tuning just finished, it might have saved weights in a 'policy_finetuned' dir
+    # we move it to the next iteration
+    finetuned_actor = RECAP_WORKSPACE / "policy_finetuned" / "actor.pt"
+    if finetuned_actor.exists():
+        shutil.move(str(finetuned_actor), str(next_iter_dir / "actor.pt"))
+        print(f"Moved finetuned actor to {next_iter_dir}")
+    else:
+        # Simulate creating updated weights if not existing
+        torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "actor.pt"))
+
     torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "critic.pt"))
     
     return {"status": "ok", "new_iteration": next_iter_id}
@@ -1020,6 +1086,119 @@ async def load_value_network(req: dict):
         return {"status": "ok", "config_name": checkpoint.get("config_name")}
     except Exception as e:
         return {"error": str(e)}
+
+def train_policy_network_thread(config_name: str, loop):
+    global TRAINING_STATE
+    
+    # 1. Prepare data - conditioned on binarized advantages (advantage_ids)
+    all_images = []
+    all_text = []
+    all_internal = []
+    all_actions = []
+    all_advantage_ids = []
+    
+    print("Preparing data for policy fine-tuning...")
+    for i in range(len(REPLAY_BUFFER)):
+        advantage_ids = REPLAY_BUFFER.data['advantage_ids'][i]
+        valid_mask = advantage_ids != -1
+        if valid_mask.any():
+            all_images.append(torch.from_numpy(REPLAY_BUFFER.data['images'][i][valid_mask]))
+            all_text.append(torch.from_numpy(REPLAY_BUFFER.data['text'][i][valid_mask]))
+            all_internal.append(torch.from_numpy(REPLAY_BUFFER.data['internal'][i][valid_mask]))
+            all_actions.append(torch.from_numpy(REPLAY_BUFFER.data['actions'][i][valid_mask]))
+            all_advantage_ids.append(torch.from_numpy(advantage_ids[valid_mask]))
+    
+    if not all_images:
+        print("No valid data for policy training")
+        TRAINING_STATE["is_training"] = False
+        _broadcast_training_update(loop)
+        return
+
+    dataset = torch.utils.data.TensorDataset(
+        torch.cat(all_images),
+        torch.cat(all_text),
+        torch.cat(all_internal),
+        torch.cat(all_actions),
+        torch.cat(all_advantage_ids)
+    )
+    
+    batch_size = 4
+    loader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = True)
+
+    # 2. Initialize model
+    config = PI_ZERO_CONFIGS.get(config_name, PI_ZERO_CONFIGS["small"])
+    model = SmallPiZero(**config).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4) # lower lr for finetuning
+    model.train()
+
+    num_epochs = 1
+    TRAINING_STATE.update({
+        "is_training": True,
+        "current_epoch": 0,
+        "total_epochs": num_epochs,
+        "current_step": 0,
+        "total_steps": len(loader) * num_epochs,
+        "last_loss": 0.0
+    })
+    _broadcast_training_update(loop)
+
+    # 3. Training loop
+    target_size = (config.get('image_size', 32), config.get('image_size', 32))
+    
+    print(f"Starting policy fine-tuning for {num_epochs} epoch...")
+    for epoch in range(num_epochs):
+        TRAINING_STATE["current_epoch"] = epoch + 1
+        for i, (images, text, internal, actions, adv_ids) in enumerate(loader):
+            images = images.to(DEVICE).squeeze(2)
+            if images.shape[-2:] != target_size:
+                images = TF.resize(images, target_size, antialias = True)
+            
+            text = text.to(DEVICE)
+            internal = internal.to(DEVICE)
+            actions = actions.to(DEVICE)
+            adv_ids = adv_ids.to(DEVICE)
+            
+            # Conditioned on advantage_ids
+            output = model(images, text, internal, actions, advantage_ids = adv_ids)
+            loss = output[0] if isinstance(output, tuple) else output
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            TRAINING_STATE["current_step"] += 1
+            TRAINING_STATE["last_loss"] = float(loss.item())
+            
+            if i % 2 == 0:
+                _broadcast_training_update(loop)
+        
+        _broadcast_training_update(loop)
+
+    # 4. Finalize
+    if RECAP_WORKSPACE:
+        policy_dir = RECAP_WORKSPACE / "policy_finetuned"
+        policy_dir.mkdir(parents=True, exist_ok=True)
+        
+        model_path = policy_dir / "actor.pt"
+        torch.save(model.pizero.state_dict(), str(model_path))
+        print(f"Finetuned policy saved to {model_path}")
+
+    TRAINING_STATE["is_training"] = False
+    _broadcast_training_update(loop)
+
+@app.post("/api/recap/finetune")
+async def start_policy_finetune(req: dict):
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    if TRAINING_STATE["is_training"]:
+        return {"error": "Training already in progress"}
+        
+    config_name = req.get("config", "mock") # use mock for speed in e2e
+    loop = asyncio.get_event_loop()
+    threading.Thread(target=train_policy_network_thread, args=(config_name, loop), daemon=True).start()
+    
+    return {"status": "ok"}
 
 @app.post("/api/value/train")
 async def start_training(req: dict):
