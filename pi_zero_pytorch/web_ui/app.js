@@ -1154,35 +1154,69 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Finetune Policy button handler
+    const policyTrainingModal = document.getElementById('policy-training-modal');
+    const startPolicyTrainBtn = document.getElementById('btn-policy-start-train');
+    const cancelPolicyTrainBtn = document.getElementById('btn-policy-cancel-train');
+    const policyTrainingProgressView = document.getElementById('policy-training-progress-view');
+    const policyTrainingSuccessView = document.getElementById('policy-training-success-view');
+    const policyConfigOptions = document.querySelectorAll('.policy-config-selection .config-option');
+
+    // Policy Training UI elements
+    const policyTrainEpoch = document.getElementById('policy-train-epoch');
+    const policyTrainLoss = document.getElementById('policy-train-loss');
+    const policyTrainProgressBar = document.getElementById('policy-train-progress-bar');
+    const policyTrainStepDetail = document.getElementById('policy-train-step-detail');
+    const policySummaryConfig = document.getElementById('policy-summary-config');
+    const policySummaryEpochs = document.getElementById('policy-summary-epochs');
+    const policySummaryLoss = document.getElementById('policy-summary-loss');
+
+    let selectedPolicyConfig = 'mock';
+
     btnFinetunePolicy.onclick = async () => {
         if (btnFinetunePolicy.disabled) return;
 
-        trainingModal.classList.remove('hidden-element');
-        trainingProgressView.classList.add('hidden-element');
-        trainingSuccessView.classList.add('hidden-element');
-        document.querySelector('.config-selection').classList.add('hidden-element'); // Hide config for policy
+        policyTrainingModal.classList.remove('hidden-element');
+        policyTrainingProgressView.classList.add('hidden-element');
+        policyTrainingSuccessView.classList.add('hidden-element');
 
-        startTrainBtn.disabled = true;
-        startTrainBtn.textContent = 'Preparing Policy Training...';
+        startPolicyTrainBtn.disabled = false;
+        startPolicyTrainBtn.textContent = 'Start Finetuning';
+    };
 
+    cancelPolicyTrainBtn.onclick = () => {
+        policyTrainingModal.classList.add('hidden-element');
+    };
+
+    policyConfigOptions.forEach(opt => {
+        opt.onclick = () => {
+            policyConfigOptions.forEach(o => o.classList.remove('selected'));
+            opt.classList.add('selected');
+            selectedPolicyConfig = opt.dataset.config;
+        };
+    });
+
+    startPolicyTrainBtn.onclick = async () => {
         try {
+            startPolicyTrainBtn.disabled = true;
+            startPolicyTrainBtn.textContent = 'Preparing...';
+
             const response = await fetch('/api/recap/finetune', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ config: 'mock' }) // default to mock for feedback
+                body: JSON.stringify({ config: selectedPolicyConfig })
             });
             const result = await response.json();
             if (result.error) {
                 alert(result.error);
-                trainingModal.classList.add('hidden-element');
+                policyTrainingModal.classList.add('hidden-element');
             } else {
-                trainingProgressView.classList.remove('hidden-element');
-                startTrainBtn.disabled = true;
-                startTrainBtn.textContent = 'Training...';
+                policyTrainingProgressView.classList.remove('hidden-element');
+                startPolicyTrainBtn.disabled = true;
+                startPolicyTrainBtn.textContent = 'Finetuning...';
             }
         } catch (error) {
             console.error('Policy fine-tuning failed:', error);
-            trainingModal.classList.add('hidden-element');
+            policyTrainingModal.classList.add('hidden-element');
         }
     };
 
@@ -1273,34 +1307,64 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateTrainingUI(state) {
         if (!state.is_training) {
             if (state.current_step > 0 && state.current_step >= state.total_steps) {
-                // Show Success View
-                trainingProgressView.classList.add('hidden-element');
-                trainingSuccessView.classList.remove('hidden-element');
+                // Show Success View based on active modal (simplistic check)
+                if (!trainingModal.classList.contains('hidden-element')) {
+                    // Value Network Success
+                    trainingProgressView.classList.add('hidden-element');
+                    trainingSuccessView.classList.remove('hidden-element');
 
-                summaryConfig.textContent = selectedConfig.toUpperCase();
-                summaryEpochs.textContent = state.current_epoch;
-                summaryLoss.textContent = state.last_loss.toFixed(6);
+                    summaryConfig.textContent = selectedConfig.toUpperCase();
+                    summaryEpochs.textContent = state.current_epoch;
+                    summaryLoss.textContent = state.last_loss.toFixed(6);
 
-                startTrainBtn.disabled = false;
-                startTrainBtn.textContent = 'Train Again';
+                    startTrainBtn.disabled = false;
+                    startTrainBtn.textContent = 'Train Again';
+                    fetchValueNetworks(); // Refresh list
+                } else if (!policyTrainingModal.classList.contains('hidden-element')) {
+                    // Policy Network Success
+                    policyTrainingProgressView.classList.add('hidden-element');
+                    policyTrainingSuccessView.classList.remove('hidden-element');
 
-                fetchValueNetworks(); // Refresh list
+                    policySummaryConfig.textContent = selectedPolicyConfig.toUpperCase();
+                    policySummaryEpochs.textContent = state.current_epoch;
+                    policySummaryLoss.textContent = state.last_loss.toFixed(6);
+
+                    startPolicyTrainBtn.disabled = false;
+                    startPolicyTrainBtn.textContent = 'Finetune Again';
+                }
             }
             return;
         }
 
-        trainingProgressView.classList.remove('hidden-element');
-        trainingSuccessView.classList.add('hidden-element');
-        document.querySelector('.config-selection').classList.add('hidden-element');
-        startTrainBtn.disabled = true;
-        startTrainBtn.textContent = 'Training...';
+        // Update Progress based on active modal
+        if (!trainingModal.classList.contains('hidden-element')) {
+            trainingProgressView.classList.remove('hidden-element');
+            trainingSuccessView.classList.add('hidden-element');
+            document.querySelector('.config-selection').classList.remove('hidden-element');
+            startTrainBtn.disabled = true;
+            startTrainBtn.textContent = 'Training...';
 
-        trainEpoch.textContent = state.current_epoch;
-        trainLoss.textContent = state.last_loss.toFixed(6);
+            trainEpoch.textContent = state.current_epoch;
+            trainLoss.textContent = state.last_loss.toFixed(6);
 
-        const progress = (state.current_step / state.total_steps) * 100;
-        trainProgressBar.style.width = `${progress}%`;
-        trainStepDetail.textContent = `Step ${state.current_step} / ${state.total_steps}`;
+            const progress = (state.current_step / state.total_steps) * 100;
+            trainProgressBar.style.width = `${progress}%`;
+            trainStepDetail.textContent = `Step ${state.current_step} / ${state.total_steps}`;
+
+        } else if (!policyTrainingModal.classList.contains('hidden-element')) {
+            policyTrainingProgressView.classList.remove('hidden-element');
+            policyTrainingSuccessView.classList.add('hidden-element');
+
+            startPolicyTrainBtn.disabled = true;
+            startPolicyTrainBtn.textContent = 'Finetuning...';
+
+            policyTrainEpoch.textContent = state.current_epoch;
+            policyTrainLoss.textContent = state.last_loss.toFixed(6);
+
+            const progress = (state.current_step / state.total_steps) * 100;
+            policyTrainProgressBar.style.width = `${progress}%`;
+            policyTrainStepDetail.textContent = `Step ${state.current_step} / ${state.total_steps}`;
+        }
     }
 
     async function fetchValueNetworks() {
@@ -1365,6 +1429,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     trainValueBtn.onclick = () => {
         trainingModal.classList.remove('hidden-element');
+        // document.getElementById('training-modal-title').textContent = 'Train Value Network'; // Revert to static HTML
         trainingProgressView.classList.add('hidden-element');
         trainingSuccessView.classList.add('hidden-element');
         document.querySelector('.config-selection').classList.remove('hidden-element');

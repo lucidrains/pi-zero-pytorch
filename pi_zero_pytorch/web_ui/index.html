@@ -125,7 +125,8 @@
                         <span id="recap-policy-status" class="recap-status-value">Not Ready</span>
                     </div>
                     <button id="btn-finetune-policy" class="btn-recap-action" disabled>Fine-tune Policy Network</button>
-                    <p class="tiny-label" style="margin-top: 4px; opacity: 0.7;">Trains small π0 on binarized advantages</p>
+                    <p class="tiny-label" style="margin-top: 4px; opacity: 0.7;">Trains small π0 on binarized advantages
+                    </p>
                 </div>
 
                 <!-- Task List -->
@@ -183,7 +184,7 @@
     <!-- Training Modal -->
     <div id="training-modal" class="modal hidden-element">
         <div class="modal-content glass-container">
-            <h3>Train Value Network</h3>
+            <h3 id="training-modal-title">Train Value Network</h3>
             <p class="tiny-label">Select configuration and train on calculated returns.</p>
 
             <div class="config-selection">
@@ -235,6 +236,57 @@
             <div class="modal-actions">
                 <button id="btn-cancel-train" class="btn-secondary">Close</button>
                 <button id="btn-start-train" class="btn-primary">Start Training</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Policy Training Modal -->
+    <div id="policy-training-modal" class="modal hidden-element">
+        <div class="modal-content glass-container">
+            <h3>Finetune Policy Network</h3>
+            <p class="tiny-label">Finetune policy using binarized advantages.</p>
+
+            <div class="config-selection policy-config-selection">
+                <div class="config-option selected" data-config="mock">
+                    <span class="config-name">Mock (Ultra Fast)</span>
+                    <span class="config-detail">8 dim, 1 depth, 1 heads, 32px</span>
+                </div>
+                <div class="config-option" data-config="small">
+                    <span class="config-name">Small</span>
+                    <span class="config-detail">16 dim, 1 depth, 2 heads, 32px</span>
+                </div>
+            </div>
+
+            <div id="policy-training-progress-view" class="hidden-element">
+                <div class="training-stats">
+                    <div class="stat-item">
+                        <span class="stat-label">Epoch</span>
+                        <span id="policy-train-epoch">-</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Loss</span>
+                        <span id="policy-train-loss">-</span>
+                    </div>
+                </div>
+                <div class="progress-container">
+                    <div id="policy-train-progress-bar" class="progress-bar"></div>
+                </div>
+                <p id="policy-train-step-detail" class="tiny-label"></p>
+            </div>
+
+            <div id="policy-training-success-view" class="hidden-element">
+                <div class="success-icon">✓</div>
+                <h4>Finetuning Complete!</h4>
+                <div class="training-summary">
+                    <p>Model: <span id="policy-summary-config">-</span></p>
+                    <p>Epochs: <span id="policy-summary-epochs">-</span></p>
+                    <p>Final Loss: <span id="policy-summary-loss">-</span></p>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="btn-policy-cancel-train" class="btn-secondary">Close</button>
+                <button id="btn-policy-start-train" class="btn-primary">Start Finetuning</button>
             </div>
         </div>
     </div>
