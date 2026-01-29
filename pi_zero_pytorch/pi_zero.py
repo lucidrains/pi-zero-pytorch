@@ -3969,7 +3969,7 @@ class PiZeroSix(Module):
     ):
         experiences.store_meta_datapoint(
             episode_id,
-            name = 'invalidated',
+            name = 'invalidated_episode',
             datapoint = True
         )
 
@@ -4341,8 +4341,8 @@ class PiZeroSix(Module):
                 fail           = 'bool',
                 task_completed = ('int', (), -1),
                 marked_timestep = ('int', (), -1),
-                invalidated    = 'bool',
-                recap_step     = ('int', (), -1) # -1 stands for base pretraining dataset
+                recap_step     = ('int', (), -1),  # -1 stands for base pretraining dataset
+                invalidated_episode = 'bool',
             ),
             fields = dict(
                 images      = ('float', (3, env.num_images, *env.image_shape)),

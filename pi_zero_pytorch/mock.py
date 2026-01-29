@@ -49,8 +49,8 @@ def create_mock_replay_buffer(
         meta_fields = dict(
             task_id     = ('int', (), -1),
             fail        = 'bool',
-            invalidated = 'bool',
-            recap_step  = ('int', (), -1)
+            recap_step  = ('int', (), -1),
+            invalidated_episode = 'bool',
         ),
         fields = dict(
             images      = ('float', (3, num_images, *image_shape)),
