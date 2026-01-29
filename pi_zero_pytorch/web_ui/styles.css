@@ -10,6 +10,7 @@
     --sidebar-width: 320px;
     --card-bg: rgba(255, 255, 255, 0.04);
     --card-hover: rgba(255, 255, 255, 0.08);
+    --intervention-color: #a855f7;
 }
 
 * {
@@ -239,7 +240,8 @@ header {
 main {
     flex: 1;
     display: flex;
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
 }
 
 /* RECAP Sidebar Styles */
@@ -260,6 +262,8 @@ main {
 
 .modal-content {
     width: 500px;
+    max-height: 90vh;
+    overflow-y: auto;
     padding: 2.5rem;
     background: rgba(15, 15, 15, 0.95);
     border-radius: 28px;
@@ -526,9 +530,10 @@ main {
 }
 
 .recap-sidebar {
-    width: 260px;
+    width: 220px;
+    min-width: 200px;
     border-right: 1px solid var(--glass-border);
-    padding: 1rem;
+    padding: 0.75rem;
     overflow-y: auto;
     background: rgba(255, 255, 255, 0.01);
 }
@@ -720,14 +725,16 @@ main {
 }
 
 .sidebar {
-    width: 240px;
+    width: 210px;
+    min-width: 190px;
     border-right: 1px solid var(--glass-border);
     padding: 1rem;
     overflow-y: auto;
 }
 
 .task-sidebar {
-    width: 240px;
+    width: 210px;
+    min-width: 190px;
     border-left: 1px solid var(--glass-border);
     padding: 1rem;
     overflow-y: auto;
@@ -791,6 +798,22 @@ main {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+}
+
+.video-info-container {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    overflow: hidden;
+}
+
+.folder-label {
+    font-size: 0.65rem;
+    color: var(--text-secondary);
+    opacity: 0.6;
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.02em;
 }
 
 .task-tag {
@@ -994,6 +1017,28 @@ main {
 .frame-box.invalidated {
     filter: grayscale(1) opacity(0.3);
     background: #475569 !important;
+}
+
+.expert-indicator {
+    width: 6px;
+    height: 4px;
+    background: var(--intervention-color);
+    border-radius: 1px;
+    margin-top: 2px;
+    box-shadow: 0 0 4px var(--intervention-color);
+}
+
+.btn-star:hover {
+    background: rgba(168, 85, 247, 0.2);
+    border-color: var(--intervention-color);
+    color: var(--intervention-color);
+}
+
+.btn-star.active {
+    background: var(--intervention-color);
+    color: white;
+    border-color: var(--intervention-color);
+    box-shadow: 0 0 8px var(--intervention-color);
 }
 
 .player-container {

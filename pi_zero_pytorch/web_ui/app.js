@@ -149,6 +149,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 frames.forEach(f => {
                     f.querySelector('.btn-up').classList.remove('active');
                     f.querySelector('.btn-down').classList.remove('active');
+                    f.querySelector('.btn-star').classList.remove('active');
                 });
             }
         } catch (error) {
@@ -217,6 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
+                console.log(`[RECAP] Binarization successful for ${activeVideo.filename}. IDs:`, data.advantage_ids);
                 if (labels[activeVideo.filename]) {
                     labels[activeVideo.filename].advantage_ids = data.advantage_ids;
                 }
@@ -273,6 +275,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupSync(invalidateCutoffInput, invalidateCutoffSlider);
 
     async function fetchData() {
+        console.log("Fetching Rollout data...");
         try {
             const [videoRes, labelRes, taskRes] = await Promise.all([
                 fetch('/api/videos'),
@@ -283,10 +286,14 @@ document.addEventListener('DOMContentLoaded', () => {
             labels = await labelRes.json();
             tasks = await taskRes.json();
 
+            console.log(`Fetch complete: ${videos.length} videos, ${Object.keys(labels).length} labels`);
+
             renderList();
             renderTasks();
+            updateUIVisibility();
 
-            if (videos.length > 0) {
+            if (videos.length > 0 && !activeVideo) {
+                console.log("Auto-playing first video");
                 playVideo(videos[0]);
             }
         } catch (error) {
@@ -485,8 +492,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 ? `<span class="task-tag" title="${label.task_id}">${label.task_id}</span>`
                 : '';
 
+            const folderTag = video.folder
+                ? `<span class="folder-label">${video.folder}</span>`
+                : '';
+
             li.innerHTML = `
-                <span class="item-name">${video.filename} ${taskTag}</span>
+                <div class="video-info-container">
+                    <span class="item-name">${video.filename} ${taskTag}</span>
+                    ${folderTag}
+                </div>
                 ${statusHtml}
             `;
             li.onclick = () => playVideo(video, li);
@@ -517,6 +531,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const invalidIndicator = document.createElement('div');
             invalidIndicator.className = 'invalidated-indicator';
             invalidIndicator.style.visibility = (label && label.invalidated && label.invalidated[i]) ? 'visible' : 'hidden';
+
+            const expertIndicator = document.createElement('div');
+            expertIndicator.className = 'expert-indicator';
+            expertIndicator.style.visibility = (label && label.expert_segment && label.expert_segment[i]) ? 'visible' : 'hidden';
 
             if (label && label.advantage_ids && label.advantage_ids[i] !== -1) {
                 const advId = label.advantage_ids[i];
@@ -556,6 +574,7 @@ document.addEventListener('DOMContentLoaded', () => {
             container.appendChild(indicator);
             container.appendChild(invalidIndicator);
             container.appendChild(box);
+            container.appendChild(expertIndicator);
 
             if (label && label.invalidated && label.invalidated[i]) {
                 box.classList.add('invalidated');
@@ -610,6 +629,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (v === null || isNaN(v)) return null;
             const x = (i / denom) * width;
             const y = height - ((v - min) / range) * (height - 20) - 10;
+
+            if (isNaN(x) || isNaN(y)) return null;
             return { x, y, value: v, index: i };
         });
 
@@ -629,13 +650,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Zero-line for advantages
         if (type === 'advantage') {
-            const zeroY = height - ((0 - min) / range) * (height - 20) - 10;
-            if (zeroY >= 0 && zeroY <= height) {
+            const zeroValueY = height - ((0 - min) / range) * (height - 20) - 10;
+            if (!isNaN(zeroValueY) && zeroValueY >= 0 && zeroValueY <= height) {
                 const zeroLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
                 zeroLine.setAttribute("x1", "0");
-                zeroLine.setAttribute("y1", zeroY.toString());
+                zeroLine.setAttribute("y1", zeroValueY.toString());
                 zeroLine.setAttribute("x2", width.toString());
-                zeroLine.setAttribute("y2", zeroY.toString());
+                zeroLine.setAttribute("y2", zeroValueY.toString());
                 zeroLine.setAttribute("stroke", "rgba(255, 255, 255, 0.15)");
                 zeroLine.setAttribute("stroke-dasharray", "4 4");
                 svg.appendChild(zeroLine);
@@ -783,6 +804,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
     }
+    window.jumpToFrame = jumpToFrame;
 
     function renderCarousel(frames, filename) {
         carouselTrack.innerHTML = '';
@@ -795,17 +817,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const isActiveSuccess = label && label.task_completed === 1 && label.marked_timestep === index;
             const isActiveFail = label && label.task_completed === 0 && label.marked_timestep === index;
+            const isActiveIntervention = label && label.expert_segment && label.expert_segment[index];
 
             card.innerHTML = `
                 <img src="${frameUrl}" alt="Frame ${index}">
                 <div class="labeller-btns">
                     <button class="btn btn-up ${isActiveSuccess ? 'active' : ''}" title="Success">✓</button>
                     <button class="btn btn-down ${isActiveFail ? 'active' : ''}" title="Failure">✗</button>
+                    <button class="btn btn-star ${isActiveIntervention ? 'active' : ''}" title="Expert Intervention">★</button>
                 </div>
             `;
 
             const upBtn = card.querySelector('.btn-up');
             const downBtn = card.querySelector('.btn-down');
+            const starBtn = card.querySelector('.btn-star');
 
             upBtn.onclick = async (e) => {
                 e.stopPropagation();
@@ -817,10 +842,50 @@ document.addEventListener('DOMContentLoaded', () => {
                 await labelFrame(filename, index, false);
             };
 
+            starBtn.onclick = async (e) => {
+                e.stopPropagation();
+                await labelIntervention(filename, index);
+            };
+
             card.onclick = () => jumpToFrame(index);
 
             carouselTrack.appendChild(card);
         });
+    }
+
+    async function labelIntervention(filename, timestep) {
+        try {
+            const response = await fetch('/api/label/intervention', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename, timestep })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                if (!labels[filename]) labels[filename] = {};
+                labels[filename].is_expert_intervention = true;
+                labels[filename].expert_segment = data.expert_segment;
+                labels[filename].advantage_ids = data.advantage_ids;
+
+                renderList();
+                renderTimeline(activeVideo.frames, filename);
+                renderCharts(filename);
+                updateHeaderStatus(filename);
+
+                // Update carousel buttons
+                const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
+                frames.forEach((f, i) => {
+                    const star = f.querySelector('.btn-star');
+                    if (data.expert_segment[i]) {
+                        star.classList.add('active');
+                    } else {
+                        star.classList.remove('active');
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('Intervention labelling failed:', error);
+        }
     }
 
     async function labelFrame(filename, timestep, success) {
@@ -887,6 +952,13 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             statusIcon.innerHTML = '';
             timeLabel.style.display = 'none';
+        }
+
+        const interventionBadge = document.getElementById('intervention-badge');
+        if (label && label.is_expert_intervention) {
+            interventionBadge.style.display = 'inline-block';
+        } else {
+            interventionBadge.style.display = 'none';
         }
 
         const taskBadge = document.getElementById('current-task');
@@ -998,6 +1070,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const activeLabel = activeVideo ? labels[activeVideo.filename] : null;
         const hasBinarized = activeLabel && activeLabel.advantage_ids && activeLabel.advantage_ids.some(id => id !== -1);
 
+        console.log(`[RECAP] renderRecapSidebar: hasBinarized=${hasBinarized}, activeVideo=${activeVideo?.filename}`);
+
         btnFinetunePolicy.disabled = !hasBinarized;
 
         // Check if any iteration > 0 has weights or if iter 0 has been "finetuned"
@@ -1040,6 +1114,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         </div>
                         <div class="iteration-actions">
                             <button class="btn-recap-mini" onclick="recapCollect('${task.name}', ${iter.id})">Collect</button>
+                            <button class="btn-recap-mini btn-recap-sim" onclick="recapSimulate('${task.name}', ${iter.id})">Sim</button>
                             ${hasData ? `<button class="btn-recap-mini" onclick="recapIterate('${task.name}', ${iter.id})">Iterate</button>` : ''}
                         </div>
                     </div>
@@ -1098,6 +1173,25 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (error) {
             console.error('Collect failed:', error);
+        }
+    };
+
+    window.recapSimulate = async function (taskName, iterId) {
+        try {
+            const response = await fetch('/api/recap/simulate_collection', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_name: taskName, iter_id: iterId })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                await fetchRecapState();
+                if (activeVideo && activeVideo.filename.includes(taskName)) {
+                    await fetchData();
+                }
+            }
+        } catch (error) {
+            console.error('Simulation failed:', error);
         }
     };
 
@@ -1251,6 +1345,7 @@ document.addEventListener('DOMContentLoaded', () => {
             loadingOverlay.classList.add('hidden-element');
             updateUIVisibility();
             await fetchValueNetworks();
+            await fetchData(); // Ensure videos/labels are loaded
             return;
         }
 
@@ -1266,6 +1361,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const trainingModal = document.getElementById('training-modal');
     const startTrainBtn = document.getElementById('btn-start-train');
     const cancelTrainBtn = document.getElementById('btn-cancel-train');
+    const simulateCollectionBtn = document.getElementById('btn-simulate-collection');
     const configOptions = document.querySelectorAll('.config-option');
     const trainingProgressView = document.getElementById('training-progress-view');
     const trainEpoch = document.getElementById('train-epoch');
@@ -1277,6 +1373,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const summaryConfig = document.getElementById('summary-config');
     const summaryEpochs = document.getElementById('summary-epochs');
     const summaryLoss = document.getElementById('summary-loss');
+
+    if (simulateCollectionBtn) {
+        simulateCollectionBtn.onclick = async () => {
+            // Pick a task from the state (e.g. first task not yet initialized with iter 0)
+            const taskToSimulate = recapState.tasks.find(t => !t.iterations.some(it => it.id === 0))?.name || 'mock_task';
+            try {
+                const response = await fetch('/api/recap/simulate_collection', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_name: taskToSimulate })
+                });
+                const data = await response.json();
+                if (data.status === 'ok') {
+                    await fetchRecapState();
+                }
+            } catch (error) {
+                console.error('Simulation failed:', error);
+            }
+        };
+    }
 
     let selectedConfig = 'mock';
     let trainingSocket = null;

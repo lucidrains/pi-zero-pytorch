@@ -32,6 +32,8 @@
                     <span class="filename" id="current-filename">Select a video</span>
                     <button id="reset-btn" class="btn-reset" title="Reset labelling">↺</button>
                     <span class="badge" id="current-frames">0 frames</span>
+                    <span id="intervention-badge" class="badge"
+                        style="display: none; background: #a855f7; color: white;">Expert Intervention</span>
                     <span id="current-task" class="task-badge"></span>
                     <span id="label-time-container" class="tiny-label"></span>
                 </div>
@@ -108,6 +110,7 @@
         <main>
             <div class="recap-sidebar" id="recap-sidebar" style="display: none;">
                 <h2>⚡ RECAP State</h2>
+
 
                 <!-- Generalist Status -->
                 <div class="recap-status-card">
