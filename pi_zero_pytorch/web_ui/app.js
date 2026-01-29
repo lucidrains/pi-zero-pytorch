@@ -23,6 +23,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const statsQuantileInput = document.getElementById('stats-quantile-input');
     const statsResult = document.getElementById('stats-result');
 
+    const exportBtn = document.getElementById('export-btn');
     const invalidateBtn = document.getElementById('invalidate-btn');
     const invalidateCutoffInput = document.getElementById('invalidate-cutoff-input');
     const invalidateCutoffSlider = document.getElementById('invalidate-cutoff-slider');
@@ -46,6 +47,47 @@ document.addEventListener('DOMContentLoaded', () => {
     let activeVideo = null;
     let currentCutoff = null;
     let recapState = null;
+    let activeFolders = []; // Track active folder paths for display
+
+    // Sidebar elements for visibility control
+    const rolloutsSidebar = document.querySelector('.sidebar');
+    const tasksSidebar = document.querySelector('.task-sidebar');
+    const activeFoldersContainer = document.getElementById('active-folders');
+
+    // Update active folders display under Rollouts title
+    function updateActiveFoldersDisplay() {
+        if (!activeFoldersContainer) return;
+        activeFoldersContainer.innerHTML = '';
+
+        for (const folder of activeFolders) {
+            const item = document.createElement('div');
+            item.className = 'active-folder-item' + (folder.active ? ' active' : '');
+            item.innerHTML = `<span class="folder-icon">📁</span><span class="folder-path">${folder.path}</span>`;
+            item.onclick = () => {
+                // Set this folder as active and reload its data
+                activeFolders.forEach(f => f.active = false);
+                folder.active = true;
+                updateActiveFoldersDisplay();
+                updateFolderHighlighting();
+            };
+            activeFoldersContainer.appendChild(item);
+        }
+    }
+
+    // Update folder icon highlighting in RECAP task list
+    function updateFolderHighlighting() {
+        const allFolderItems = document.querySelectorAll('.recap-data-item');
+        allFolderItems.forEach(item => {
+            item.classList.remove('active');
+            // Check if this folder matches any active folder
+            const folderText = item.textContent;
+            for (const folder of activeFolders) {
+                if (folder.active && folderText.includes(folder.id)) {
+                    item.classList.add('active');
+                }
+            }
+        });
+    }
 
     // Initial UI state
     function updateUIVisibility() {
@@ -99,20 +141,39 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        // Also sidebars
-        const rolloutsSidebar = document.querySelector('.sidebar');
-        const tasksSidebar = document.querySelector('.task-sidebar');
-
         if (rolloutsSidebar && tasksSidebar) {
-            // In RECAP mode, hide sidebars if no data loaded
-            const hasData = videos.length > 0;
+            const hasVideos = videos.length > 0;
+            const isRecap = recapState && recapState.enabled;
 
-            if (!hasData) {
-                rolloutsSidebar.style.display = 'none';
-                tasksSidebar.style.display = 'none';
+            // Rollouts sidebar (video list): visible if we have videos or if recap is enabled (where it shows folders)
+            // Actually, in standalone mode, it's our main navigation.
+            rolloutsSidebar.style.display = (hasVideos || isRecap) ? 'block' : 'none';
+
+            // Tasks sidebar (RECAP ops): ONLY in recap mode and if we have data
+            tasksSidebar.style.display = (isRecap && hasVideos) ? 'block' : 'none';
+
+            if (!hasVideos) {
+                // Show "no trajectories loaded" message
+                const mainContent = document.querySelector('.main-content');
+                let noTrajMsg = document.getElementById('no-trajectories-msg');
+                if (!noTrajMsg) {
+                    noTrajMsg = document.createElement('div');
+                    noTrajMsg.id = 'no-trajectories-msg';
+                    noTrajMsg.className = 'info-message';
+                    const message = isRecap ?
+                        'Please click on a folder in the RECAP sidebar to start labelling.' :
+                        'Please load a folder or select it via command line.';
+                    noTrajMsg.innerHTML = `
+                            <div class="info-icon">📂</div>
+                            <h2>No trajectories loaded</h2>
+                            <p>${message}</p>
+                        `;
+                    mainContent.appendChild(noTrajMsg);
+                }
+                noTrajMsg.style.display = 'flex';
             } else {
-                rolloutsSidebar.style.display = 'block';
-                tasksSidebar.style.display = 'block';
+                const noTrajMsg = document.getElementById('no-trajectories-msg');
+                if (noTrajMsg) noTrajMsg.style.display = 'none';
             }
         }
     }
@@ -173,6 +234,10 @@ document.addEventListener('DOMContentLoaded', () => {
     calcAdvBtn.onclick = async () => {
         if (!activeVideo) return;
         await calculateAdvantage(activeVideo.filename);
+    };
+
+    exportBtn.onclick = () => {
+        window.location.href = '/api/export';
     };
 
     calcStatsBtn.onclick = async () => {
@@ -298,6 +363,12 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (error) {
             console.error('Failed to fetch data:', error);
+        }
+
+        // If we still have no videos, retry in a bit (to handle initialization race conditions)
+        if (videos.length === 0) {
+            console.log("No videos found yet, retrying in 2s...");
+            setTimeout(fetchData, 2000);
         }
     }
 
@@ -530,7 +601,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const invalidIndicator = document.createElement('div');
             invalidIndicator.className = 'invalidated-indicator';
-            invalidIndicator.style.visibility = (label && label.invalidated && label.invalidated[i]) ? 'visible' : 'hidden';
+            invalidIndicator.style.visibility = (label && label.invalidated) ? 'visible' : 'hidden';
 
             const expertIndicator = document.createElement('div');
             expertIndicator.className = 'expert-indicator';
@@ -576,7 +647,7 @@ document.addEventListener('DOMContentLoaded', () => {
             container.appendChild(box);
             container.appendChild(expertIndicator);
 
-            if (label && label.invalidated && label.invalidated[i]) {
+            if (label && label.invalidated) {
                 box.classList.add('invalidated');
             }
 
@@ -997,6 +1068,12 @@ document.addEventListener('DOMContentLoaded', () => {
         fetchFrames(video.filename);
     }
 
+
+    async function fetchStatus() {
+        const response = await fetch('/api/status');
+        return await response.json();
+    }
+
     async function checkConversionStatus() {
         // If in RECAP mode and no video dir is set, skip conversion check
         if (recapState && recapState.enabled && loadingOverlay.dataset.recapLoading !== 'true') {
@@ -1006,9 +1083,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         try {
-            const response = await fetch('/api/status');
-            const status = await response.json();
-
+            const status = await fetchStatus();
+            console.log('Conversion Status:', status);
             if (status.is_converting) {
                 loadingOverlay.classList.remove('hidden-element');
                 const percent = status.total > 0 ? (status.progress / status.total) * 100 : 0;
@@ -1079,9 +1155,26 @@ document.addEventListener('DOMContentLoaded', () => {
         const isFinetuned = recapState.tasks.some(t => t.iterations.some(i => i.id > 0 && i.actor));
         recapPolicyStatus.textContent = isFinetuned ? 'Ready' : 'Not Ready';
         recapPolicyStatus.className = `recap-status-value ${isFinetuned ? 'success' : 'fail'}`;
+        recapTaskList.innerHTML = '';
+
+        // Render Pretrained Dataset if available
+        if (recapState.pretrained_data) {
+            const ptGroup = document.createElement('div');
+            ptGroup.className = 'recap-task-group';
+            ptGroup.innerHTML = `
+                <div class="recap-task-header">
+                    <span class="recap-task-name">PRETRAINED DATASET</span>
+                </div>
+                <div class="recap-data-list">
+                    <div class="recap-data-item" onclick="loadPretrained()">
+                        📁 Original Dataset (${recapState.pretrained_data.video_count} videos)
+                    </div>
+                </div>
+            `;
+            recapTaskList.appendChild(ptGroup);
+        }
 
         // Render task list
-        recapTaskList.innerHTML = '';
         for (const task of recapState.tasks) {
             const taskGroup = document.createElement('div');
             taskGroup.className = 'recap-task-group';
@@ -1213,6 +1306,39 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
+    async function loadPretrained() {
+        loadingOverlay.classList.remove('hidden-element');
+        loadingStatus.textContent = 'Loading Pretrained data...';
+        loadingDetail.textContent = `pretrained_data`;
+
+        try {
+            const response = await fetch('/api/recap/load_data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ is_pretrained: true })
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                videos = [];
+                labels = {};
+                activeVideo = null;
+                updateUIVisibility();
+                videoList.innerHTML = '';
+                carouselTrack.innerHTML = '';
+                timelineContainer.innerHTML = '';
+                loadingOverlay.dataset.recapLoading = 'true';
+                checkConversionStatus();
+            } else {
+                console.error('Load failed:', data.error);
+                loadingOverlay.classList.add('hidden-element');
+            }
+        } catch (error) {
+            console.error('Load failed:', error);
+            loadingOverlay.classList.add('hidden-element');
+        }
+    }
+    window.loadPretrained = loadPretrained;
+
     async function loadRecapData(taskName, iterId, dataId) {
         loadingOverlay.classList.remove('hidden-element');
         loadingStatus.textContent = 'Loading RECAP data...';
@@ -1226,6 +1352,18 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await response.json();
             if (data.status === 'ok') {
+                // Track the active folder
+                const folderPath = `${taskName}/iter_${iterId}/${dataId}`;
+                activeFolders.forEach(f => f.active = false);
+                const existingFolder = activeFolders.find(f => f.path === folderPath);
+                if (existingFolder) {
+                    existingFolder.active = true;
+                } else {
+                    activeFolders.push({ path: folderPath, id: dataId, active: true });
+                }
+                updateActiveFoldersDisplay();
+                updateFolderHighlighting();
+
                 // Clear current state
                 videos = [];
                 labels = {};

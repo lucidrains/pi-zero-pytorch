@@ -19,6 +19,9 @@ import json
 import tqdm
 import threading
 import asyncio
+import zipfile
+import io
+import traceback
 from fastapi import WebSocket, WebSocketDisconnect
 
 CONVERSION_STATUS = {
@@ -218,27 +221,41 @@ def extract_frames(video_path: Path, cache_path: Path):
         return
 
     cache_path.mkdir(parents=True, exist_ok=True)
-    print(f"[RECAP] Extracting frames from {video_path} to {cache_path}...")
+    print(f"[RECAP] Extracting frames from {video_path} to {cache_path} using ffmpeg...")
     
-    if FAST_MOCK:
-        print("[RECAP] FAST_MOCK is enabled, creating dummy frame.")
-        (cache_path / "frame_0000.jpg").touch()
-        return
-
-    cap = cv2.VideoCapture(str(video_path))
-    count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        cv2.imwrite(str(cache_path / f"frame_{count:04d}.jpg"), frame)
-        count += 1
-    cap.release()
-    print(f"[RECAP] Extracted {count} frames.")
+    # Use ffmpeg for reliable frame extraction
+    import subprocess
+    output_pattern = str(cache_path / "frame_%04d.jpg")
+    cmd = [
+        "ffmpeg", "-i", str(video_path),
+        "-q:v", "2",  # High quality JPEG
+        output_pattern,
+        "-hide_banner", "-loglevel", "warning"
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        frame_count = len(list(cache_path.glob("*.jpg")))
+        print(f"[RECAP] Extracted {frame_count} frames.")
+    except subprocess.CalledProcessError as e:
+        print(f"[RECAP] ffmpeg extraction failed: {e.stderr.decode()}")
+    except FileNotFoundError:
+        print("[RECAP] ffmpeg not found, falling back to OpenCV...")
+        # Fallback to OpenCV if ffmpeg not available
+        cap = cv2.VideoCapture(str(video_path))
+        count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cv2.imwrite(str(cache_path / f"frame_{count:04d}.jpg"), frame)
+            count += 1
+        cap.release()
+        print(f"[RECAP] Extracted {count} frames via OpenCV fallback.")
 
 def init_replay_buffer(video_dirs: List[Path]):
     global REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS
     
+    print(f"[RECAP] init_replay_buffer started with {video_dirs}")
     CONVERSION_STATUS["is_converting"] = True
     CONVERSION_STATUS["progress"] = 0
     
@@ -305,7 +322,6 @@ def init_replay_buffer(video_dirs: List[Path]):
             value = ('float', (), float('nan')),
             advantages = ('float', (), float('nan')),
             advantage_ids = ('int', (), -1),
-            invalidated = 'bool',
             expert_segment = 'bool'
         )
     )
@@ -320,18 +336,17 @@ def init_replay_buffer(video_dirs: List[Path]):
         VIDEO_TO_EPISODE[video_path.name] = i
         
         if FAST_MOCK:
-            # Skip video reading and populate with minimal dummy data
-            # Use small dimensions to speed up everything
+            # Skip video reading and populate with dummy data
             with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
-                # Just store one dummy frame per video to satisfy the buffer
-                # In a real demo we might want more, but for "extremely fast" one is enough
-                REPLAY_BUFFER.store(
-                    images = torch.randn(c, 1, h, w),
-                    text = torch.zeros(32, dtype=torch.long),
-                    internal = torch.randn(32),
-                    actions = torch.randn(16, 6),
-                    reward = 0.0
-                )
+                # Store enough frames to allow labelling at various timesteps
+                for _ in range(64):
+                    REPLAY_BUFFER.store(
+                        images = torch.randn(c, 1, h, w),
+                        text = torch.zeros(32, dtype=torch.long),
+                        internal = torch.randn(32),
+                        actions = torch.randn(16, 6),
+                        reward = 0.0
+                    )
             continue
 
         cap = cv2.VideoCapture(str(video_path))
@@ -367,11 +382,30 @@ def init_replay_buffer(video_dirs: List[Path]):
 
 @app.get("/api/status")
 async def get_status():
+    print(f"[RECAP] /api/status check: {CONVERSION_STATUS}")
     return CONVERSION_STATUS
 
 @app.get("/api/training/status")
 async def get_training_status():
     return TRAINING_STATE
+
+@app.get("/api/videos")
+async def get_videos():
+    if REPLAY_BUFFER is None:
+        print("[RECAP] /api/videos: REPLAY_BUFFER is None!")
+        return []
+    
+    video_list = []
+    for filename, ep_id in VIDEO_TO_EPISODE.items():
+        # Get actual frame count from episode_lens (number of timesteps in this episode)
+        num_frames = int(REPLAY_BUFFER.meta_data['episode_lens'][ep_id].item())
+        video_list.append({
+            "filename": filename,
+            "url": f"/videos/{filename}",  # Matches the actual endpoint
+            "frames": num_frames
+        })
+    print(f"[RECAP] /api/videos: returning {len(video_list)} videos")
+    return video_list
 
 @app.get("/api/tasks")
 async def get_tasks():
@@ -499,7 +533,7 @@ async def get_all_labels():
             "advantage_ids": advantage_ids,
             "is_expert_intervention": REPLAY_BUFFER.meta_data['is_expert_intervention'][episode_id].item(),
             "expert_segment": REPLAY_BUFFER.data['expert_segment'][episode_id].tolist(),
-            "invalidated": REPLAY_BUFFER.data['invalidated'][episode_id].tolist()
+            "invalidated": REPLAY_BUFFER.meta_data['invalidated'][episode_id].item()
         }
     return result
 
@@ -525,7 +559,7 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantage_ids'][episode_id] = -1
-    REPLAY_BUFFER.data['invalidated'][episode_id] = False
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
     REPLAY_BUFFER.data['expert_segment'][episode_id] = False
     
     REPLAY_BUFFER.flush()
@@ -555,7 +589,7 @@ async def label_video(req: LabelRequest):
     # Reset value and advantages to NaN as they are now stale
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
-    REPLAY_BUFFER.data['invalidated'][episode_id] = False
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
     
     # Calculate returns
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
@@ -649,7 +683,7 @@ async def calculate_returns(req: dict):
     # Reset value and advantages to NaN as they are now stale
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
-    REPLAY_BUFFER.data['invalidated'][episode_id] = False
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
 
     REPLAY_BUFFER.flush()
     
@@ -694,7 +728,7 @@ async def _calculate_episode_value_internal(episode_id: int, filename: str, max_
     final_values = torch.full((images.shape[0],), float('nan'))
     final_values[:len(values)] = torch.tensor(values)
     REPLAY_BUFFER.data['value'][episode_id] = final_values.numpy()
-    REPLAY_BUFFER.data['invalidated'][episode_id] = False
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
     REPLAY_BUFFER.flush()
     return values
 
@@ -788,11 +822,12 @@ async def calculate_episode_advantage(req: dict):
         adv_ids[:num_frames][expert_mask] = 1
         REPLAY_BUFFER.data['advantage_ids'][episode_id] = adv_ids
 
-        REPLAY_BUFFER.data['invalidated'][episode_id] = False
+        REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
         REPLAY_BUFFER.flush()
 
         return {"status": "ok", "advantages": advantages, "value": values.tolist(), "advantage_ids": adv_ids.tolist()}
     except Exception as e:
+        traceback.print_exc()
         print(f"Error calculating advantage for {filename}: {str(e)}")
         return {"error": str(e)}
 
@@ -861,18 +896,63 @@ async def invalidate_episode_timesteps(req: dict):
     
     # Calculate invalidated mask: True if advantage <= cutoff and not NaN
     valid_mask = ~np.isnan(advs)
-    invalidated = np.zeros(advs.shape, dtype=bool)
-    invalidated[valid_mask] = (advs[valid_mask] <= cutoff)
-
-    REPLAY_BUFFER.data['invalidated'][episode_id] = invalidated
+    # If any advantage is below cutoff, invalidate the whole episode (RECAP policy)
+    is_invalid = bool((advs[valid_mask] <= cutoff).any())
+    REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', is_invalid)
     REPLAY_BUFFER.flush()
 
-    return {"status": "ok", "invalidated": invalidated.tolist()}
+    return {"status": "ok", "invalidated": is_invalid}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
     index_path = Path(__file__).parent / "web_ui" / "index.html"
     return HTMLResponse(content=index_path.read_text(), status_code=200)
+
+@app.get("/api/export")
+async def export_labels():
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+
+    # Create export directory in cache if it doesn't exist
+    export_dir = CACHE_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = int(time.time())
+    zip_filename = f"labels_export_{timestamp}.zip"
+    zip_path = export_dir / zip_filename
+    
+    # Extract ALL data fields
+    data_dict = {name: REPLAY_BUFFER.data[name][:] for name in REPLAY_BUFFER.data.keys()}
+    
+    # Extract ALL meta data fields
+    meta_data_dict = {name: REPLAY_BUFFER.meta_data[name][:] for name in REPLAY_BUFFER.meta_data.keys()}
+    
+    # Metadata mapping
+    metadata = {
+        "video_to_index": VIDEO_TO_EPISODE,
+        "config": RECAP_CONFIG,
+        "timestamp": timestamp
+    }
+    
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        # Save data.npz
+        data_buffer = io.BytesIO()
+        np.savez(data_buffer, **data_dict)
+        zip_file.writestr("data.npz", data_buffer.getvalue())
+
+        # Save meta_data.npz
+        meta_data_buffer = io.BytesIO()
+        np.savez(meta_data_buffer, **meta_data_dict)
+        zip_file.writestr("meta_data.npz", meta_data_buffer.getvalue())
+        
+        # Save metadata.json
+        zip_file.writestr("metadata.json", json.dumps(metadata, indent=2))
+        
+    return FileResponse(
+        path=str(zip_path),
+        filename=zip_filename,
+        media_type="application/zip"
+    )
 
 @app.get("/api/recap/state")
 async def get_recap_state():
@@ -887,11 +967,21 @@ async def get_recap_state():
             "actor": (RECAP_WORKSPACE / "pretrained-actor.pt").exists(),
             "critic": (RECAP_WORKSPACE / "pretrained-critic.pt").exists()
         },
+        "pretrained_data": None,
         "tasks": []
     }
 
     # Get tasks from config
     extensions = {".mp4", ".webm", ".avi", ".mov"}
+
+    # Check for pretrained_data directory
+    pretrained_data_dir = RECAP_WORKSPACE / "pretrained_data"
+    if pretrained_data_dir.exists():
+        video_count = len([f for f in pretrained_data_dir.iterdir() if f.suffix.lower() in extensions and f.stat().st_size > 0])
+        state["pretrained_data"] = {
+            "video_count": video_count
+        }
+
     for task_name, task_config in RECAP_CONFIG.get("tasks", {}).items():
         task_dir = RECAP_WORKSPACE / task_name
         task_state = {
@@ -1421,11 +1511,15 @@ async def recap_load_data(req: dict):
     task_name = req.get("task_name")
     iter_id = req.get("iter_id")
     data_id = req.get("data_id")
+    is_pretrained = req.get("is_pretrained", False)
     
-    if not all([task_name, iter_id is not None, data_id]):
-        return {"error": "Missing required parameters"}
-    
-    target_dir = RECAP_WORKSPACE / task_name / str(iter_id) / data_id
+    if is_pretrained:
+        target_dir = RECAP_WORKSPACE / "pretrained_data"
+    else:
+        if not all([task_name, iter_id is not None, data_id]):
+            return {"error": "Missing required parameters"}
+        target_dir = RECAP_WORKSPACE / task_name / str(iter_id) / data_id
+
     if not target_dir.exists():
         return {"error": f"Data directory {target_dir} does not exist"}
     
@@ -1467,22 +1561,20 @@ def main(port, folders, recap_workspace):
             print("Error: No valid folders provided")
             return
 
-        VIDEO_DIRS = valid_dirs
-        print(f"Standalone mode: loading videos from {len(VIDEO_DIRS)} folders")
-        # Initialize buffer immediately for standalone mode
-        threading.Thread(target=init_replay_buffer, args=(VIDEO_DIRS,), daemon=True).start()
-    else:
-        # VIDEO_DIRS will be set dynamically in RECAP mode
-        VIDEO_DIRS = []
-    
-    # Initialize CONVERSION_STATUS as not converting
+    # Initialize CONVERSION_STATUS
     global CONVERSION_STATUS
     CONVERSION_STATUS = {
-        "is_converting": False,
+        "is_converting": folders is not None, # Set to True immediately if in standalone mode
         "progress": 0,
         "total": 0,
         "current_video": ""
     }
+
+    if folders:
+        VIDEO_DIRS = valid_dirs
+        print(f"Standalone mode: loading videos from {len(VIDEO_DIRS)} folders")
+        # Initialize buffer immediately for standalone mode
+        threading.Thread(target=init_replay_buffer, args=(VIDEO_DIRS,), daemon=True).start()
 
     # Initialize Value Network
     global VALUE_NETWORK
