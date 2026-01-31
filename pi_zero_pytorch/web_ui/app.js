@@ -45,8 +45,10 @@ document.addEventListener('DOMContentLoaded', () => {
     let labels = {}; // filename -> {task_completed, marked_timestep, returns, value, advantages, advantage_ids, invalidated}
     let tasks = [];
     let activeVideo = null;
+    let activePlayers = []; // Store multiple players if num_views > 1
     let currentCutoff = null;
     let recapState = null;
+    let viewpointNames = {};
     let activeFolders = []; // Track active folder paths for display
 
     // Sidebar elements for visibility control
@@ -342,14 +344,17 @@ document.addEventListener('DOMContentLoaded', () => {
     async function fetchData() {
         console.log("Fetching Rollout data...");
         try {
-            const [videoRes, labelRes, taskRes] = await Promise.all([
+            const [videoRes, labelRes, taskRes, viewpointRes] = await Promise.all([
                 fetch('/api/videos'),
                 fetch('/api/labels'),
-                fetch('/api/tasks')
+                fetch('/api/tasks'),
+                fetch('/api/viewpoints')
             ]);
             videos = await videoRes.json();
             labels = await labelRes.json();
             tasks = await taskRes.json();
+            const vpData = await viewpointRes.json();
+            viewpointNames = vpData.viewpoints || {};
 
             console.log(`Fetch complete: ${videos.length} videos, ${Object.keys(labels).length} labels`);
 
@@ -859,11 +864,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function jumpToFrame(index) {
-        if (!activeVideo || !player.duration) return;
+        if (!activeVideo) return;
 
-        // Accurate seek using frames / duration ratio
-        const seekTime = (index / activeVideo.frames) * player.duration;
-        player.currentTime = seekTime;
+        const mainPlayer = activePlayers[0] || player;
+        if (!mainPlayer || !mainPlayer.duration) return;
+
+        const seekTime = (index / activeVideo.frames) * mainPlayer.duration;
+
+        activePlayers.forEach(p => {
+            p.currentTime = seekTime;
+        });
+
+        // ensure main player for backward compatibility
+        if (activePlayers.length === 0) player.currentTime = seekTime;
 
         // Autoscroll carousel
         const cards = carouselTrack.querySelectorAll('.frame-card');
@@ -890,8 +903,27 @@ document.addEventListener('DOMContentLoaded', () => {
             const isActiveFail = label && label.task_completed === 0 && label.marked_timestep === index;
             const isActiveIntervention = label && label.expert_segment && label.expert_segment[index];
 
+            let framesHtml = '';
+            if (Array.isArray(frameUrl)) {
+                // Multi-view
+                framesHtml = `<div class="frame-stack">`;
+                frameUrl.forEach((vUrl, vIdx) => {
+                    const vpName = viewpointNames[vIdx] || `View ${vIdx}`;
+                    framesHtml += `
+                        <div class="view-container">
+                            <img src="${vUrl}" alt="View ${vIdx}">
+                            <div class="view-label">${vpName}</div>
+                        </div>
+                    `;
+                });
+                framesHtml += `</div>`;
+            } else {
+                // Single-view
+                framesHtml = `<img src="${frameUrl}" alt="Frame ${index}">`;
+            }
+
             card.innerHTML = `
-                <img src="${frameUrl}" alt="Frame ${index}">
+                ${framesHtml}
                 <div class="labeller-btns">
                     <button class="btn btn-up ${isActiveSuccess ? 'active' : ''}" title="Success">✓</button>
                     <button class="btn btn-down ${isActiveFail ? 'active' : ''}" title="Failure">✗</button>
@@ -1053,9 +1085,80 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
-        player.src = video.url;
-        player.load();
-        player.play();
+        const videoWrapper = document.querySelector('.video-wrapper');
+        videoWrapper.innerHTML = '';
+        activePlayers = [];
+
+        if (video.num_views > 1) {
+            const grid = document.createElement('div');
+            grid.className = `video-grid views-${video.num_views}`;
+
+            for (let v = 0; v < video.num_views; v++) {
+                const item = document.createElement('div');
+                item.className = 'player-item';
+
+                const vPlayer = document.createElement('video');
+                vPlayer.src = `${video.url}.${v}.mp4`;
+                vPlayer.controls = true; // Enable controls for all views
+                vPlayer.muted = true;
+                vPlayer.playsInline = true;
+
+                const vpName = viewpointNames[v] || `View ${v}`;
+                const label = document.createElement('div');
+                label.className = 'player-label';
+                label.textContent = vpName;
+
+                item.appendChild(vPlayer);
+                item.appendChild(label);
+                grid.appendChild(item);
+                activePlayers.push(vPlayer);
+            }
+            videoWrapper.appendChild(grid);
+
+            // Sync logic
+            const sync = (event) => {
+                const target = event.target;
+                if (target.seeking_sync) return; // Prevent loop
+
+                activePlayers.forEach(p => {
+                    if (p === target) return;
+
+                    if (event.type === 'play') p.play().catch(() => { });
+                    if (event.type === 'pause') p.pause();
+                    if (event.type === 'ratechange') p.playbackRate = target.playbackRate;
+
+                    if (event.type === 'timeupdate' || event.type === 'seeking') {
+                        if (Math.abs(p.currentTime - target.currentTime) > 0.15) {
+                            p.seeking_sync = true;
+                            p.currentTime = target.currentTime;
+                            // Clear flag after a short delay to allow seek to complete
+                            setTimeout(() => { p.seeking_sync = false; }, 50);
+                        }
+                    }
+                });
+            };
+
+            activePlayers.forEach(p => {
+                p.addEventListener('play', sync);
+                p.addEventListener('pause', sync);
+                p.addEventListener('seeking', sync);
+                p.addEventListener('timeupdate', sync);
+                p.addEventListener('ratechange', sync);
+                p.load();
+            });
+
+            activePlayers[0].play().catch(() => { });
+        } else {
+            const vPlayer = document.createElement('video');
+            vPlayer.id = 'main-player';
+            vPlayer.src = video.url;
+            vPlayer.controls = true;
+            vPlayer.muted = true; // Consistency
+            videoWrapper.appendChild(vPlayer);
+            activePlayers = [vPlayer];
+            vPlayer.load();
+            vPlayer.play().catch(() => { });
+        }
 
         currentFilename.textContent = video.filename;
         currentFrames.textContent = `${video.frames} frames`;

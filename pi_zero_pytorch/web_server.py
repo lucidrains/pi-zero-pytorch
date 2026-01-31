@@ -178,6 +178,7 @@ VIDEO_DIRS = []
 CACHE_DIR = Path(".cache/frames")
 REPLAY_BUFFER = None
 VIDEO_TO_EPISODE = {}
+NUM_VIEWS = 1
 VALUE_NETWORK = None
 RECAP_WORKSPACE = None  # Set via --recap-workspace CLI option
 DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -217,43 +218,32 @@ def get_frame_count(video_path: Path) -> int:
 
 def extract_frames(video_path: Path, cache_path: Path):
     if cache_path.exists() and any(cache_path.glob("*.jpg")):
-        print(f"[RECAP] Frames already exist in {cache_path}, skipping extraction.")
         return
 
     cache_path.mkdir(parents=True, exist_ok=True)
-    print(f"[RECAP] Extracting frames from {video_path} to {cache_path} using ffmpeg...")
     
-    # Use ffmpeg for reliable frame extraction
     import subprocess
     output_pattern = str(cache_path / "frame_%04d.jpg")
     cmd = [
         "ffmpeg", "-i", str(video_path),
-        "-q:v", "2",  # High quality JPEG
+        "-q:v", "2",
         output_pattern,
         "-hide_banner", "-loglevel", "warning"
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
-        frame_count = len(list(cache_path.glob("*.jpg")))
-        print(f"[RECAP] Extracted {frame_count} frames.")
-    except subprocess.CalledProcessError as e:
-        print(f"[RECAP] ffmpeg extraction failed: {e.stderr.decode()}")
-    except FileNotFoundError:
-        print("[RECAP] ffmpeg not found, falling back to OpenCV...")
-        # Fallback to OpenCV if ffmpeg not available
+    except Exception:
         cap = cv2.VideoCapture(str(video_path))
         count = 0
         while True:
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
             cv2.imwrite(str(cache_path / f"frame_{count:04d}.jpg"), frame)
             count += 1
         cap.release()
-        print(f"[RECAP] Extracted {count} frames via OpenCV fallback.")
 
 def init_replay_buffer(video_dirs: List[Path]):
-    global REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS
+    global REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS, NUM_VIEWS
     
     print(f"[RECAP] init_replay_buffer started with {video_dirs}")
     CONVERSION_STATUS["is_converting"] = True
@@ -265,24 +255,49 @@ def init_replay_buffer(video_dirs: List[Path]):
     tmp_buffer_dir.mkdir(parents=True, exist_ok = True)
 
     extensions = {".mp4", ".webm", ".avi", ".mov"}
-    video_files = []
     
-    # Support both single Path and list of Paths
     if isinstance(video_dirs, Path):
         video_dirs = [video_dirs]
 
+    # Group videos by episode name
+    # Pattern: {episode}.{view}.mp4 or {episode}.mp4
+    episodes = {} # episode_name -> [list of view files]
+
     for vdir in video_dirs:
-        video_files.extend([f for f in vdir.iterdir() if f.suffix.lower() in extensions and f.stat().st_size > 0])
+        for f in vdir.iterdir():
+            if f.suffix.lower() in extensions and f.stat().st_size > 0:
+                parts = f.name.split('.')
+                if len(parts) >= 3 and parts[-2].isdigit():
+                    ep_name = ".".join(parts[:-2])
+                    view_idx = int(parts[-2])
+                else:
+                    ep_name = ".".join(parts[:-1])
+                    view_idx = 0
+                
+                if ep_name not in episodes:
+                    episodes[ep_name] = {}
+                episodes[ep_name][view_idx] = f
+
+    episode_names = sorted(episodes.keys())
     
-    video_files = sorted(video_files, key=lambda x: x.name)
-    
-    if not video_files:
+    if not episode_names:
         print("No valid video files found")
         CONVERSION_STATUS["is_converting"] = False
         return
 
+    # Determine num_views
+    num_views = 0
+    for ep_name in episode_names:
+        num_views = max(num_views, max(episodes[ep_name].keys()) + 1)
+    
+    num_views = max(1, num_views)
+    NUM_VIEWS = num_views
+    print(f"[RECAP] Detected {len(episode_names)} episodes with {num_views} view(s).")
+
     h, w, c, max_frames = None, None, None, 0
-    for vf in video_files:
+    # Use first available frame to get dimensions
+    for ep_name in episode_names:
+        vf = episodes[ep_name][0]
         cap = cv2.VideoCapture(str(vf))
         ret, frame = cap.read()
         cap.release()
@@ -295,13 +310,13 @@ def init_replay_buffer(video_dirs: List[Path]):
         CONVERSION_STATUS["is_converting"] = False
         return
     
-    for vf in video_files:
-        max_frames = max(max_frames, get_frame_count(vf))
-
+    for ep_name in episode_names:
+        for vf in episodes[ep_name].values():
+            max_frames = max(max_frames, get_frame_count(vf))
 
     REPLAY_BUFFER = ReplayBuffer(
         str(tmp_buffer_dir),
-        max_episodes = len(video_files),
+        max_episodes = len(episode_names),
         max_timesteps = max_frames,
         meta_fields = dict(
             task_id        = ('int', (), -1),
@@ -313,10 +328,10 @@ def init_replay_buffer(video_dirs: List[Path]):
             is_expert_intervention = 'bool'
         ),
         fields = dict(
-            images = ('float', (c, 1, h, w)), # matching (c, num_images, h, w) pattern
-            text = ('int', (32,)), # dummy text len
-            internal = ('float', (32,)), # matches dim_joint_state
-            actions = ('float', (16, 6)), # dummy trajectory
+            images = ('float', (c, num_views, h, w)),
+            text = ('int', (32,)),
+            internal = ('float', (32,)),
+            actions = ('float', (16, 6)),
             reward = 'float',
             returns = ('float', (), float('nan')),
             value = ('float', (), float('nan')),
@@ -326,22 +341,23 @@ def init_replay_buffer(video_dirs: List[Path]):
         )
     )
 
-    print(f"Initializing ReplayBuffer from {len(video_files)} videos...")
-    CONVERSION_STATUS["total"] = len(video_files)
+    CONVERSION_STATUS["total"] = len(episode_names)
 
-    for i, video_path in enumerate(video_files):
-        CONVERSION_STATUS["current_video"] = video_path.name
+    for i, ep_name in enumerate(episode_names):
+        CONVERSION_STATUS["current_video"] = ep_name
         CONVERSION_STATUS["progress"] = i
         
-        VIDEO_TO_EPISODE[video_path.name] = i
+        VIDEO_TO_EPISODE[ep_name] = i
         
+        view_paths = [episodes[ep_name].get(v) for v in range(num_views)]
+        # fallback to view 0 if others missing
+        view_paths = [p if p else view_paths[0] for p in view_paths]
+
         if FAST_MOCK:
-            # Skip video reading and populate with dummy data
             with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
-                # Store enough frames to allow labelling at various timesteps
                 for _ in range(64):
                     REPLAY_BUFFER.store(
-                        images = torch.randn(c, 1, h, w),
+                        images = torch.randn(c, num_views, h, w),
                         text = torch.zeros(32, dtype=torch.long),
                         internal = torch.randn(32),
                         actions = torch.randn(16, 6),
@@ -349,35 +365,37 @@ def init_replay_buffer(video_dirs: List[Path]):
                     )
             continue
 
-        cap = cv2.VideoCapture(str(video_path))
+        caps = [cv2.VideoCapture(str(p)) for p in view_paths]
         
-        # we'll assume a dummy task_id for now
         with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                # Convert to float and [C, 1, H, W]
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
-                frame_tensor = frame_tensor.unsqueeze(1) # Add num_images dim
+                frames = []
+                for cap in caps:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
+                    frames.append(frame_tensor)
                 
-                # mock other fields
-                mock_text = torch.randint(0, 100, (32,))
-                mock_internal = torch.randn(32)
-                mock_actions = torch.randn(16, 6)
+                if len(frames) < len(caps):
+                    break
+                
+                # Stack frames into [C, num_views, H, W]
+                stacked_frames = torch.stack(frames, dim = 1)
                 
                 REPLAY_BUFFER.store(
-                    images = frame_tensor,
-                    text = mock_text,
-                    internal = mock_internal,
-                    actions = mock_actions,
+                    images = stacked_frames,
+                    text = torch.randint(0, 100, (32,)),
+                    internal = torch.randn(32),
+                    actions = torch.randn(16, 6),
                     reward = 0.0
                 )
-        cap.release()
+        for cap in caps:
+            cap.release()
     
     CONVERSION_STATUS["is_converting"] = False
-    CONVERSION_STATUS["progress"] = len(video_files)
+    CONVERSION_STATUS["progress"] = len(episode_names)
     print("ReplayBuffer initialization complete.")
 
 @app.get("/api/status")
@@ -392,19 +410,17 @@ async def get_training_status():
 @app.get("/api/videos")
 async def get_videos():
     if REPLAY_BUFFER is None:
-        print("[RECAP] /api/videos: REPLAY_BUFFER is None!")
         return []
     
     video_list = []
     for filename, ep_id in VIDEO_TO_EPISODE.items():
-        # Get actual frame count from episode_lens (number of timesteps in this episode)
         num_frames = int(REPLAY_BUFFER.meta_data['episode_lens'][ep_id].item())
         video_list.append({
             "filename": filename,
-            "url": f"/videos/{filename}",  # Matches the actual endpoint
-            "frames": num_frames
+            "url": f"/videos/{filename}",
+            "frames": num_frames,
+            "num_views": int(NUM_VIEWS)
         })
-    print(f"[RECAP] /api/videos: returning {len(video_list)} videos")
     return video_list
 
 @app.get("/api/tasks")
@@ -476,25 +492,74 @@ async def serve_video(filename: str):
     if not VIDEO_DIRS:
         return {"error": "Video directories not set"}
     
+    # Handle filename like episode_0 (which should serve episode_0.0.mp4 by default)
+    # or handle explicit requests like episode_0.0.mp4
+    
     video_path = get_video_path(filename)
+    if video_path:
+        return FileResponse(video_path)
+    
+    # Try appending .0.mp4 if it's a grouped name
+    video_path = get_video_path(f"{filename}.0.mp4")
     if video_path:
         return FileResponse(video_path)
             
     return {"error": "Video not found"}
 
+@app.get("/api/viewpoints")
+async def get_viewpoints():
+    for vdir in VIDEO_DIRS:
+        vp_json = vdir / "viewpoints.json"
+        if vp_json.exists():
+            with open(vp_json) as f:
+                return json.load(f)
+    return {"viewpoints": {}}
 
 @app.get("/api/video/{filename}/frames")
 async def get_video_frames(filename: str):
-    video_path = None
-    video_path = get_video_path(filename)
-    if not video_path:
+    # Determine all views for this filename
+    # filename is the episode base name
+    views = []
+    view_idx = 0
+    while True:
+        v_name = f"{filename}.{view_idx}.mp4"
+        v_path = get_video_path(v_name)
+        if not v_path:
+            # Fallback check for single view
+            if view_idx == 0:
+                v_path = get_video_path(f"{filename}.mp4")
+                if v_path:
+                    views.append(v_path)
+            break
+        views.append(v_path)
+        view_idx += 1
+    
+    if not views:
         return {"error": "Video not found"}
     
-    cache_path = CACHE_DIR / filename
-    extract_frames(video_path, cache_path)
+    # Extract frames for each view
+    all_frames = []
+    max_f = 0
+    for i, v_path in enumerate(views):
+        c_name = v_path.name
+        cache_path = CACHE_DIR / c_name
+        extract_frames(v_path, cache_path)
+        frames = sorted([f.name for f in cache_path.glob("*.jpg")])
+        all_frames.append([f"/cache/{c_name}/{f}" for f in frames])
+        max_f = max(max_f, len(frames))
     
-    frames = sorted([f.name for f in cache_path.glob("*.jpg")])
-    return {"frames": [f"/cache/{filename}/{f}" for f in frames]}
+    # Return 2D array [timestep][view]
+    result = []
+    for t in range(max_f):
+        t_views = []
+        for v in range(len(all_frames)):
+            if t < len(all_frames[v]):
+                t_views.append(all_frames[v][t])
+            else:
+                t_views.append(None)
+        result.append(t_views)
+        
+    return {"frames": result}
 
 @app.get("/api/labels")
 async def get_all_labels():
