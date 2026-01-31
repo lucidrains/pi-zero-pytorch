@@ -33,6 +33,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const loadingProgress = document.getElementById('loading-progress');
     const loadingDetail = document.getElementById('loading-detail');
 
+    const actionSection = document.getElementById('action-section');
+    const actionControlsGrid = document.getElementById('action-controls-grid');
+    const actionTimestepLabel = document.getElementById('action-timestep-label');
+    const saveActionBtn = document.getElementById('save-action-btn');
+
     // Force hide overlay immediately on script load to be safe
     if (loadingOverlay) loadingOverlay.classList.add('hidden-element');
 
@@ -61,6 +66,43 @@ document.addEventListener('DOMContentLoaded', () => {
     const proprioPrevBtn = document.getElementById('proprio-prev');
     const proprioNextBtn = document.getElementById('proprio-next');
     const proprioDimLabel = document.getElementById('proprio-dim-label');
+
+    // Action state
+    let currentAction = null; // 1D array [D]
+    let currentActionDim = 0;
+    let currentTimestep = 0;
+
+    const errorContainer = document.getElementById('error-notification-container');
+
+    function showError(message) {
+        const notification = document.createElement('div');
+        notification.className = 'error-notification';
+        notification.innerHTML = `<span>⚠️</span> <span>${message}</span>`;
+        errorContainer.appendChild(notification);
+
+        setTimeout(() => {
+            notification.classList.add('fade-out');
+            setTimeout(() => notification.remove(), 500);
+        }, 5000);
+    }
+
+    async function apiFetch(url, options = {}, btn = null) {
+        if (btn) btn.classList.add('loading');
+        try {
+            const response = await fetch(url, options);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+            }
+            return await response.json();
+        } catch (error) {
+            console.error(`API Error (${url}):`, error);
+            showError(error.message);
+            throw error;
+        } finally {
+            if (btn) btn.classList.remove('loading');
+        }
+    }
 
     // Sidebar elements for visibility control
     const rolloutsSidebar = document.querySelector('.sidebar');
@@ -204,30 +246,26 @@ document.addEventListener('DOMContentLoaded', () => {
     // Reset Label
     resetBtn.onclick = async () => {
         if (!activeVideo) return;
-        try {
-            const response = await fetch('/api/label/reset', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: activeVideo.filename })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                delete labels[activeVideo.filename];
-                updateHeaderStatus(activeVideo.filename);
-                renderList();
-                renderTimeline(activeVideo.frames, activeVideo.filename);
-                renderCharts(activeVideo.filename);
+        const data = await apiFetch('/api/label/reset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: activeVideo.filename })
+        }, resetBtn);
 
-                // Refresh carousel active states
-                const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
-                frames.forEach(f => {
-                    f.querySelector('.btn-up').classList.remove('active');
-                    f.querySelector('.btn-down').classList.remove('active');
-                    f.querySelector('.btn-star').classList.remove('active');
-                });
-            }
-        } catch (error) {
-            console.error('Reset failed:', error);
+        if (data.status === 'ok') {
+            delete labels[activeVideo.filename];
+            updateHeaderStatus(activeVideo.filename);
+            renderList();
+            renderTimeline(activeVideo.frames, activeVideo.filename);
+            renderCharts(activeVideo.filename);
+
+            // Refresh carousel active states
+            const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
+            frames.forEach(f => {
+                f.querySelector('.btn-up').classList.remove('active');
+                f.querySelector('.btn-down').classList.remove('active');
+                f.querySelector('.btn-star').classList.remove('active');
+            });
         }
     };
 
@@ -256,27 +294,17 @@ document.addEventListener('DOMContentLoaded', () => {
     calcStatsBtn.onclick = async () => {
         statsResult.classList.remove('hidden-element');
         const percentile = parseFloat(statsQuantileInput.value);
-        calcStatsBtn.disabled = true;
-        calcStatsBtn.textContent = 'Calculating...';
-        try {
-            const response = await fetch('/api/advantage/stats', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ percentile })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                statsResult.textContent = `Cutoff (${data.count} pts): ${data.cutoff.toFixed(6)}`;
-                currentCutoff = data.cutoff;
-            } else {
-                statsResult.textContent = `Error: ${data.error}`;
-            }
-        } catch (error) {
-            console.error('Stats calculation failed:', error);
-            statsResult.textContent = 'Error: Check console';
-        } finally {
-            calcStatsBtn.disabled = false;
-            calcStatsBtn.textContent = 'Calc Global Stats';
+        const data = await apiFetch('/api/advantage/stats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ percentile })
+        }, calcStatsBtn);
+
+        if (data.status === 'ok') {
+            statsResult.textContent = `Cutoff (${data.count} pts): ${data.cutoff.toFixed(6)}`;
+            currentCutoff = data.cutoff;
+        } else {
+            statsResult.textContent = `Error: ${data.error}`;
         }
     };
 
@@ -284,61 +312,43 @@ document.addEventListener('DOMContentLoaded', () => {
         statsResult.classList.remove('hidden-element');
         if (!activeVideo || currentCutoff === null) return;
 
-        binarizeBtn.disabled = true;
-        try {
-            const response = await fetch('/api/advantage/binarize', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    filename: activeVideo.filename,
-                    cutoff: currentCutoff
-                })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                console.log(`[RECAP] Binarization successful for ${activeVideo.filename}. IDs:`, data.advantage_ids);
-                if (labels[activeVideo.filename]) {
-                    labels[activeVideo.filename].advantage_ids = data.advantage_ids;
-                }
-                renderTimeline(activeVideo.frames, activeVideo.filename);
-                renderRecapSidebar();
-                statsResult.textContent = `Binarized with cutoff: ${currentCutoff.toFixed(6)}`;
+        const data = await apiFetch('/api/advantage/binarize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filename: activeVideo.filename,
+                cutoff: currentCutoff
+            })
+        }, binarizeBtn);
+
+        if (data.status === 'ok') {
+            console.log(`[RECAP] Binarization successful for ${activeVideo.filename}. IDs:`, data.advantage_ids);
+            if (labels[activeVideo.filename]) {
+                labels[activeVideo.filename].advantage_ids = data.advantage_ids;
             }
-        } catch (error) {
-            console.error('Binarization failed:', error);
-            statsResult.textContent = 'Error: Binarization failed';
-        } finally {
-            binarizeBtn.disabled = false;
+            renderTimeline(activeVideo.frames, activeVideo.filename);
+            renderRecapSidebar();
+            statsResult.textContent = `Binarized with cutoff: ${currentCutoff.toFixed(6)}`;
         }
     };
 
     invalidateBtn.onclick = async () => {
         if (!activeVideo) return;
         const cutoff = parseFloat(invalidateCutoffInput.value);
-        invalidateBtn.disabled = true;
-        invalidateBtn.textContent = 'Invalidating...';
+        const data = await apiFetch('/api/episode/invalidate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filename: activeVideo.filename,
+                cutoff: cutoff
+            })
+        }, invalidateBtn);
 
-        try {
-            const response = await fetch('/api/episode/invalidate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    filename: activeVideo.filename,
-                    cutoff: cutoff
-                })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                if (labels[activeVideo.filename]) {
-                    labels[activeVideo.filename].invalidated = data.invalidated;
-                }
-                renderTimeline(activeVideo.frames, activeVideo.filename);
+        if (data.status === 'ok') {
+            if (labels[activeVideo.filename]) {
+                labels[activeVideo.filename].invalidated = data.invalidated;
             }
-        } catch (error) {
-            console.error('Invalidation failed:', error);
-        } finally {
-            invalidateBtn.disabled = false;
-            invalidateBtn.textContent = 'Invalidate';
+            renderTimeline(activeVideo.frames, activeVideo.filename);
         }
     };
 
@@ -355,16 +365,15 @@ document.addEventListener('DOMContentLoaded', () => {
     async function fetchData() {
         console.log("Fetching Rollout data...");
         try {
-            const [videoRes, labelRes, taskRes, viewpointRes] = await Promise.all([
-                fetch('/api/videos'),
-                fetch('/api/labels'),
-                fetch('/api/tasks'),
-                fetch('/api/viewpoints')
+            const [videos_in, labels_in, tasks_in, vpData] = await Promise.all([
+                apiFetch('/api/videos'),
+                apiFetch('/api/labels'),
+                apiFetch('/api/tasks'),
+                apiFetch('/api/viewpoints')
             ]);
-            videos = await videoRes.json();
-            labels = await labelRes.json();
-            tasks = await taskRes.json();
-            const vpData = await viewpointRes.json();
+            videos = videos_in;
+            labels = labels_in;
+            tasks = tasks_in.tasks || tasks_in;
             viewpointNames = vpData.viewpoints || {};
 
             console.log(`Fetch complete: ${videos.length} videos, ${Object.keys(labels).length} labels`);
@@ -392,11 +401,9 @@ document.addEventListener('DOMContentLoaded', () => {
     async function fetchFrames(filename) {
         carouselTrack.innerHTML = '<div class="loader">Extracting frames...</div>';
         try {
-            const response = await fetch(`/api/video/${filename}/frames`);
-            const data = await response.json();
+            const data = await apiFetch(`/api/video/${filename}/frames`);
             renderCarousel(data.frames, filename);
         } catch (error) {
-            console.error('Failed to fetch frames:', error);
             carouselTrack.innerHTML = '<div class="error">Error loading frames</div>';
         }
     }
@@ -424,7 +431,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="task-footer">
                     <div class="task-slug">${task.id}</div>
                 </div>
-                <button class="btn-assign" onclick="event.stopPropagation(); assignTask('${task.id}')">
+                <button class="btn-assign" onclick="event.stopPropagation(); assignTask('${task.id}', this)">
                     ${isActive ? 'Re-assign' : 'Assign to Episode'}
                 </button>
             `;
@@ -432,132 +439,106 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    async function assignTask(taskId) {
+    async function assignTask(taskId, btn = null) {
         if (!activeVideo) return;
-        try {
-            const response = await fetch('/api/episode/task', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: activeVideo.filename, task_id: taskId })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                if (!labels[activeVideo.filename]) {
-                    labels[activeVideo.filename] = {
-                        task_completed: -1,
-                        marked_timestep: -1,
-                        returns: []
-                    };
-                }
-                labels[activeVideo.filename].task_id = taskId;
+        const data = await apiFetch('/api/episode/task', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: activeVideo.filename, task_id: taskId })
+        }, btn);
 
-                renderList(); // Refresh sidebar to show slug
-
-                // If it was already labelled, we might want to re-calculate returns since normalization might change
-                if (labels[activeVideo.filename].marked_timestep !== -1) {
-                    await calculateReturns(activeVideo.filename);
-                } else {
-                    renderTasks();
-                }
+        if (data.status === 'ok') {
+            if (!labels[activeVideo.filename]) {
+                labels[activeVideo.filename] = {
+                    task_completed: -1,
+                    marked_timestep: -1,
+                    returns: []
+                };
             }
-        } catch (error) {
-            console.error('Task assignment failed:', error);
+            labels[activeVideo.filename].task_id = taskId;
+
+            renderList(); // Refresh sidebar to show slug
+
+            // If it was already labelled, we might want to re-calculate returns since normalization might change
+            if (labels[activeVideo.filename].marked_timestep !== -1) {
+                await calculateReturns(activeVideo.filename);
+            } else {
+                renderTasks();
+            }
         }
     }
 
     // Export assignTask to window so onclick works
     window.assignTask = assignTask;
 
-    async function calculateReturns(filename) {
-        try {
-            const response = await fetch('/api/returns/calculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                if (labels[filename]) {
-                    labels[filename].returns = data.returns;
-                    labels[filename].value = null;
-                    labels[filename].advantages = null;
-                }
-                if (activeVideo && activeVideo.filename === filename) {
-                    renderTimeline(activeVideo.frames, activeVideo.filename);
-                    renderTasks();
-                    renderCharts(filename);
-                }
+    async function calculateReturns(filename, btn = null) {
+        if (!btn) btn = calcReturnsBtn; // Default to the top button
+        const data = await apiFetch('/api/returns/calculate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename })
+        }, btn);
+
+        if (data.status === 'ok') {
+            if (labels[filename]) {
+                labels[filename].returns = data.returns;
+                labels[filename].value = null;
+                labels[filename].advantages = null;
             }
-        } catch (error) {
-            console.error('Calculation failed:', error);
+            if (activeVideo && activeVideo.filename === filename) {
+                renderTimeline(activeVideo.frames, activeVideo.filename);
+                renderTasks();
+                renderCharts(filename);
+            }
         }
     }
 
     async function calculateValue(filename) {
-        calcValueBtn.disabled = true;
-        calcValueBtn.textContent = 'Calculating...';
-        try {
-            const response = await fetch('/api/episode/value/calculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                if (!labels[filename]) {
-                    labels[filename] = { value: [], advantages: [], returns: [], task_completed: -1 };
-                }
-                labels[filename].value = data.value;
-                if (activeVideo && activeVideo.filename === filename) {
-                    renderCharts(filename);
-                    calcAdvBtn.disabled = false; // Enable advantage calc after value succeeds
-                }
+        const data = await apiFetch('/api/episode/value/calculate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename })
+        }, calcValueBtn);
+
+        if (data.status === 'ok') {
+            if (!labels[filename]) {
+                labels[filename] = { value: [], advantages: [], returns: [], task_completed: -1 };
             }
-        } catch (error) {
-            console.error('Value calculation failed:', error);
-        } finally {
-            calcValueBtn.disabled = false;
-            calcValueBtn.textContent = 'Calc Value';
+            labels[filename].value = data.value;
+            if (activeVideo && activeVideo.filename === filename) {
+                renderCharts(filename);
+                calcAdvBtn.disabled = false; // Enable advantage calc after value succeeds
+            }
         }
     }
 
     async function calculateAdvantage(filename) {
-        calcAdvBtn.disabled = true;
-        calcAdvBtn.textContent = 'Calculating...';
-        try {
-            const response = await fetch('/api/episode/advantage/calculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    filename,
-                    gamma: parseFloat(gaeGammaInput.value),
-                    lam: parseFloat(gaeLamInput.value)
-                })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                if (!labels[filename]) {
-                    labels[filename] = { value: [], advantages: [], returns: [], task_completed: -1 };
-                }
-                labels[filename].advantages = data.advantages;
-                labels[filename].value = data.value; // Keep existing line
-                labels[filename].advantage_ids = data.advantage_ids;
-                if (activeVideo && activeVideo.filename === filename) {
-                    renderCharts(filename);
-                    renderTimeline(activeVideo.frames, activeVideo.filename); // Changed to use activeVideo.frames
-                }
+        const data = await apiFetch('/api/episode/advantage/calculate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filename,
+                gamma: parseFloat(gaeGammaInput.value),
+                lam: parseFloat(gaeLamInput.value)
+            })
+        }, calcAdvBtn);
+
+        if (data.status === 'ok') {
+            if (!labels[filename]) {
+                labels[filename] = { value: [], advantages: [], returns: [], task_completed: -1 };
             }
-        } catch (error) {
-            console.error('Advantage calculation failed:', error);
-        } finally {
-            calcAdvBtn.disabled = false;
-            calcAdvBtn.textContent = 'Calc Advantage';
+            labels[filename].advantages = data.advantages;
+            labels[filename].value = data.value; // Keep existing line
+            labels[filename].advantage_ids = data.advantage_ids;
+            if (activeVideo && activeVideo.filename === filename) {
+                renderCharts(filename);
+                renderTimeline(activeVideo.frames, activeVideo.filename); // Changed to use activeVideo.frames
+            }
         }
     }
 
     async function fetchLabels() {
-        const res = await fetch('/api/labels');
-        labels = await res.json();
+        labels = await apiFetch('/api/labels');
     }
 
     function renderList() {
@@ -632,6 +613,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const box = document.createElement('div');
             box.className = 'frame-box';
+            box.dataset.index = i;
 
             if (label && label.returns) {
                 const ret = label.returns[i];
@@ -653,6 +635,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             } else if (label && label.marked_timestep === i) {
                 box.classList.add(label.task_completed === 1 ? 'success' : 'fail');
+            }
+
+            if (label && label.expert_segment && label.expert_segment[i]) {
+                box.classList.add('edited');
             }
 
             box.onclick = () => {
@@ -862,8 +848,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Proprioception functions
     async function fetchProprio(filename) {
         try {
-            const response = await fetch(`/api/video/${filename}/proprio`);
-            const data = await response.json();
+            const data = await apiFetch(`/api/video/${filename}/proprio`);
 
             if (data.proprio && data.num_dims > 0) {
                 proprioData = data.proprio;
@@ -880,7 +865,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 proprioSection.classList.add('hidden-element');
             }
         } catch (error) {
-            console.error('Failed to fetch proprio:', error);
             proprioData = null;
             proprioSection.classList.add('hidden-element');
         }
@@ -954,6 +938,9 @@ document.addEventListener('DOMContentLoaded', () => {
         // ensure main player for backward compatibility
         if (activePlayers.length === 0) player.currentTime = seekTime;
 
+        currentTimestep = index;
+        fetchAction(activeVideo.filename, index);
+
         // Autoscroll carousel
         const cards = carouselTrack.querySelectorAll('.frame-card');
         if (cards[index]) {
@@ -965,6 +952,99 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     window.jumpToFrame = jumpToFrame;
+
+    async function fetchAction(filename, timestep) {
+        try {
+            const data = await apiFetch(`/api/video/${filename}/action/${timestep}`);
+
+            if (data.action) {
+                currentAction = data.action;
+                currentActionDim = data.dim;
+                actionSection.classList.remove('hidden-element');
+                actionTimestepLabel.textContent = `T=${timestep}`;
+                renderActionControls();
+            } else {
+                actionSection.classList.add('hidden-element');
+            }
+        } catch (error) {
+            actionSection.classList.add('hidden-element');
+        }
+    }
+
+    function renderActionControls() {
+        actionControlsGrid.innerHTML = '';
+        if (!currentAction) return;
+
+        currentAction.forEach((val, i) => {
+            const controlItem = document.createElement('div');
+            controlItem.className = 'action-control-item';
+
+            const labelRow = document.createElement('div');
+            labelRow.className = 'action-control-label';
+            labelRow.innerHTML = `<span>Dim ${i}</span><span id="action-val-${i}">${val.toFixed(4)}</span>`;
+
+            const sliderRow = document.createElement('div');
+            sliderRow.className = 'action-slider-row';
+
+            const slider = document.createElement('input');
+            slider.type = 'range';
+            slider.min = '-2';
+            slider.max = '2';
+            slider.step = '0.001';
+            slider.value = val;
+
+            const numInput = document.createElement('input');
+            numInput.type = 'number';
+            numInput.className = 'action-value-input';
+            numInput.step = '0.001';
+            numInput.value = val.toFixed(4);
+
+            slider.oninput = () => {
+                numInput.value = parseFloat(slider.value).toFixed(4);
+                currentAction[i] = parseFloat(slider.value);
+                document.getElementById(`action-val-${i}`).textContent = currentAction[i].toFixed(4);
+            };
+
+            numInput.oninput = () => {
+                slider.value = numInput.value;
+                currentAction[i] = parseFloat(numInput.value);
+                document.getElementById(`action-val-${i}`).textContent = currentAction[i].toFixed(4);
+            };
+
+            sliderRow.appendChild(slider);
+            sliderRow.appendChild(numInput);
+            controlItem.appendChild(labelRow);
+            controlItem.appendChild(sliderRow);
+            actionControlsGrid.appendChild(controlItem);
+        });
+    }
+
+    saveActionBtn.onclick = async () => {
+        if (!activeVideo || !currentAction) return;
+
+        const data = await apiFetch(`/api/video/${activeVideo.filename}/action/${currentTimestep}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filename: activeVideo.filename,
+                timestep: currentTimestep,
+                action: currentAction
+            })
+        }, saveActionBtn);
+
+        if (data.status === 'ok') {
+            console.log('Action saved successfully');
+            // Refresh labels to show edited status in timeline
+            await fetchLabels();
+            renderTimeline(activeVideo.frames, activeVideo.filename);
+
+            // Show temporary success state
+            saveActionBtn.textContent = 'Saved! ✓';
+            setTimeout(() => {
+                saveActionBtn.textContent = 'Save Action';
+            }, 2000);
+        }
+    };
 
     function renderCarousel(frames, filename) {
         carouselTrack.innerHTML = '';
@@ -1013,17 +1093,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
             upBtn.onclick = async (e) => {
                 e.stopPropagation();
-                await labelFrame(filename, index, true);
+                await labelFrame(filename, index, true, upBtn);
             };
 
             downBtn.onclick = async (e) => {
                 e.stopPropagation();
-                await labelFrame(filename, index, false);
+                await labelFrame(filename, index, false, downBtn);
             };
 
             starBtn.onclick = async (e) => {
                 e.stopPropagation();
-                await labelIntervention(filename, index);
+                await labelIntervention(filename, index, starBtn);
             };
 
             card.onclick = () => jumpToFrame(index);
@@ -1032,87 +1112,79 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    async function labelIntervention(filename, timestep) {
-        try {
-            const response = await fetch('/api/label/intervention', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename, timestep })
+    async function labelIntervention(filename, timestep, btn = null) {
+        const data = await apiFetch('/api/label/intervention', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, timestep })
+        }, btn);
+
+        if (data.status === 'ok') {
+            if (!labels[filename]) labels[filename] = {};
+            labels[filename].is_expert_intervention = true;
+            labels[filename].expert_segment = data.expert_segment;
+            labels[filename].advantage_ids = data.advantage_ids;
+
+            renderList();
+            renderTimeline(activeVideo.frames, filename);
+            renderCharts(filename);
+            updateHeaderStatus(filename);
+
+            // Update carousel buttons
+            const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
+            frames.forEach((f, i) => {
+                const star = f.querySelector('.btn-star');
+                if (data.expert_segment[i]) {
+                    star.classList.add('active');
+                } else {
+                    star.classList.remove('active');
+                }
             });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                if (!labels[filename]) labels[filename] = {};
-                labels[filename].is_expert_intervention = true;
-                labels[filename].expert_segment = data.expert_segment;
-                labels[filename].advantage_ids = data.advantage_ids;
-
-                renderList();
-                renderTimeline(activeVideo.frames, filename);
-                renderCharts(filename);
-                updateHeaderStatus(filename);
-
-                // Update carousel buttons
-                const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
-                frames.forEach((f, i) => {
-                    const star = f.querySelector('.btn-star');
-                    if (data.expert_segment[i]) {
-                        star.classList.add('active');
-                    } else {
-                        star.classList.remove('active');
-                    }
-                });
-            }
-        } catch (error) {
-            console.error('Intervention labelling failed:', error);
         }
     }
 
-    async function labelFrame(filename, timestep, success) {
+    async function labelFrame(filename, timestep, success, btn = null) {
         const penalty = parseFloat(penaltyInput.value);
-        try {
-            const response = await fetch('/api/label', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename, timestep, success, penalty })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                labels[filename] = {
-                    task_completed: success ? 1 : 0,
-                    marked_timestep: timestep,
-                    task_id: labels[filename]?.task_id, // preserve task_id
-                    returns: data.returns,
-                    value: null,
-                    advantages: null
-                };
-                updateHeaderStatus(filename);
-                renderList();
-                renderTimeline(activeVideo.frames, filename);
-                renderTasks(); // update assign buttons visibility
-                renderCharts(filename);
+        const data = await apiFetch('/api/label', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename, timestep, success, penalty })
+        }, btn);
 
-                if (activeVideo && activeVideo.filename === filename) {
-                    const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
-                    frames.forEach((f, i) => {
-                        const up = f.querySelector('.btn-up');
-                        const down = f.querySelector('.btn-down');
-                        if (i === timestep) {
-                            if (success) {
-                                up.classList.add('active');
-                                down.classList.remove('active');
-                            } else {
-                                down.classList.add('active');
-                                up.classList.remove('active');
-                            }
-                        } else {
-                            up.classList.remove('active');
+        if (data.status === 'ok') {
+            labels[filename] = {
+                task_completed: success ? 1 : 0,
+                marked_timestep: timestep,
+                task_id: labels[filename]?.task_id, // preserve task_id
+                returns: data.returns,
+                value: null,
+                advantages: null
+            };
+            updateHeaderStatus(filename);
+            renderList();
+            renderTimeline(activeVideo.frames, filename);
+            renderTasks(); // update assign buttons visibility
+            renderCharts(filename);
+
+            if (activeVideo && activeVideo.filename === filename) {
+                const frames = Array.from(carouselTrack.querySelectorAll('.frame-card'));
+                frames.forEach((f, i) => {
+                    const up = f.querySelector('.btn-up');
+                    const down = f.querySelector('.btn-down');
+                    if (i === timestep) {
+                        if (success) {
+                            up.classList.add('active');
                             down.classList.remove('active');
+                        } else {
+                            down.classList.add('active');
+                            up.classList.remove('active');
                         }
-                    });
-                }
+                    } else {
+                        up.classList.remove('active');
+                        down.classList.remove('active');
+                    }
+                });
             }
-        } catch (error) {
-            console.error('Labelling failed:', error);
         }
     }
 
@@ -1250,8 +1322,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
     async function fetchStatus() {
-        const response = await fetch('/api/status');
-        return await response.json();
+        return await apiFetch('/api/status');
     }
 
     let conversionPoller = null;
@@ -1304,8 +1375,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function fetchRecapState() {
         try {
-            const response = await fetch('/api/recap/state');
-            recapState = await response.json();
+            recapState = await apiFetch('/api/recap/state');
 
             if (recapState.enabled) {
                 recapSidebar.style.display = 'block';
@@ -1314,9 +1384,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 recapSidebar.style.display = 'none';
             }
             updateUIVisibility();
-        } catch (error) {
-            console.error('Failed to fetch RECAP state:', error);
-        }
+        } catch (error) { }
     }
 
     function renderRecapSidebar() {
@@ -1373,7 +1441,7 @@ document.addEventListener('DOMContentLoaded', () => {
             taskHeader.innerHTML = `
                 <span class="recap-task-name">${task.name.replace(/_/g, ' ').toUpperCase()}</span>
                 ${isReady && task.iterations.length === 0 ?
-                    `<button class="btn-recap-mini" onclick="recapSpecialize('${task.name}')">SFT</button>` : ''}
+                    `<button class="btn-recap-mini" onclick="recapSpecialize('${task.name}', this)">SFT</button>` : ''}
             `;
             taskGroup.appendChild(taskHeader);
 
@@ -1395,9 +1463,9 @@ document.addEventListener('DOMContentLoaded', () => {
                             <span>${statusText}</span>
                         </div>
                         <div class="iteration-actions">
-                            <button class="btn-recap-mini" onclick="recapCollect('${task.name}', ${iter.id})">Collect</button>
-                            <button class="btn-recap-mini btn-recap-sim" onclick="recapSimulate('${task.name}', ${iter.id})">Sim</button>
-                            ${hasData ? `<button class="btn-recap-mini" onclick="recapIterate('${task.name}', ${iter.id})">Iterate</button>` : ''}
+                            <button class="btn-recap-mini" onclick="recapCollect('${task.name}', ${iter.id}, this)">Collect</button>
+                            <button class="btn-recap-mini btn-recap-sim" onclick="recapSimulate('${task.name}', ${iter.id}, this)">Sim</button>
+                            ${hasData ? `<button class="btn-recap-mini" onclick="recapIterate('${task.name}', ${iter.id}, this)">Iterate</button>` : ''}
                         </div>
                     </div>
                 `;
@@ -1422,76 +1490,50 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    window.recapSpecialize = async function (taskName) {
-        try {
-            const response = await fetch('/api/recap/specialize', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_name: taskName })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                await fetchRecapState();
-            } else {
-                console.error('Specialize failed:', data.error);
-            }
-        } catch (error) {
-            console.error('Specialize failed:', error);
+    window.recapSpecialize = async function (taskName, btn = null) {
+        const data = await apiFetch('/api/recap/specialize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_name: taskName })
+        }, btn);
+        if (data.status === 'ok') {
+            await fetchRecapState();
         }
     };
 
-    window.recapCollect = async function (taskName, iterId) {
-        try {
-            const response = await fetch('/api/recap/collect', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_name: taskName, iter_id: iterId })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                await fetchRecapState();
-            } else {
-                console.error('Collect failed:', data.error);
-            }
-        } catch (error) {
-            console.error('Collect failed:', error);
+    window.recapCollect = async function (taskName, iterId, btn = null) {
+        const data = await apiFetch('/api/recap/collect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_name: taskName, iter_id: iterId })
+        }, btn);
+        if (data.status === 'ok') {
+            await fetchRecapState();
         }
     };
 
-    window.recapSimulate = async function (taskName, iterId) {
-        try {
-            const response = await fetch('/api/recap/simulate_collection', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_name: taskName, iter_id: iterId })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                await fetchRecapState();
-                if (activeVideo && activeVideo.filename.includes(taskName)) {
-                    await fetchData();
-                }
+    window.recapSimulate = async function (taskName, iterId, btn = null) {
+        const data = await apiFetch('/api/recap/simulate_collection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_name: taskName, iter_id: iterId })
+        }, btn);
+        if (data.status === 'ok') {
+            await fetchRecapState();
+            if (activeVideo && activeVideo.filename.includes(taskName)) {
+                await fetchData();
             }
-        } catch (error) {
-            console.error('Simulation failed:', error);
         }
     };
 
-    window.recapIterate = async function (taskName, iterId) {
-        try {
-            const response = await fetch('/api/recap/iterate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ task_name: taskName, iter_id: iterId })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                await fetchRecapState();
-            } else {
-                console.error('Iterate failed:', data.error);
-            }
-        } catch (error) {
-            console.error('Iterate failed:', error);
+    window.recapIterate = async function (taskName, iterId, btn = null) {
+        const data = await apiFetch('/api/recap/iterate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_name: taskName, iter_id: iterId })
+        }, btn);
+        if (data.status === 'ok') {
+            await fetchRecapState();
         }
     };
 
@@ -1501,12 +1543,11 @@ document.addEventListener('DOMContentLoaded', () => {
         loadingDetail.textContent = `pretrained_data`;
 
         try {
-            const response = await fetch('/api/recap/load_data', {
+            const data = await apiFetch('/api/recap/load_data', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ is_pretrained: true })
             });
-            const data = await response.json();
             if (data.status === 'ok') {
                 videos = [];
                 labels = {};
@@ -1518,11 +1559,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 loadingOverlay.dataset.recapLoading = 'true';
                 checkConversionStatus();
             } else {
-                console.error('Load failed:', data.error);
                 loadingOverlay.classList.add('hidden-element');
             }
         } catch (error) {
-            console.error('Load failed:', error);
             loadingOverlay.classList.add('hidden-element');
         }
     }
@@ -1534,12 +1573,11 @@ document.addEventListener('DOMContentLoaded', () => {
         loadingDetail.textContent = `${taskName} / iter ${iterId} / ${dataId}`;
 
         try {
-            const response = await fetch('/api/recap/load_data', {
+            const data = await apiFetch('/api/recap/load_data', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ task_name: taskName, iter_id: iterId, data_id: dataId })
             });
-            const data = await response.json();
             if (data.status === 'ok') {
                 // Track the active folder
                 const folderPath = `${taskName}/iter_${iterId}/${dataId}`;
@@ -1565,11 +1603,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 loadingOverlay.dataset.recapLoading = 'true';
                 checkConversionStatus();
             } else {
-                console.error('Load failed:', data.error);
                 loadingOverlay.classList.add('hidden-element');
             }
         } catch (error) {
-            console.error('Load failed:', error);
             loadingOverlay.classList.add('hidden-element');
         }
     }
@@ -1618,44 +1654,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
     startPolicyTrainBtn.onclick = async () => {
         try {
-            startPolicyTrainBtn.disabled = true;
-            startPolicyTrainBtn.textContent = 'Preparing...';
-
-            const response = await fetch('/api/recap/finetune', {
+            const result = await apiFetch('/api/recap/finetune', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ config: selectedPolicyConfig })
-            });
-            const result = await response.json();
-            if (result.error) {
-                alert(result.error);
-                policyTrainingModal.classList.add('hidden-element');
-            } else {
+            }, startPolicyTrainBtn);
+
+            if (result.status === 'ok') {
                 policyTrainingProgressView.classList.remove('hidden-element');
-                startPolicyTrainBtn.disabled = true;
-                startPolicyTrainBtn.textContent = 'Finetuning...';
             }
-        } catch (error) {
-            console.error('Policy fine-tuning failed:', error);
-            policyTrainingModal.classList.add('hidden-element');
-        }
+        } catch (error) { }
     };
 
     // Pretrain button handler
     btnPretrain.onclick = async () => {
-        try {
-            const response = await fetch('/api/recap/pretrain', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                await fetchRecapState();
-            } else {
-                console.error('Pretrain failed:', data.error);
-            }
-        } catch (error) {
-            console.error('Pretrain failed:', error);
+        const data = await apiFetch('/api/recap/pretrain', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        }, btnPretrain);
+        if (data.status === 'ok') {
+            await fetchRecapState();
         }
     };
 
@@ -1705,18 +1723,13 @@ document.addEventListener('DOMContentLoaded', () => {
         simulateCollectionBtn.onclick = async () => {
             // Pick a task from the state (e.g. first task not yet initialized with iter 0)
             const taskToSimulate = recapState.tasks.find(t => !t.iterations.some(it => it.id === 0))?.name || 'mock_task';
-            try {
-                const response = await fetch('/api/recap/simulate_collection', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task_name: taskToSimulate })
-                });
-                const data = await response.json();
-                if (data.status === 'ok') {
-                    await fetchRecapState();
-                }
-            } catch (error) {
-                console.error('Simulation failed:', error);
+            const data = await apiFetch('/api/recap/simulate_collection', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_name: taskToSimulate })
+            }, simulateCollectionBtn);
+            if (data.status === 'ok') {
+                await fetchRecapState();
             }
         };
     }
@@ -1812,12 +1825,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function fetchValueNetworks() {
         try {
-            const response = await fetch('/api/value/networks/list');
-            const networks = await response.json();
+            const networks = await apiFetch('/api/value/networks/list');
             renderValueNetworks(networks);
-        } catch (error) {
-            console.error('Failed to fetch value networks:', error);
-        }
+        } catch (error) { }
     }
 
     function renderValueNetworks(networks) {
@@ -1851,22 +1861,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function loadValueNetwork(filename) {
-        try {
-            const response = await fetch('/api/value/networks/load', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename })
-            });
-            const data = await response.json();
-            if (data.status === 'ok') {
-                activeValueNetwork = filename;
-                calcValueBtn.disabled = false;
-                fetchValueNetworks(); // Refresh to update active state
-            } else {
-                alert('Load failed: ' + data.error);
-            }
-        } catch (error) {
-            console.error('Load failed:', error);
+        const data = await apiFetch('/api/value/networks/load', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename })
+        });
+        if (data.status === 'ok') {
+            activeValueNetwork = filename;
+            calcValueBtn.disabled = false;
+            fetchValueNetworks(); // Refresh to update active state
         }
     }
 
@@ -1898,21 +1901,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     startTrainBtn.onclick = async () => {
-        try {
-            const response = await fetch('/api/value/train', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ config: selectedConfig })
-            });
-            const result = await response.json();
-            if (result.error) {
-                alert(result.error);
-            } else {
-                trainingProgressView.classList.remove('hidden-element');
-                document.querySelector('.config-selection').classList.add('hidden-element');
-            }
-        } catch (error) {
-            console.error('Training failed:', error);
+        const result = await apiFetch('/api/value/train', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ config: selectedConfig })
+        }, startTrainBtn);
+        if (result.status === 'ok') {
+            trainingProgressView.classList.remove('hidden-element');
+            document.querySelector('.config-selection').classList.add('hidden-element');
         }
     };
 

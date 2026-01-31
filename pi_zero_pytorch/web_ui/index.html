@@ -23,6 +23,7 @@
             <p id="loading-detail" class="tiny-label"></p>
         </div>
     </div>
+    <div id="error-notification-container" class="error-notification-container"></div>
     <div class="glass-container">
         <header>
             <div class="header-row header-row-1">
@@ -186,6 +187,19 @@
                         </div>
                     </div>
                     <div id="proprio-chart-container" class="chart-container"></div>
+                </div>
+
+                <div id="action-section" class="action-section hidden-element">
+                    <div class="action-header">
+                        <span class="action-title">Action Editor</span>
+                        <div class="action-meta">
+                            <span id="action-timestep-label" class="tiny-label">T=0</span>
+                            <button id="save-action-btn" class="btn-action pulse">Save Action</button>
+                        </div>
+                    </div>
+                    <div id="action-controls-grid" class="action-controls-grid">
+                        <!-- Action sliders will be injected here -->
+                    </div>
                 </div>
             </div>
 

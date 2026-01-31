@@ -198,6 +198,14 @@ class InterventionRequest(BaseModel):
     filename: str
     timestep: int
 
+class ActionUpdateRequest(BaseModel):
+    filename: str
+    timestep: int
+    action: List[float] # We'll start with just the first step of the horizon for simplicity, or we can handle the whole thing.
+    # To keep it flexible, let's assume it's the flattened or specific dim.
+    # Actually, let's allow updating the whole (16, 6) or just the 6-dim action at T=0.
+    # Given the complexity of UI for 16x6, let's start with the 6-dim action at index 0 of the horizon.
+
 class VideoInfo(BaseModel):
     filename: str
     frames: int
@@ -835,6 +843,59 @@ async def label_intervention(req: InterventionRequest):
         "expert_segment": expert_mask.tolist(),
         "advantage_ids": adv_ids.tolist()
     }
+
+@app.get("/api/video/{filename}/action/{timestep}")
+async def get_action(filename: str, timestep: int):
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+    
+    # actions shape: (num_episodes, max_timesteps, horizon, action_dim)
+    # Get the action at the specific timestep. 
+    # For now, we return the first action in the horizon (index 0).
+    action = REPLAY_BUFFER.data['actions'][episode_id, timestep, 0].tolist()
+    
+    return {
+        "action": action,
+        "horizon": 16, # Fixed for now as per init_replay_buffer
+        "dim": 6
+    }
+
+@app.post("/api/video/{filename}/action/{timestep}")
+async def update_action(filename: str, timestep: int, req: ActionUpdateRequest):
+    if REPLAY_BUFFER is None:
+        return {"error": "ReplayBuffer not initialized"}
+    
+    episode_id = VIDEO_TO_EPISODE.get(filename)
+    if episode_id is None:
+        return {"error": "Video not found in buffer"}
+    
+    # Validate action dim
+    action_tensor = torch.tensor(req.action)
+    if action_tensor.shape[0] != 6:
+        return {"error": f"Invalid action dimension. Expected 6, got {action_tensor.shape[0]}"}
+    
+    # Update REPLAY_BUFFER. index 0 of the horizon for now.
+    REPLAY_BUFFER.data['actions'][episode_id, timestep, 0] = action_tensor.numpy()
+    
+    # Mark as expert segment if it wasn't already? 
+    # Or just keep it as is. Usually editing implies expert correction.
+    # Let's mark it as expert segment for this timestep.
+    expert_mask = REPLAY_BUFFER.data['expert_segment'][episode_id]
+    expert_mask[timestep] = True
+    REPLAY_BUFFER.data['expert_segment'][episode_id] = expert_mask
+    
+    # Force advantage_id to 1 (Positive) for this edited step
+    adv_ids = REPLAY_BUFFER.data['advantage_ids'][episode_id]
+    adv_ids[timestep] = 1
+    REPLAY_BUFFER.data['advantage_ids'][episode_id] = adv_ids
+
+    REPLAY_BUFFER.flush()
+    
+    return {"status": "ok", "action": req.action}
 
 @app.post("/api/returns/calculate")
 async def calculate_returns(req: dict):
