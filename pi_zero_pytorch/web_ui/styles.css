@@ -1342,6 +1342,71 @@ main {
     white-space: nowrap;
 }
 
+/* Proprioception Section */
+.proprio-section {
+    margin-top: 1rem;
+    padding: 0 2rem;
+}
+
+.proprio-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.5rem;
+}
+
+.proprio-title {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: #4ade80;
+    letter-spacing: 1px;
+    font-weight: 600;
+}
+
+.proprio-nav {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.proprio-nav-btn {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    color: var(--text-primary);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.7rem;
+    transition: background 0.2s;
+}
+
+.proprio-nav-btn:hover {
+    background: var(--card-hover);
+}
+
+#proprio-dim-label {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    min-width: 60px;
+    text-align: center;
+}
+
+#proprio-chart-container {
+    height: 80px;
+    padding: 0;
+}
+
+.chart-line-proprio {
+    fill: none;
+    stroke: #4ade80;
+    stroke-width: 1.5;
+}
+
+.chart-area-proprio {
+    fill: rgba(74, 222, 128, 0.15);
+    stroke: none;
+}
+
 .gae-controls {
     display: flex;
     gap: 1.5rem;

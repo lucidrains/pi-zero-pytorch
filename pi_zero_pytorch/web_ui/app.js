@@ -51,6 +51,17 @@ document.addEventListener('DOMContentLoaded', () => {
     let viewpointNames = {};
     let activeFolders = []; // Track active folder paths for display
 
+    // Proprioception state
+    let proprioData = null;    // 2D array [T, D]
+    let proprioNumDims = 0;
+    let proprioDimNames = [];
+    let currentProprioIdx = 0;
+    const proprioSection = document.getElementById('proprio-section');
+    const proprioChartContainer = document.getElementById('proprio-chart-container');
+    const proprioPrevBtn = document.getElementById('proprio-prev');
+    const proprioNextBtn = document.getElementById('proprio-next');
+    const proprioDimLabel = document.getElementById('proprio-dim-label');
+
     // Sidebar elements for visibility control
     const rolloutsSidebar = document.querySelector('.sidebar');
     const tasksSidebar = document.querySelector('.task-sidebar');
@@ -848,6 +859,70 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Proprioception functions
+    async function fetchProprio(filename) {
+        try {
+            const response = await fetch(`/api/video/${filename}/proprio`);
+            const data = await response.json();
+
+            if (data.proprio && data.num_dims > 0) {
+                proprioData = data.proprio;
+                proprioNumDims = data.num_dims;
+                proprioDimNames = data.dim_names;
+                currentProprioIdx = 0;
+
+                proprioSection.classList.remove('hidden-element');
+                updateProprioLabel();
+                renderProprioChart();
+            } else {
+                // No proprio data
+                proprioData = null;
+                proprioSection.classList.add('hidden-element');
+            }
+        } catch (error) {
+            console.error('Failed to fetch proprio:', error);
+            proprioData = null;
+            proprioSection.classList.add('hidden-element');
+        }
+    }
+
+    function updateProprioLabel() {
+        const dimName = proprioDimNames[currentProprioIdx] || `Dim ${currentProprioIdx}`;
+        proprioDimLabel.textContent = `${dimName} (${currentProprioIdx + 1}/${proprioNumDims})`;
+    }
+
+    function renderProprioChart() {
+        if (!proprioData || proprioNumDims === 0) return;
+
+        // Extract current dimension's data
+        const dimData = proprioData.map(t => t[currentProprioIdx]);
+        const totalLength = activeVideo ? activeVideo.frames : dimData.length;
+
+        renderChart(proprioChartContainer, dimData, proprioDimNames[currentProprioIdx] || 'Joint', 'proprio', totalLength);
+        proprioChartContainer.classList.add('active');
+    }
+
+    // Proprio navigation handlers
+    if (proprioPrevBtn) {
+        proprioPrevBtn.addEventListener('click', () => {
+            if (proprioNumDims > 0) {
+                currentProprioIdx = (currentProprioIdx - 1 + proprioNumDims) % proprioNumDims;
+                updateProprioLabel();
+                renderProprioChart();
+            }
+        });
+    }
+
+    if (proprioNextBtn) {
+        proprioNextBtn.addEventListener('click', () => {
+            if (proprioNumDims > 0) {
+                currentProprioIdx = (currentProprioIdx + 1) % proprioNumDims;
+                updateProprioLabel();
+                renderProprioChart();
+            }
+        });
+    }
+
     function showGlobalTooltip(e, frameIdx, value, title) {
         chartTooltip.style.display = 'block';
         chartTooltip.style.left = `${e.clientX + 15}px`;
@@ -1170,6 +1245,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCharts(video.filename);
         renderTasks();
         fetchFrames(video.filename);
+        fetchProprio(video.filename);
     }
 
 
@@ -1515,7 +1591,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const policySummaryEpochs = document.getElementById('policy-summary-epochs');
     const policySummaryLoss = document.getElementById('policy-summary-loss');
 
-    let selectedPolicyConfig = 'mock';
+    let selectedPolicyConfig = 'small';
 
     btnFinetunePolicy.onclick = async () => {
         if (btnFinetunePolicy.disabled) return;

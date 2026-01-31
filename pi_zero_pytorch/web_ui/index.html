@@ -175,6 +175,18 @@
                         <!-- Frames will be populated here -->
                     </div>
                 </div>
+
+                <div id="proprio-section" class="proprio-section hidden-element">
+                    <div class="proprio-header">
+                        <span class="proprio-title">Joint State</span>
+                        <div class="proprio-nav">
+                            <button id="proprio-prev" class="proprio-nav-btn">◀</button>
+                            <span id="proprio-dim-label">Dim 0/0</span>
+                            <button id="proprio-next" class="proprio-nav-btn">▶</button>
+                        </div>
+                    </div>
+                    <div id="proprio-chart-container" class="chart-container"></div>
+                </div>
             </div>
 
             <div class="task-sidebar">
@@ -252,11 +264,11 @@
             <p class="tiny-label">Finetune policy using binarized advantages.</p>
 
             <div class="config-selection policy-config-selection">
-                <div class="config-option selected" data-config="mock">
+                <div class="config-option" data-config="mock">
                     <span class="config-name">Mock (Ultra Fast)</span>
                     <span class="config-detail">8 dim, 1 depth, 1 heads, 32px</span>
                 </div>
-                <div class="config-option" data-config="small">
+                <div class="config-option selected" data-config="small">
                     <span class="config-name">Small</span>
                     <span class="config-detail">16 dim, 1 depth, 2 heads, 32px</span>
                 </div>

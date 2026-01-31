@@ -179,6 +179,7 @@ CACHE_DIR = Path(".cache/frames")
 REPLAY_BUFFER = None
 VIDEO_TO_EPISODE = {}
 VIDEO_TO_PATH = {}
+VIDEO_TO_PROPRIO = {}  # Maps episode name to proprioception array (T, D)
 DATA_DIR = Path("data")
 NUM_VIEWS = 1
 VALUE_NETWORK = None
@@ -245,10 +246,11 @@ def extract_frames(video_path: Path, cache_path: Path):
         cap.release()
 
 def init_replay_buffer(video_dirs: List[Path]):
-    global REPLAY_BUFFER, VIDEO_TO_EPISODE, VIDEO_TO_PATH, CONVERSION_STATUS, NUM_VIEWS
+    global REPLAY_BUFFER, VIDEO_TO_EPISODE, VIDEO_TO_PATH, VIDEO_TO_PROPRIO, CONVERSION_STATUS, NUM_VIEWS
     
     VIDEO_TO_EPISODE.clear()
     VIDEO_TO_PATH.clear()
+    VIDEO_TO_PROPRIO.clear()
     
     print(f"[RECAP] init_replay_buffer started with {video_dirs}")
     CONVERSION_STATUS["is_converting"] = True
@@ -306,6 +308,34 @@ def init_replay_buffer(video_dirs: List[Path]):
         num_views = max(1, num_views)
         NUM_VIEWS = num_views
         print(f"[RECAP] Detected {len(episode_names)} episodes with {num_views} view(s).")
+        
+        proprio_dim = 0
+        print(f"[RECAP] Initializing proprio_dim tracking...")
+        
+        # Load proprioception data from .npz files
+        proprio_keys = ['proprio', 'joint_state', 'qpos', 'robot_state', 'state']
+        for data_dir in video_dirs:
+            for npz_file in data_dir.rglob("*.npz"):
+                try:
+                    data = np.load(npz_file, allow_pickle=True)
+                    ep_name = npz_file.stem  # Use filename as episode name
+                    
+                    # Find a matching proprioception key
+                    for key in proprio_keys:
+                        if key in data:
+                            proprio_array = data[key]
+                            if proprio_array.ndim >= 1:
+                                VIDEO_TO_PROPRIO[ep_name] = proprio_array.tolist()
+                                if proprio_array.ndim == 1:
+                                    proprio_dim = max(proprio_dim, 1)
+                                else:
+                                    proprio_dim = max(proprio_dim, proprio_array.shape[-1])
+                                print(f"[RECAP] Loaded proprio for {ep_name}: shape={proprio_array.shape}")
+                            break
+                except Exception as e:
+                    print(f"[RECAP] Failed to load proprio from {npz_file}: {e}")
+
+        print(f"[RECAP] Final detected proprio_dim: {proprio_dim}")
 
         h, w, c, max_frames = None, None, None, 0
         for ep_name in episode_names:
@@ -325,6 +355,22 @@ def init_replay_buffer(video_dirs: List[Path]):
             for vf in episodes[ep_name].values():
                 max_frames = max(max_frames, get_frame_count(vf))
 
+        fields = dict(
+            images = ('float', (c, num_views, h, w)),
+            text = ('int', (32,)),
+            internal = ('float', (32,)),
+            actions = ('float', (16, 6)),
+            reward = 'float',
+            returns = ('float', (), float('nan')),
+            value = ('float', (), float('nan')),
+            advantages = ('float', (), float('nan')),
+            advantage_ids = ('int', (), -1),
+            expert_segment = 'bool'
+        )
+
+        if proprio_dim > 0:
+            fields['proprio'] = ('float', (proprio_dim,))
+
         REPLAY_BUFFER = ReplayBuffer(
             str(tmp_buffer_dir),
             max_episodes = len(episode_names),
@@ -338,18 +384,7 @@ def init_replay_buffer(video_dirs: List[Path]):
                 recap_step     = ('int', (), -1),
                 is_expert_intervention = 'bool'
             ),
-            fields = dict(
-                images = ('float', (c, num_views, h, w)),
-                text = ('int', (32,)),
-                internal = ('float', (32,)),
-                actions = ('float', (16, 6)),
-                reward = 'float',
-                returns = ('float', (), float('nan')),
-                value = ('float', (), float('nan')),
-                advantages = ('float', (), float('nan')),
-                advantage_ids = ('int', (), -1),
-                expert_segment = 'bool'
-            )
+            fields = fields
         )
 
         CONVERSION_STATUS["total"] = len(episode_names)
@@ -365,23 +400,39 @@ def init_replay_buffer(video_dirs: List[Path]):
             
             view_paths = [episodes[ep_name].get(v) for v in range(num_views)]
             view_paths = [p if p else view_paths[0] for p in view_paths]
+            
+            # Fetch proprio for this episode
+            ep_proprio = VIDEO_TO_PROPRIO.get(ep_name)
+            if ep_proprio:
+                ep_proprio = torch.tensor(ep_proprio)
 
             if FAST_MOCK:
                 start_mock = time.time()
                 with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
-                    for _ in range(32):
-                        REPLAY_BUFFER.store(
+                    for t_idx in range(32):
+                        store_kwargs = dict(
                             images = torch.randn(c, num_views, h, w),
                             text = torch.zeros(32, dtype=torch.long),
                             internal = torch.randn(32),
                             actions = torch.randn(16, 6),
                             reward = 0.0
                         )
+                        if ep_proprio is not None:
+                            # Use actual proprio if available (broadcast/slice as needed, here we just cycle or slice if possible)
+                            if t_idx < ep_proprio.shape[0]:
+                                store_kwargs['proprio'] = ep_proprio[t_idx]
+                            else:
+                                store_kwargs['proprio'] = torch.zeros(proprio_dim)
+                        elif proprio_dim > 0:
+                            store_kwargs['proprio'] = torch.zeros(proprio_dim)
+                            
+                        REPLAY_BUFFER.store(**store_kwargs)
                 print(f"[RECAP] FAST_MOCK: episode {i} done in {time.time() - start_mock:.4f}s")
                 continue
 
             caps = [cv2.VideoCapture(str(p)) for p in view_paths]
             with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
+                t_idx = 0
                 while True:
                     frames = []
                     for cap in caps:
@@ -391,13 +442,25 @@ def init_replay_buffer(video_dirs: List[Path]):
                         frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
                         frames.append(frame_tensor)
                     if len(frames) < len(caps): break
-                    REPLAY_BUFFER.store(
+                    
+                    store_kwargs = dict(
                         images = torch.stack(frames, dim = 1),
                         text = torch.randint(0, 100, (32,)),
                         internal = torch.randn(32),
                         actions = torch.randn(16, 6),
                         reward = 0.0
                     )
+                    
+                    if ep_proprio is not None:
+                        if t_idx < ep_proprio.shape[0]:
+                            store_kwargs['proprio'] = ep_proprio[t_idx]
+                        else:
+                            store_kwargs['proprio'] = ep_proprio[-1] # repeat last
+                    elif proprio_dim > 0:
+                        store_kwargs['proprio'] = torch.zeros(proprio_dim)
+
+                    REPLAY_BUFFER.store(**store_kwargs)
+                    t_idx += 1
             for cap in caps: cap.release()
     except Exception as e:
         print(f"[RECAP] ERROR in init_replay_buffer: {e}")
@@ -598,6 +661,28 @@ async def get_video_frames(filename: str):
         result.append(t_views)
         
     return {"frames": result}
+
+@app.get("/api/video/{filename}/proprio")
+async def get_video_proprio(filename: str):
+    """Return proprioception data for a video/episode if available."""
+    proprio = VIDEO_TO_PROPRIO.get(filename)
+    if proprio is None:
+        return {"proprio": None, "dim_names": [], "num_dims": 0}
+    
+    # proprio should be a 2D list [T, D] or 1D [T]
+    if isinstance(proprio, list) and len(proprio) > 0:
+        if isinstance(proprio[0], list):
+            num_dims = len(proprio[0])
+        else:
+            num_dims = 1
+            proprio = [[v] for v in proprio]  # Convert 1D to 2D
+    else:
+        num_dims = 0
+    
+    # Generate dimension names
+    dim_names = [f"Joint {i}" for i in range(num_dims)]
+    
+    return {"proprio": proprio, "dim_names": dim_names, "num_dims": num_dims}
 
 @app.get("/api/labels")
 async def get_all_labels():
@@ -1438,6 +1523,9 @@ async def load_value_network(req: dict):
 def train_policy_network_thread(config_name: str, loop):
     global TRAINING_STATE
     
+    has_proprio = (REPLAY_BUFFER is not None) and ('proprio' in REPLAY_BUFFER.data)
+    all_proprio = []
+    
     # 1. Prepare data - conditioned on binarized advantages (advantage_ids)
     if config_name == "mock":
         # Extremely fast mock data
@@ -1453,6 +1541,7 @@ def train_policy_network_thread(config_name: str, loop):
         all_internal = []
         all_actions = []
         all_advantage_ids = []
+        
         for i in range(len(REPLAY_BUFFER)):
             advantage_ids = REPLAY_BUFFER.data['advantage_ids'][i]
             valid_mask = advantage_ids != -1
@@ -1462,6 +1551,8 @@ def train_policy_network_thread(config_name: str, loop):
                 all_internal.append(torch.from_numpy(REPLAY_BUFFER.data['internal'][i][valid_mask]))
                 all_actions.append(torch.from_numpy(REPLAY_BUFFER.data['actions'][i][valid_mask]))
                 all_advantage_ids.append(torch.from_numpy(advantage_ids[valid_mask]))
+                if has_proprio:
+                    all_proprio.append(torch.from_numpy(REPLAY_BUFFER.data['proprio'][i][valid_mask]))
         
         if not all_images:
             print("No valid data for policy training")
@@ -1469,19 +1560,33 @@ def train_policy_network_thread(config_name: str, loop):
             _broadcast_training_update(loop)
             return
 
-        dataset = torch.utils.data.TensorDataset(
+        tensors = [
             torch.cat(all_images),
             torch.cat(all_text),
             torch.cat(all_internal),
             torch.cat(all_actions),
             torch.cat(all_advantage_ids)
-        )
+        ]
+        
+        if has_proprio:
+            tensors.append(torch.cat(all_proprio))
+
+        dataset = torch.utils.data.TensorDataset(*tensors)
     
     batch_size = 4
     loader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = True)
 
     # 2. Initialize model
-    config = PI_ZERO_CONFIGS.get(config_name, PI_ZERO_CONFIGS["small"])
+    config = PI_ZERO_CONFIGS.get(config_name, PI_ZERO_CONFIGS["small"]).copy()
+    
+    # If we have proprio data in the dataset, update dim_joint_state to match
+    if has_proprio and len(all_proprio) > 0:
+        actual_proprio_dim = all_proprio[0].shape[-1]
+        config["dim_joint_state"] = actual_proprio_dim
+        print(f"[RECAP] Using actual proprio_dim for policy: {actual_proprio_dim}")
+    else:
+        print(f"[RECAP] Using default dim_joint_state: {config.get('dim_joint_state', 32)}")
+    
     model = SmallPiZero(**config).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4) # lower lr for finetuning
     model.train()
@@ -1504,18 +1609,25 @@ def train_policy_network_thread(config_name: str, loop):
     print(f"Starting policy fine-tuning for {num_epochs} epoch...")
     for epoch in range(num_epochs):
         TRAINING_STATE["current_epoch"] = epoch + 1
-        for i, (images, text, internal, actions, adv_ids) in enumerate(loader):
+        for i, batch in enumerate(loader):
+            if len(batch) == 6:
+                images, text, internal, actions, adv_ids, proprio = batch
+                joint_state = proprio
+            else:
+                images, text, internal, actions, adv_ids = batch
+                joint_state = internal
+
             images = images.to(DEVICE).squeeze(2)
             if images.shape[-2:] != target_size:
                 images = TF.resize(images, target_size, antialias = True)
             
             text = text.to(DEVICE)
-            internal = internal.to(DEVICE)
+            joint_state = joint_state.to(DEVICE)
             actions = actions.to(DEVICE)
             adv_ids = adv_ids.to(DEVICE)
             
             # Conditioned on advantage_ids
-            output = model(images, text, internal, actions, advantage_ids = adv_ids)
+            output = model(images, text, joint_state, actions, advantage_ids = adv_ids)
             loss = output[0] if isinstance(output, tuple) else output
             
             optimizer.zero_grad()
@@ -1559,6 +1671,7 @@ async def start_policy_finetune(req: dict):
         return {"error": "Training already in progress"}
         
     config_name = req.get("config", "mock") # use mock for speed in e2e
+    print(f"[RECAP] start_policy_finetune called with config: {config_name}")
     loop = asyncio.get_event_loop()
     threading.Thread(target=train_policy_network_thread, args=(config_name, loop), daemon=True).start()
     
