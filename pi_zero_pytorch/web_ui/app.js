@@ -376,6 +376,7 @@ document.addEventListener('DOMContentLoaded', () => {
             setTimeout(fetchData, 2000);
         }
     }
+    window.fetchData = fetchData;
 
     async function fetchFrames(filename) {
         carouselTrack.innerHTML = '<div class="loader">Extracting frames...</div>';
@@ -1177,35 +1178,44 @@ document.addEventListener('DOMContentLoaded', () => {
         return await response.json();
     }
 
+    let conversionPoller = null;
     async function checkConversionStatus() {
-        // If in RECAP mode and no video dir is set, skip conversion check
-        if (recapState && recapState.enabled && loadingOverlay.dataset.recapLoading !== 'true') {
-            console.log("RECAP mode: skipping checkConversionStatus");
-            loadingOverlay.classList.add('hidden-element');
-            return;
-        }
+        // Reset flag
+        window.__RECAP_LOADING_FINISHED__ = false;
 
-        try {
-            const status = await fetchStatus();
-            console.log('Conversion Status:', status);
-            if (status.is_converting) {
-                loadingOverlay.classList.remove('hidden-element');
-                const percent = status.total > 0 ? (status.progress / status.total) * 100 : 0;
-                loadingProgress.style.width = `${percent}%`;
-                loadingStatus.textContent = `Converting videos... (${status.progress}/${status.total})`;
-                loadingDetail.textContent = status.current_video;
+        if (conversionPoller) clearInterval(conversionPoller);
 
-                setTimeout(checkConversionStatus, 1000);
-            } else {
+        conversionPoller = setInterval(async () => {
+            // If in RECAP mode and no video dir is set, skip conversion check
+            if (recapState && recapState.enabled && loadingOverlay.dataset.recapLoading !== 'true') {
                 loadingOverlay.classList.add('hidden-element');
-                // Only fetch data once conversion is complete
-                await fetchData();
+                clearInterval(conversionPoller);
+                return;
             }
-        } catch (error) {
-            console.error('Failed to check status:', error);
-            setTimeout(checkConversionStatus, 2000);
-        }
+
+            try {
+                const status = await fetchStatus();
+                console.log('[POLLER] Status:', status);
+                if (status.is_converting) {
+                    loadingOverlay.classList.remove('hidden-element');
+                    const percent = status.total > 0 ? (status.progress / status.total) * 100 : 0;
+                    loadingProgress.style.width = `${percent}%`;
+                    loadingStatus.textContent = `Converting videos... (${status.progress}/${status.total})`;
+                    loadingDetail.textContent = status.current_video || 'Preparing ReplayBuffer...';
+                } else {
+                    console.log('[POLLER] Conversion complete, hiding overlay');
+                    loadingOverlay.classList.add('hidden-element');
+                    loadingOverlay.dataset.recapLoading = 'false';
+                    window.__RECAP_LOADING_FINISHED__ = true;
+                    clearInterval(conversionPoller);
+                    await fetchData();
+                }
+            } catch (error) {
+                console.error('[POLLER] Failed to check status:', error);
+            }
+        }, 1000);
     }
+    window.__RECAP_LOADING_FINISHED__ = false;
 
     const recapSidebar = document.getElementById('recap-sidebar');
     const recapTaskList = document.getElementById('recap-task-list');

@@ -178,6 +178,8 @@ VIDEO_DIRS = []
 CACHE_DIR = Path(".cache/frames")
 REPLAY_BUFFER = None
 VIDEO_TO_EPISODE = {}
+VIDEO_TO_PATH = {}
+DATA_DIR = Path("data")
 NUM_VIEWS = 1
 VALUE_NETWORK = None
 RECAP_WORKSPACE = None  # Set via --recap-workspace CLI option
@@ -243,160 +245,168 @@ def extract_frames(video_path: Path, cache_path: Path):
         cap.release()
 
 def init_replay_buffer(video_dirs: List[Path]):
-    global REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS, NUM_VIEWS
+    global REPLAY_BUFFER, VIDEO_TO_EPISODE, VIDEO_TO_PATH, CONVERSION_STATUS, NUM_VIEWS
+    
+    VIDEO_TO_EPISODE.clear()
+    VIDEO_TO_PATH.clear()
     
     print(f"[RECAP] init_replay_buffer started with {video_dirs}")
     CONVERSION_STATUS["is_converting"] = True
     CONVERSION_STATUS["progress"] = 0
     
-    tmp_buffer_dir = Path("tmp/replay_buffer")
-    if tmp_buffer_dir.exists():
-        shutil.rmtree(tmp_buffer_dir)
-    tmp_buffer_dir.mkdir(parents=True, exist_ok = True)
+    try:
+        tmp_buffer_dir = Path("tmp/replay_buffer")
+        if tmp_buffer_dir.exists():
+            shutil.rmtree(tmp_buffer_dir)
+        tmp_buffer_dir.mkdir(parents=True, exist_ok = True)
 
-    extensions = {".mp4", ".webm", ".avi", ".mov"}
-    
-    if isinstance(video_dirs, Path):
-        video_dirs = [video_dirs]
+        if isinstance(video_dirs, Path):
+            video_dirs = [video_dirs]
 
-    # Group videos by episode name
-    # Pattern: {episode}.{view}.mp4 or {episode}.mp4
-    episodes = {} # episode_name -> [list of view files]
+        episodes = {}
+        for data_dir in video_dirs:
+            print(f"[RECAP] Scanning {data_dir} for videos...")
+            found_in_dir = False
+            for ext in [".mp4", ".webm", ".avi", ".mov"]:
+                for f in data_dir.rglob(f"*{ext}"):
+                    found_in_dir = True
+                    if f.parent.name.startswith("data."):
+                        parts = f.name.split('.')
+                        if len(parts) >= 3 and parts[-2].isdigit():
+                            ep_name = ".".join(parts[:-2])
+                            view_idx = int(parts[-2])
+                        else:
+                            ep_name = f.stem
+                            view_idx = 0
+                    else:
+                        ep_name = f.parent.name
+                        try:
+                            view_idx = int(f.stem)
+                        except:
+                            view_idx = 0
 
-    for vdir in video_dirs:
-        for f in vdir.iterdir():
-            if f.suffix.lower() in extensions and f.stat().st_size > 0:
-                parts = f.name.split('.')
-                if len(parts) >= 3 and parts[-2].isdigit():
-                    ep_name = ".".join(parts[:-2])
-                    view_idx = int(parts[-2])
-                else:
-                    ep_name = ".".join(parts[:-1])
-                    view_idx = 0
-                
-                if ep_name not in episodes:
-                    episodes[ep_name] = {}
-                episodes[ep_name][view_idx] = f
+                    if ep_name not in episodes:
+                        episodes[ep_name] = {}
+                    episodes[ep_name][view_idx] = f
+                    print(f"[RECAP] Found video: {f} -> ep: {ep_name}, view: {view_idx}")
+            
+            if not found_in_dir:
+                print(f"[RECAP] WARNING: No videos found in {data_dir}")
 
-    episode_names = sorted(episodes.keys())
-    
-    if not episode_names:
-        print("No valid video files found")
-        CONVERSION_STATUS["is_converting"] = False
-        return
+        episode_names = sorted(episodes.keys())
+        
+        if not episode_names:
+            print("No valid video files found")
+            return
 
-    # Determine num_views
-    num_views = 0
-    for ep_name in episode_names:
-        num_views = max(num_views, max(episodes[ep_name].keys()) + 1)
-    
-    num_views = max(1, num_views)
-    NUM_VIEWS = num_views
-    print(f"[RECAP] Detected {len(episode_names)} episodes with {num_views} view(s).")
+        num_views = 0
+        for ep_name in episode_names:
+            num_views = max(num_views, max(episodes[ep_name].keys()) + 1)
+        
+        num_views = max(1, num_views)
+        NUM_VIEWS = num_views
+        print(f"[RECAP] Detected {len(episode_names)} episodes with {num_views} view(s).")
 
-    h, w, c, max_frames = None, None, None, 0
-    # Use first available frame to get dimensions
-    for ep_name in episode_names:
-        vf = episodes[ep_name][0]
-        cap = cv2.VideoCapture(str(vf))
-        ret, frame = cap.read()
-        cap.release()
-        if ret:
-            h, w, c = frame.shape
-            break
-    
-    if h is None:
-        print("Could not read any video files")
-        CONVERSION_STATUS["is_converting"] = False
-        return
-    
-    for ep_name in episode_names:
-        for vf in episodes[ep_name].values():
-            max_frames = max(max_frames, get_frame_count(vf))
+        h, w, c, max_frames = None, None, None, 0
+        for ep_name in episode_names:
+            vf = episodes[ep_name][0]
+            cap = cv2.VideoCapture(str(vf))
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                h, w, c = frame.shape
+                break
+        
+        if h is None:
+            print("Could not read any video files")
+            return
+        
+        for ep_name in episode_names:
+            for vf in episodes[ep_name].values():
+                max_frames = max(max_frames, get_frame_count(vf))
 
-    REPLAY_BUFFER = ReplayBuffer(
-        str(tmp_buffer_dir),
-        max_episodes = len(episode_names),
-        max_timesteps = max_frames,
-        meta_fields = dict(
-            task_id        = ('int', (), -1),
-            fail           = 'bool',
-            task_completed = ('int', (), -1),
-            marked_timestep = ('int', (), -1),
-            invalidated    = 'bool',
-            recap_step     = ('int', (), -1),
-            is_expert_intervention = 'bool'
-        ),
-        fields = dict(
-            images = ('float', (c, num_views, h, w)),
-            text = ('int', (32,)),
-            internal = ('float', (32,)),
-            actions = ('float', (16, 6)),
-            reward = 'float',
-            returns = ('float', (), float('nan')),
-            value = ('float', (), float('nan')),
-            advantages = ('float', (), float('nan')),
-            advantage_ids = ('int', (), -1),
-            expert_segment = 'bool'
+        REPLAY_BUFFER = ReplayBuffer(
+            str(tmp_buffer_dir),
+            max_episodes = len(episode_names),
+            max_timesteps = max_frames,
+            meta_fields = dict(
+                task_id        = ('int', (), -1),
+                fail           = 'bool',
+                task_completed = ('int', (), -1),
+                marked_timestep = ('int', (), -1),
+                invalidated    = 'bool',
+                recap_step     = ('int', (), -1),
+                is_expert_intervention = 'bool'
+            ),
+            fields = dict(
+                images = ('float', (c, num_views, h, w)),
+                text = ('int', (32,)),
+                internal = ('float', (32,)),
+                actions = ('float', (16, 6)),
+                reward = 'float',
+                returns = ('float', (), float('nan')),
+                value = ('float', (), float('nan')),
+                advantages = ('float', (), float('nan')),
+                advantage_ids = ('int', (), -1),
+                expert_segment = 'bool'
+            )
         )
-    )
 
-    CONVERSION_STATUS["total"] = len(episode_names)
+        CONVERSION_STATUS["total"] = len(episode_names)
 
-    for i, ep_name in enumerate(episode_names):
-        CONVERSION_STATUS["current_video"] = ep_name
-        CONVERSION_STATUS["progress"] = i
-        
-        VIDEO_TO_EPISODE[ep_name] = i
-        
-        view_paths = [episodes[ep_name].get(v) for v in range(num_views)]
-        # fallback to view 0 if others missing
-        view_paths = [p if p else view_paths[0] for p in view_paths]
+        for i, ep_name in enumerate(episode_names):
+            CONVERSION_STATUS["current_video"] = ep_name
+            CONVERSION_STATUS["progress"] = i
+            
+            VIDEO_TO_EPISODE[ep_name] = i
+            for view_idx, p in episodes[ep_name].items():
+                VIDEO_TO_PATH[p.name] = p
+            VIDEO_TO_PATH[ep_name] = episodes[ep_name][0]
+            
+            view_paths = [episodes[ep_name].get(v) for v in range(num_views)]
+            view_paths = [p if p else view_paths[0] for p in view_paths]
 
-        if FAST_MOCK:
+            if FAST_MOCK:
+                start_mock = time.time()
+                with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
+                    for _ in range(32):
+                        REPLAY_BUFFER.store(
+                            images = torch.randn(c, num_views, h, w),
+                            text = torch.zeros(32, dtype=torch.long),
+                            internal = torch.randn(32),
+                            actions = torch.randn(16, 6),
+                            reward = 0.0
+                        )
+                print(f"[RECAP] FAST_MOCK: episode {i} done in {time.time() - start_mock:.4f}s")
+                continue
+
+            caps = [cv2.VideoCapture(str(p)) for p in view_paths]
             with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
-                for _ in range(64):
+                while True:
+                    frames = []
+                    for cap in caps:
+                        ret, frame = cap.read()
+                        if not ret: break
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
+                        frames.append(frame_tensor)
+                    if len(frames) < len(caps): break
                     REPLAY_BUFFER.store(
-                        images = torch.randn(c, num_views, h, w),
-                        text = torch.zeros(32, dtype=torch.long),
+                        images = torch.stack(frames, dim = 1),
+                        text = torch.randint(0, 100, (32,)),
                         internal = torch.randn(32),
                         actions = torch.randn(16, 6),
                         reward = 0.0
                     )
-            continue
-
-        caps = [cv2.VideoCapture(str(p)) for p in view_paths]
-        
-        with REPLAY_BUFFER.one_episode(task_id = torch.tensor(-1)):
-            while True:
-                frames = []
-                for cap in caps:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
-                    frames.append(frame_tensor)
-                
-                if len(frames) < len(caps):
-                    break
-                
-                # Stack frames into [C, num_views, H, W]
-                stacked_frames = torch.stack(frames, dim = 1)
-                
-                REPLAY_BUFFER.store(
-                    images = stacked_frames,
-                    text = torch.randint(0, 100, (32,)),
-                    internal = torch.randn(32),
-                    actions = torch.randn(16, 6),
-                    reward = 0.0
-                )
-        for cap in caps:
-            cap.release()
-    
-    CONVERSION_STATUS["is_converting"] = False
-    CONVERSION_STATUS["progress"] = len(episode_names)
-    print("ReplayBuffer initialization complete.")
+            for cap in caps: cap.release()
+    except Exception as e:
+        print(f"[RECAP] ERROR in init_replay_buffer: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        CONVERSION_STATUS["is_converting"] = False
+        CONVERSION_STATUS["progress"] = len(episode_names)
+        print("ReplayBuffer initialization complete.")
 
 @app.get("/api/status")
 async def get_status():
@@ -515,27 +525,55 @@ async def get_viewpoints():
                 return json.load(f)
     return {"viewpoints": {}}
 
+def get_video_path(filename: str) -> Path:
+    # Check our explicit mapping first
+    if filename in VIDEO_TO_PATH:
+        return VIDEO_TO_PATH[filename]
+        
+    # Check if it's in a subfolder (for RECAP)
+    if "/" in filename or "\\" in filename:
+        return Path(filename)
+        
+    # Fallback to the first video directory if available
+    if VIDEO_DIRS:
+        return VIDEO_DIRS[0] / filename
+        
+    return DATA_DIR / filename
+
 @app.get("/api/video/{filename}/frames")
 async def get_video_frames(filename: str):
     # Determine all views for this filename
     # filename is the episode base name
     views = []
+    
+    # First try multi-view naming (episode.viewIdx.mp4)
     view_idx = 0
     while True:
         v_name = f"{filename}.{view_idx}.mp4"
         v_path = get_video_path(v_name)
-        if not v_path:
-            # Fallback check for single view
-            if view_idx == 0:
-                v_path = get_video_path(f"{filename}.mp4")
-                if v_path:
-                    views.append(v_path)
+        if not v_path or not v_path.exists():
             break
         views.append(v_path)
         view_idx += 1
     
+    # If no multi-view files found, try single-view naming
     if not views:
-        return {"error": "Video not found"}
+        # Try episode.mp4
+        single_path = get_video_path(f"{filename}.mp4")
+        if single_path and single_path.exists():
+            views.append(single_path)
+        else:
+            # Check VIDEO_TO_PATH for the episode name directly
+            for key, path in VIDEO_TO_PATH.items():
+                # Match by episode base name
+                if key.replace('.mp4', '') == filename or key == filename:
+                    views.append(path)
+                    break
+    
+    if not views:
+        print(f"[FRAMES] Video not found: {filename}")
+        print(f"[FRAMES] VIDEO_TO_PATH keys: {list(VIDEO_TO_PATH.keys())}")
+        return {"error": "Video not found", "frames": []}
     
     # Extract frames for each view
     all_frames = []
@@ -1594,6 +1632,8 @@ async def recap_load_data(req: dict):
     VIDEO_TO_EPISODE = {}
     
     # Start conversion in background
+    CONVERSION_STATUS["is_converting"] = True
+    CONVERSION_STATUS["progress"] = 0
     threading.Thread(target=init_replay_buffer, args=(VIDEO_DIRS,), daemon=True).start()
     
     return {"status": "ok", "video_dir": str(target_dir)}
