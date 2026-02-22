@@ -1349,7 +1349,7 @@ class PiZero(Module):
 
         self.to_time_cond = nn.Sequential(
             time_embed,
-            MLP(in_dim, *hidden_dims, out_dim, activation = nn.SiLU())
+            MLP(in_dim, *hidden_dims, out_dim, activation = nn.SiLU(), activate_last = layer_time_cond)
         )
 
         # action-time fusion (pi0)
@@ -1404,8 +1404,8 @@ class PiZero(Module):
 
             if layer_time_cond:
                 cond_layers.append(ModuleList([
-                    AdaptiveRMSNorm(dim_action, dim_time_cond),
-                    AdaptiveRMSNorm(dim_action, dim_time_cond),
+                    AdaptiveRMSNorm(dim_action, dim_time_cond, eps = norm_eps),
+                    AdaptiveRMSNorm(dim_action, dim_time_cond, eps = norm_eps),
                 ]))
             else:
                 cond_layers.append(ModuleList([
@@ -1978,7 +1978,9 @@ class PiZero(Module):
             visual_tokens = images
 
         visual_tokens = self.maybe_to_image_tokens(visual_tokens)
-        visual_tokens = visual_tokens / self.token_scale
+
+        if not self.pi05:
+            visual_tokens = visual_tokens / self.token_scale
 
         # Language tokens scaled by sqrt(dim) to match reference embed_prefix
         language_tokens = language_tokens * self.token_scale
@@ -1995,9 +1997,11 @@ class PiZero(Module):
         seq = torch.arange(seq_len, device = device)
         rotary_emb = self.rotary_emb(seq)
 
-        # transformer
-        state_tokens = state_tokens * self.token_scale
-
+        initial_state_tokens = state_tokens
+        
+        if not self.pi05:
+            state_tokens = state_tokens * self.token_scale
+        
         num_visual_tokens = visual_tokens.shape[-2]
 
         for attn, ff, _, _ in self.layers:
@@ -2013,6 +2017,7 @@ class PiZero(Module):
 
             state_tokens = ff(state_tokens) + state_tokens
 
+        pre_norm_state = state_tokens
         state_tokens = self.final_norm(state_tokens)
 
         embed = state_tokens
@@ -2379,7 +2384,8 @@ class PiZero(Module):
 
             visual_tokens = self.maybe_to_image_tokens(visual_tokens)
 
-            visual_tokens = visual_tokens / self.token_scale
+            if not self.pi05:
+                visual_tokens = visual_tokens / self.token_scale
 
             # empty
 
@@ -2511,10 +2517,10 @@ class PiZero(Module):
                 if first_action_pos < ar_mask.shape[-1]:
                     ar_mask[:, first_action_pos] = 1
             else:
-                # PI0.5: Segment 1 starts at actions
-                action_tokens_start = prefix_len + num_registers
-                if action_tokens_start < ar_mask.shape[-1]:
-                    ar_mask[:, action_tokens_start] = 1
+                # PI0.5: Segment 1 starts at beginning of suffix (registers + actions)
+                suffix_start = prefix_len
+                if suffix_start < ar_mask.shape[-1]:
+                    ar_mask[:, suffix_start] = 1
 
         # rotary embeddings
         seq = (mask.float().cumsum(dim = -1) - 1).clamp_min(0)
@@ -2566,10 +2572,10 @@ class PiZero(Module):
 
         cached_state_key_values_iter = iter(default(cached_state_keys_values, []))
 
-        if exists(state_tokens):
-            state_tokens = state_tokens * self.token_scale
+        state_tokens = state_tokens * self.token_scale
 
-        action_tokens = action_tokens * (self.dim_action ** 0.5)
+        if not self.pi05:
+            action_tokens = action_tokens * (self.dim_action ** 0.5)
 
         if not inferencing:
 

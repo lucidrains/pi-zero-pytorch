@@ -1,9 +1,9 @@
 # /// script
 # dependencies = [
 #   "torch",
-#   "transformers",
+#   "transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi",
 #   "einops",
-#   "lerobot",
+#   "lerobot>=0.4.0",
 #   "beartype",
 #   "accelerate",
 #   "pi-zero-pytorch"
@@ -14,19 +14,10 @@ import os
 import sys
 import torch
 import torch.nn as nn
-from unittest.mock import MagicMock
+import lerobot.policies.pi05.modeling_pi05 as modeling_pi05
 
-# mock transformers check before lerobot imports
-
-mock_check = MagicMock()
-mock_check.check_whether_transformers_replace_is_installed_correctly.return_value = True
-sys.modules['transformers.models.siglip.check'] = mock_check
-
-import lerobot.policies.pi0.modeling_pi0 as modeling_pi0
-modeling_pi0.check_whether_transformers_replace_is_installed_correctly = lambda: True
-
-from lerobot.policies.pi0.modeling_pi0 import PI0Pytorch, GemmaConfig, PaliGemmaWithExpertModel
-from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch, GemmaConfig, PaliGemmaWithExpertModel
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
 from transformers import CONFIG_MAPPING
 from einops import rearrange
@@ -68,13 +59,15 @@ def create_tiny_lerobot():
     vlm_cfg = GemmaConfig(width = DIM, depth = DEPTH, mlp_dim = MLP_DIM, num_heads = HEADS, num_kv_heads = KV_HEADS, head_dim = HEAD_DIM)
     exp_cfg = GemmaConfig(width = DIM, depth = DEPTH, mlp_dim = MLP_DIM, num_heads = HEADS, num_kv_heads = KV_HEADS, head_dim = HEAD_DIM)
     
-    modeling_pi0.get_gemma_config = lambda v: vlm_cfg if 'paligemma' in v else exp_cfg
+    modeling_pi05.get_gemma_config = lambda v: vlm_cfg if 'paligemma' in v else exp_cfg
     
     orig_init = PaliGemmaWithExpertModel.__init__
     
     def patched_init(self, vlm_config, action_expert_config, use_adarms = None, precision = "float32", **kwargs):
         self.freeze_vision_encoder = kwargs.get('freeze_vision_encoder', False)
         self.train_expert_only = kwargs.get('train_expert_only', False)
+        if use_adarms is None:
+            use_adarms = [False, True]
         nn.Module.__init__(self)
         vlm_cfg_hf = CONFIG_MAPPING["paligemma"]()
         vlm_cfg_hf._vocab_size = VOCAB_SIZE
@@ -108,9 +101,12 @@ def create_tiny_lerobot():
             num_key_value_heads = action_expert_config.num_kv_heads,
             vocab_size = VOCAB_SIZE,
             hidden_activation = "gelu_pytorch_tanh",
-            torch_dtype = "float32"
+            torch_dtype = "float32",
+            use_adarms = use_adarms[1],
+            adarms_cond_dim = action_expert_config.width if use_adarms[1] else None
         )
         
+        # Load transformers modeling
         from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
         from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
         
@@ -120,14 +116,13 @@ def create_tiny_lerobot():
     
     PaliGemmaWithExpertModel.__init__ = patched_init
     
-    config = PI0Config()
+    config = PI05Config()
     config.max_action_dim = 32
-    config.max_state_dim = 32
     config.chunk_size = 50
     config.dtype = 'float32'
     config.device = 'cpu'
     
-    model = PI0Pytorch(config)
+    model = PI05Pytorch(config)
     PaliGemmaWithExpertModel.__init__ = orig_init
     
     model.paligemma_with_expert.paligemma.model.multi_modal_projector.linear = nn.Linear(SIGLIP_DIM, DIM)
@@ -154,11 +149,12 @@ def create_tiny_pizero():
         dim_head = HEAD_DIM,
         heads = HEADS,
         kv_heads = KV_HEADS,
-        ff_expand_factor = (MLP_DIM / DIM * 1.5),
-        action_ff_expand_factor = (MLP_DIM / DIM * 1.5),
+        ff_expand_factor = (MLP_DIM / DIM) * 1.5,
+        action_ff_expand_factor = (MLP_DIM / DIM) * 1.5,
         time_sinusoidal = True,
-        time_infused_action_tokens = True,
-        layer_time_cond = False,
+        time_infused_action_tokens = False,
+        layer_time_cond = True,
+        pi05 = True,
         vit = vit,
         vit_dim = SIGLIP_DIM,
         dim_time_cond = DIM,
@@ -198,9 +194,12 @@ def sync_weights(ler, pz):
     l_pg = ler.paligemma_with_expert.paligemma.model
     copy_linear(pz.maybe_to_image_tokens, l_pg.multi_modal_projector.linear)
     copy_weight(pz.token_emb.weight, ler.paligemma_with_expert.paligemma.language_model.embed_tokens.weight)
-    copy_linear(pz.to_joint_state_tokens, ler.state_proj)
     copy_linear(pz.to_action_tokens, ler.action_in_proj)
     copy_linear(pz.actions_to_pred_flow, ler.action_out_proj)
+
+    # time conditioning
+    copy_linear(pz.to_time_cond[1].layers[0][0], ler.time_mlp_in)
+    copy_linear(pz.to_time_cond[1].layers[1][0], ler.time_mlp_out)
 
     # transformer layers
     p_block = pz.layers[0]
@@ -212,7 +211,7 @@ def sync_weights(ler, pz):
     copy_weight(p_block[0].to_qkv.weight, torch.cat([l_vlm.self_attn.q_proj.weight, l_vlm.self_attn.k_proj.weight, l_vlm.self_attn.v_proj.weight], dim = 0))
     copy_weight(p_block[0].to_out.weight, l_vlm.self_attn.o_proj.weight)
 
-    copy_weight(p_cond[0].weight, l_exp.input_layernorm.weight)
+    copy_linear(p_cond[0].to_modulation, l_exp.input_layernorm.dense)
     copy_weight(p_block[0].to_actions_qkv.weight, torch.cat([l_exp.self_attn.q_proj.weight, l_exp.self_attn.k_proj.weight, l_exp.self_attn.v_proj.weight], dim = 0))
     copy_weight(p_block[0].to_actions_out.weight, l_exp.self_attn.o_proj.weight)
 
@@ -220,17 +219,14 @@ def sync_weights(ler, pz):
     copy_weight(p_block[1].proj_in.weight, torch.cat([l_vlm.mlp.gate_proj.weight, l_vlm.mlp.up_proj.weight], dim = 0))
     copy_weight(p_block[1].proj_out.weight, l_vlm.mlp.down_proj.weight)
 
-    copy_weight(p_cond[1].weight, l_exp.post_attention_layernorm.weight)
+    copy_linear(p_cond[1].to_modulation, l_exp.post_attention_layernorm.dense)
     copy_weight(p_block[2].proj_in.weight, torch.cat([l_exp.mlp.gate_proj.weight, l_exp.mlp.up_proj.weight], dim = 0))
     copy_weight(p_block[2].proj_out.weight, l_exp.mlp.down_proj.weight)
 
     # final heads
     copy_weight(pz.final_norm.weight, ler.paligemma_with_expert.paligemma.language_model.norm.weight)
     copy_weight(pz.state_to_logits.weight, ler.paligemma_with_expert.paligemma.lm_head.weight)
-    copy_weight(pz.final_actions_norm.weight, ler.paligemma_with_expert.gemma_expert.model.norm.weight)
-    
-    copy_linear(pz.to_action_time_fuse.layers[0][0], ler.action_time_mlp_in)
-    copy_linear(pz.to_action_time_fuse.layers[1], ler.action_time_mlp_out)
+    copy_linear(pz.final_actions_norm.to_modulation, ler.paligemma_with_expert.gemma_expert.model.norm.dense)
 
 if __name__ == '__main__':
     torch.manual_seed(42)
@@ -246,17 +242,17 @@ if __name__ == '__main__':
     
     img = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
     tokens = torch.randint(0, 1000, (1, 48))
-    state = torch.randn(1, 32)
+    state = torch.zeros(1, 32)
     actions = torch.randn(1, 50, 32)
     times = torch.tensor([0.5])
-    
+
     with torch.no_grad():
         # lerobot
         img_masks = [torch.ones(1, dtype = torch.bool)]
         lang_masks = torch.ones(1, 48, dtype = torch.bool)
         
         prefix_embs, prefix_pad_masks, prefix_att_masks = ler.embed_prefix([img], img_masks, tokens, lang_masks)
-        prefix_att_2d_masks = modeling_pi0.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_att_2d_masks = modeling_pi05.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim = 1) - 1
         prefix_att_2d_masks_4d = ler._prepare_attention_masks_4d(prefix_att_2d_masks)
         
@@ -267,8 +263,8 @@ if __name__ == '__main__':
             use_cache = True,
         )
         
-        ler_logits = ler.paligemma_with_expert.paligemma.lm_head(ler.paligemma_with_expert.paligemma.language_model.norm(vlm_out[0]))
-        ler_flow = ler.denoise_step(state = state, prefix_pad_masks = prefix_pad_masks, past_key_values = past_kv, x_t = actions, timestep = times)
+        ler_logits = ler.paligemma_with_expert.paligemma.lm_head(ler.paligemma_with_expert.paligemma.language_model.norm(vlm_out[0])[0])
+        ler_flow = ler.denoise_step(prefix_pad_masks = prefix_pad_masks, past_key_values = past_kv, x_t = actions, timestep = times)
 
         # pizero
         pz_logits = pz.forward_only_vision_language(images = img, token_ids = tokens)
@@ -279,10 +275,11 @@ if __name__ == '__main__':
     logits_diff = (pz_logits - ler_logits).abs().max().item()
     flow_diff = (pz_flow - ler_flow).abs().max().item()
     
-    print(f'logits max diff: {logits_diff:.2e}')
+    print(f'\nlogits max diff: {logits_diff:.2e}')
     print(f'flow max diff: {flow_diff:.2e}')
     
-    assert logits_diff < 5e-5, f'logits divergence: {logits_diff}'
-    assert flow_diff < 5e-4, f'flow divergence: {flow_diff}'
+    if logits_diff >= 5e-4 or flow_diff >= 5e-5:
+        print('\n✗ pi0.5 parity fail')
+        sys.exit(1)
     
-    print('✓ parity success')
+    print('\n✓ pi0.5 parity success')
