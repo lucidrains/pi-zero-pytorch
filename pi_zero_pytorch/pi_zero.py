@@ -2572,7 +2572,8 @@ class PiZero(Module):
 
         cached_state_key_values_iter = iter(default(cached_state_keys_values, []))
 
-        state_tokens = state_tokens * self.token_scale
+        if exists(state_tokens):
+            state_tokens = state_tokens * self.token_scale
 
         if not self.pi05:
             action_tokens = action_tokens * (self.dim_action ** 0.5)
