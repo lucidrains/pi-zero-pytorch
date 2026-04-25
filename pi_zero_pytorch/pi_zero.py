@@ -1504,7 +1504,7 @@ class PiZero(Module):
             self.advantage_embed = nn.Embedding(num_advantage_tokens, dim)
             self.null_advantage_token = nn.Parameter(torch.randn(dim))
 
-        self.advantage_tokens_dropout_prob = 0.
+        self.advantage_tokens_dropout_prob = advantage_tokens_dropout_prob
 
         # time sampling related
 
