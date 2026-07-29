@@ -71,7 +71,8 @@ from torch_einops_utils import (
     pack_with_inverse,
     pad_sequence,
     and_masks,
-    lens_to_mask
+    lens_to_mask,
+    masked_mean
 )
 
 # ein notation
@@ -2199,6 +2200,7 @@ class PiZero(Module):
         cached_state_keys_values: list[tuple[Tensor, Tensor]] | None = None,
         return_language_loss = True,
         return_action_flow_loss = True,
+        return_unreduced_loss = False,
         knowledge_insulate = False,
         visual_tokens: Tensor | None = None,                     # float[b nv d]
         **kwargs
@@ -2776,7 +2778,11 @@ class PiZero(Module):
             pooled_action_embeds = reduce(action_embeds, 'b n d -> b d', 'mean')
             pred_task_status = self.to_task_status(pooled_action_embeds)
 
-            pred_task_status_loss = F.cross_entropy(pred_task_status, task_status)
+            pred_task_status_loss = F.cross_entropy(
+                pred_task_status,
+                task_status,
+                reduction = 'none' if return_unreduced_loss else 'mean'
+            )
 
         # flow loss for actions tokens
 
@@ -2794,7 +2800,14 @@ class PiZero(Module):
 
             return pred_actions_flow, next_state_cached_keys_values
 
-        flow_loss = self.zero
+        reduce_loss_dim = slice(1, None) if return_unreduced_loss else None
+
+        zero = self.zero
+
+        if return_unreduced_loss:
+            zero = repeat(zero, '-> b', b = batch)
+
+        flow_loss = zero
 
         if return_action_flow_loss:
             flow_loss = self.loss_fn(pred_actions_flow, flow)
@@ -2813,18 +2826,13 @@ class PiZero(Module):
 
             mask = and_masks([is_not_invalid_mask, is_not_action_prefix_mask])
 
-            # mask out
+            # mask out and reduce
 
-            if exists(mask):
-                flow_loss = flow_loss[mask]
-
-            # average
-
-            flow_loss = flow_loss.mean()
+            flow_loss = masked_mean(flow_loss, mask, dim = reduce_loss_dim)
 
         # maybe discrete action embed loss
 
-        discrete_action_ar_loss = self.zero
+        discrete_action_ar_loss = zero
 
         if not is_tensor_empty(maybe_discrete_action_tokens):
 
@@ -2833,12 +2841,17 @@ class PiZero(Module):
             discrete_action_ar_loss = F.cross_entropy(
                 rearrange(pred_discrete_action_logits, 'b n l -> b l n'),
                 target_discrete_action_ids,
-                ignore_index = self.discrete_action_pad_id
+                ignore_index = self.discrete_action_pad_id,
+                reduction = 'none'
             )
+
+            mask = target_discrete_action_ids != self.discrete_action_pad_id
+
+            discrete_action_ar_loss = masked_mean(discrete_action_ar_loss, mask, dim = reduce_loss_dim)
 
         # language cross entropy loss
 
-        language_loss = self.zero
+        language_loss = zero
 
         if return_language_loss:
             language_logits = self.state_to_logits(tokens)
@@ -2846,8 +2859,13 @@ class PiZero(Module):
             language_loss = F.cross_entropy(
                 rearrange(language_logits[:, :-1], 'b n l -> b l n'),
                 labels.long(),
-                ignore_index = self.lm_pad_id
+                ignore_index = self.lm_pad_id,
+                reduction = 'none'
             )
+
+            mask = labels != self.lm_pad_id
+
+            language_loss = masked_mean(language_loss, mask, dim = reduce_loss_dim)
 
         # loss breakdown
 

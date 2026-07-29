@@ -14,7 +14,7 @@ def download_pi0_weights(
 ):
     """
     Download weights from either HuggingFace or Google Cloud Storage.
-    
+
     Args:
         local_dir: Local directory to save weights
         repo_id: If provided, downloads from HuggingFace hub.
@@ -22,18 +22,18 @@ def download_pi0_weights(
                  Otherwise, auto-detects from folder name.
     """
     local_dir = str(local_dir)
-    
+
     # Check if downloading from Google Cloud Storage
     if local_dir.startswith('gs://'):
         try:
             import subprocess
             print(f'Downloading from Google Cloud Storage: {local_dir}')
-            
+
             # Extract the actual local path from the folder name
             gcs_path = local_dir
             local_path = Path('checkpoints') / Path(gcs_path).name
             local_path.mkdir(parents=True, exist_ok=True)
-            
+
             # Use gsutil to download
             subprocess.run(
                 ['gsutil', '-m', 'cp', '-r', f'{gcs_path}/*', str(local_path)],
@@ -41,12 +41,12 @@ def download_pi0_weights(
             )
             print(f'Downloaded to {local_path}')
             return local_path
-            
+
         except FileNotFoundError:
             raise ImportError('gsutil not found. Install Google Cloud SDK: https://cloud.google.com/sdk/docs/install')
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f'Failed to download from GCS: {e}')
-    
+
     # HuggingFace download
     try:
         from huggingface_hub import snapshot_download
@@ -57,17 +57,17 @@ def download_pi0_weights(
     if repo_id is None:
         folder_name = Path(local_dir).name
         repo_id = f'lerobot/{folder_name}'
-    
+
     print(f'Downloading weights from HuggingFace: {repo_id} to {local_dir}...')
-    
+
     Path(local_dir).mkdir(parents = True, exist_ok = True)
-    
+
     snapshot_download(
         repo_id = repo_id,
         local_dir = local_dir,
         allow_patterns = ['config.json', 'model.safetensors']
     )
-    
+
     print('Download complete.')
     return Path(local_dir)
 
@@ -190,9 +190,9 @@ def build_converted_state_dict(pi_weights, pz_state):
         pz_state[f'{pz_p}.1.proj_out.weight'].copy_(pi_weights.get_tensor(f'{pi_p}.mlp.down_proj.weight'))
 
         # action path (gemma expert) - cond_layers norms
-        
+
         has_adaptive_norms = f'{pi_e}.input_layernorm.dense.weight' in pi_keys
-        
+
         if has_adaptive_norms:
             # AdaptiveRMSNorm
             # input_layernorm -> cond_layers[i][0]
@@ -223,14 +223,14 @@ def build_converted_state_dict(pi_weights, pz_state):
     # final norm and rotary
 
     pz_state['final_norm.weight'].copy_(pi_weights.get_tensor('paligemma_with_expert.paligemma.model.language_model.norm.weight'))
-    
+
     expert_norm_p = 'paligemma_with_expert.gemma_expert.model.norm'
-    
+
     # Check if final_actions_norm is Adaptive (has .norm submodule) or standard RMSNorm
     if 'final_actions_norm.norm.weight' in pz_state:
         # AdaptiveRMSNorm
         pz_state['final_actions_norm.norm.weight'].copy_(pi_weights.get_tensor(f'{expert_norm_p}.weight'))
-        
+
         if f'{expert_norm_p}.dense.weight' in pi_keys:
             pz_state['final_actions_norm.to_modulation.weight'].copy_(pi_weights.get_tensor(f'{expert_norm_p}.dense.weight'))
             pz_state['final_actions_norm.to_modulation.bias'].copy_(pi_weights.get_tensor(f'{expert_norm_p}.dense.bias'))
@@ -246,7 +246,7 @@ def build_converted_state_dict(pi_weights, pz_state):
         if 'token_emb.weight' in pz_state: pz_state['token_emb.weight'].copy_(pi_weights.get_tensor(pi_head))
 
     # vision encoder
-    
+
     vit_pz_keys = [k for k in pz_state.keys() if k.startswith('vit.layers.') and k.endswith('.0.to_qkv.weight')]
     num_vit_layers = len(vit_pz_keys)
 

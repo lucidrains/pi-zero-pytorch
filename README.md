@@ -196,73 +196,73 @@ That's it
 
 ```bibtex
 @misc{dong2025reinforcementlearningimplicitimitation,
-    title   = {Reinforcement Learning via Implicit Imitation Guidance}, 
+    title   = {Reinforcement Learning via Implicit Imitation Guidance},
     author  = {Perry Dong and Alec M. Lessing and Annie S. Chen and Chelsea Finn},
     year    = {2025},
     eprint  = {2506.07505},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url = {https://arxiv.org/abs/2506.07505}, 
+    url = {https://arxiv.org/abs/2506.07505},
 }
 ```
 
 ```bibtex
 @misc{zhou2025efficientonlinereinforcementlearning,
-    title   = {Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data}, 
+    title   = {Efficient Online Reinforcement Learning Fine-Tuning Need Not Retain Offline Data},
     author  = {Zhiyuan Zhou and Andy Peng and Qiyang Li and Sergey Levine and Aviral Kumar},
     year    = {2025},
     eprint  = {2412.07762},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url = {https://arxiv.org/abs/2412.07762}, 
+    url = {https://arxiv.org/abs/2412.07762},
 }
 ```
 
 ```bibtex
 @misc{cheang2025gr3technicalreport,
-    title   = {GR-3 Technical Report}, 
+    title   = {GR-3 Technical Report},
     author  = {Chilam Cheang and Sijin Chen and Zhongren Cui and Yingdong Hu and Liqun Huang and Tao Kong and Hang Li and Yifeng Li and Yuxiao Liu and Xiao Ma and Hao Niu and Wenxuan Ou and Wanli Peng and Zeyu Ren and Haixin Shi and Jiawen Tian and Hongtao Wu and Xin Xiao and Yuyang Xiao and Jiafeng Xu and Yichu Yang},
     year    = {2025},
     eprint  = {2507.15493},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2507.15493}, 
+    url     = {https://arxiv.org/abs/2507.15493},
 }
 ```
 
 ```bibtex
 @misc{heng2025vitacformerlearningcrossmodalrepresentation,
-    title   = {ViTacFormer: Learning Cross-Modal Representation for Visuo-Tactile Dexterous Manipulation}, 
+    title   = {ViTacFormer: Learning Cross-Modal Representation for Visuo-Tactile Dexterous Manipulation},
     author  = {Liang Heng and Haoran Geng and Kaifeng Zhang and Pieter Abbeel and Jitendra Malik},
     year    = {2025},
     eprint  = {2506.15953},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2506.15953}, 
+    url     = {https://arxiv.org/abs/2506.15953},
 }
 ```
 
 ```bibtex
 @misc{black2025realtimeexecutionactionchunking,
-    title   = {Real-Time Execution of Action Chunking Flow Policies}, 
+    title   = {Real-Time Execution of Action Chunking Flow Policies},
     author  = {Kevin Black and Manuel Y. Galliker and Sergey Levine},
     year    = {2025},
     eprint  = {2506.07339},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2506.07339}, 
+    url     = {https://arxiv.org/abs/2506.07339},
 }
 ```
 
 ```bibtex
 @misc{mcallister2025flowmatchingpolicygradients,
-    title   = {Flow Matching Policy Gradients}, 
+    title   = {Flow Matching Policy Gradients},
     author  = {David McAllister and Songwei Ge and Brent Yi and Chung Min Kim and Ethan Weber and Hongsuk Choi and Haiwen Feng and Angjoo Kanazawa},
     year    = {2025},
     eprint  = {2507.21053},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url = {https://arxiv.org/abs/2507.21053}, 
+    url = {https://arxiv.org/abs/2507.21053},
 }
 ```
 
@@ -279,61 +279,61 @@ That's it
 
 ```bibtex
 @misc{intelligence2025pi06vlalearnsexperience,
-      title     = {$\pi^{*}_{0.6}$: a VLA That Learns From Experience}, 
+      title     = {$\pi^{*}_{0.6}$: a VLA That Learns From Experience},
       author    = {Physical Intelligence and Ali Amin and Raichelle Aniceto and Ashwin Balakrishna and Kevin Black and Ken Conley and Grace Connors and James Darpinian and Karan Dhabalia and Jared DiCarlo and Danny Driess and Michael Equi and Adnan Esmail and Yunhao Fang and Chelsea Finn and Catherine Glossop and Thomas Godden and Ivan Goryachev and Lachy Groom and Hunter Hancock and Karol Hausman and Gashon Hussein and Brian Ichter and Szymon Jakubczak and Rowan Jen and Tim Jones and Ben Katz and Liyiming Ke and Chandra Kuchi and Marinda Lamb and Devin LeBlanc and Sergey Levine and Adrian Li-Bell and Yao Lu and Vishnu Mano and Mohith Mothukuri and Suraj Nair and Karl Pertsch and Allen Z. Ren and Charvi Sharma and Lucy Xiaoyang Shi and Laura Smith and Jost Tobias Springenberg and Kyle Stachowicz and Will Stoeckle and Alex Swerdlow and James Tanner and Marcel Torne and Quan Vuong and Anna Walling and Haohuan Wang and Blake Williams and Sukwon Yoo and Lili Yu and Ury Zhilinsky and Zhiyuan Zhou},
       year      = {2025},
       eprint    = {2511.14759},
       archivePrefix = {arXiv},
       primaryClass = {cs.LG},
-      url       = {https://arxiv.org/abs/2511.14759}, 
+      url       = {https://arxiv.org/abs/2511.14759},
 }
 ```
 
 ```bibtex
 @misc{tang2025diffusionmodelsclassifierfreeguidance,
-    title   = {Diffusion Models without Classifier-free Guidance}, 
+    title   = {Diffusion Models without Classifier-free Guidance},
     author  = {Zhicong Tang and Jianmin Bao and Dong Chen and Baining Guo},
     year    = {2025},
     eprint  = {2502.12154},
     archivePrefix = {arXiv},
     primaryClass = {cs.CV},
-    url     = {https://arxiv.org/abs/2502.12154}, 
+    url     = {https://arxiv.org/abs/2502.12154},
 }
 ```
 
 ```bibtex
 @misc{li2025grrlgoingdexterousprecise,
-    title   = {GR-RL: Going Dexterous and Precise for Long-Horizon Robotic Manipulation}, 
+    title   = {GR-RL: Going Dexterous and Precise for Long-Horizon Robotic Manipulation},
     author={Yunfei Li and Xiao Ma and Jiafeng Xu and Yu Cui and Zhongren Cui and Zhigang Han and Liqun Huang and Tao Kong and Yuxiao Liu and Hao Niu and Wanli Peng and Jingchao Qiao and Zeyu Ren and Haixin Shi and Zhi Su and Jiawen Tian and Yuyang Xiao and Shenyu Zhang and Liwei Zheng and Hang Li and Yonghui Wu},
     year    = {2025},
     eprint  = {2512.01801},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2512.01801}, 
+    url     = {https://arxiv.org/abs/2512.01801},
 }
 ```
 
 ```bibtex
 @misc{black2025trainingtimeactionconditioningefficient,
-    title   = {Training-Time Action Conditioning for Efficient Real-Time Chunking}, 
+    title   = {Training-Time Action Conditioning for Efficient Real-Time Chunking},
     author  = {Kevin Black and Allen Z. Ren and Michael Equi and Sergey Levine},
     year    = {2025},
     eprint  = {2512.05964},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2512.05964}, 
+    url     = {https://arxiv.org/abs/2512.05964},
 }
 ```
 
 ```bibtex
 @misc{pertsch2025fastefficientactiontokenization,
-    title   = {FAST: Efficient Action Tokenization for Vision-Language-Action Models}, 
+    title   = {FAST: Efficient Action Tokenization for Vision-Language-Action Models},
     author  = {Karl Pertsch and Kyle Stachowicz and Brian Ichter and Danny Driess and Suraj Nair and Quan Vuong and Oier Mees and Chelsea Finn and Sergey Levine},
     year    = {2025},
     eprint  = {2501.09747},
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
-    url     = {https://arxiv.org/abs/2501.09747}, 
+    url     = {https://arxiv.org/abs/2501.09747},
 }
 ```
 

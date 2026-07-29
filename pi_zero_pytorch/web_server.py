@@ -88,7 +88,7 @@ class SmallPiZero(torch.nn.Module):
     def __init__(
         self,
         dim = 32,
-        dim_action = 32, 
+        dim_action = 32,
         dim_action_input = 6,
         dim_joint_state = 32,
         num_tokens = 256,
@@ -232,7 +232,7 @@ def extract_frames(video_path: Path, cache_path: Path):
         return
 
     cache_path.mkdir(parents=True, exist_ok=True)
-    
+
     import subprocess
     output_pattern = str(cache_path / "frame_%04d.jpg")
     cmd = [
@@ -255,15 +255,15 @@ def extract_frames(video_path: Path, cache_path: Path):
 
 def init_replay_buffer(video_dirs: List[Path]):
     global REPLAY_BUFFER, VIDEO_TO_EPISODE, VIDEO_TO_PATH, VIDEO_TO_PROPRIO, CONVERSION_STATUS, NUM_VIEWS
-    
+
     VIDEO_TO_EPISODE.clear()
     VIDEO_TO_PATH.clear()
     VIDEO_TO_PROPRIO.clear()
-    
+
     print(f"[RECAP] init_replay_buffer started with {video_dirs}")
     CONVERSION_STATUS["is_converting"] = True
     CONVERSION_STATUS["progress"] = 0
-    
+
     try:
         tmp_buffer_dir = Path("tmp/replay_buffer")
         if tmp_buffer_dir.exists():
@@ -299,12 +299,12 @@ def init_replay_buffer(video_dirs: List[Path]):
                         episodes[ep_name] = {}
                     episodes[ep_name][view_idx] = f
                     print(f"[RECAP] Found video: {f} -> ep: {ep_name}, view: {view_idx}")
-            
+
             if not found_in_dir:
                 print(f"[RECAP] WARNING: No videos found in {data_dir}")
 
         episode_names = sorted(episodes.keys())
-        
+
         if not episode_names:
             print("No valid video files found")
             return
@@ -312,14 +312,14 @@ def init_replay_buffer(video_dirs: List[Path]):
         num_views = 0
         for ep_name in episode_names:
             num_views = max(num_views, max(episodes[ep_name].keys()) + 1)
-        
+
         num_views = max(1, num_views)
         NUM_VIEWS = num_views
         print(f"[RECAP] Detected {len(episode_names)} episodes with {num_views} view(s).")
-        
+
         proprio_dim = 0
         print(f"[RECAP] Initializing proprio_dim tracking...")
-        
+
         # Load proprioception data from .npz files
         proprio_keys = ['proprio', 'joint_state', 'qpos', 'robot_state', 'state']
         for data_dir in video_dirs:
@@ -327,7 +327,7 @@ def init_replay_buffer(video_dirs: List[Path]):
                 try:
                     data = np.load(npz_file, allow_pickle=True)
                     ep_name = npz_file.stem  # Use filename as episode name
-                    
+
                     # Find a matching proprioception key
                     for key in proprio_keys:
                         if key in data:
@@ -354,11 +354,11 @@ def init_replay_buffer(video_dirs: List[Path]):
             if ret:
                 h, w, c = frame.shape
                 break
-        
+
         if h is None:
             print("Could not read any video files")
             return
-        
+
         for ep_name in episode_names:
             for vf in episodes[ep_name].values():
                 max_frames = max(max_frames, get_frame_count(vf))
@@ -400,15 +400,15 @@ def init_replay_buffer(video_dirs: List[Path]):
         for i, ep_name in enumerate(episode_names):
             CONVERSION_STATUS["current_video"] = ep_name
             CONVERSION_STATUS["progress"] = i
-            
+
             VIDEO_TO_EPISODE[ep_name] = i
             for view_idx, p in episodes[ep_name].items():
                 VIDEO_TO_PATH[p.name] = p
             VIDEO_TO_PATH[ep_name] = episodes[ep_name][0]
-            
+
             view_paths = [episodes[ep_name].get(v) for v in range(num_views)]
             view_paths = [p if p else view_paths[0] for p in view_paths]
-            
+
             # Fetch proprio for this episode
             ep_proprio = VIDEO_TO_PROPRIO.get(ep_name)
             if ep_proprio:
@@ -433,7 +433,7 @@ def init_replay_buffer(video_dirs: List[Path]):
                                 store_kwargs['proprio'] = torch.zeros(proprio_dim)
                         elif proprio_dim > 0:
                             store_kwargs['proprio'] = torch.zeros(proprio_dim)
-                            
+
                         REPLAY_BUFFER.store(**store_kwargs)
                 print(f"[RECAP] FAST_MOCK: episode {i} done in {time.time() - start_mock:.4f}s")
                 continue
@@ -450,7 +450,7 @@ def init_replay_buffer(video_dirs: List[Path]):
                         frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
                         frames.append(frame_tensor)
                     if len(frames) < len(caps): break
-                    
+
                     store_kwargs = dict(
                         images = torch.stack(frames, dim = 1),
                         text = torch.randint(0, 100, (32,)),
@@ -458,7 +458,7 @@ def init_replay_buffer(video_dirs: List[Path]):
                         actions = torch.randn(16, 6),
                         reward = 0.0
                     )
-                    
+
                     if ep_proprio is not None:
                         if t_idx < ep_proprio.shape[0]:
                             store_kwargs['proprio'] = ep_proprio[t_idx]
@@ -492,7 +492,7 @@ async def get_training_status():
 async def get_videos():
     if REPLAY_BUFFER is None:
         return []
-    
+
     video_list = []
     for filename, ep_id in VIDEO_TO_EPISODE.items():
         num_frames = int(REPLAY_BUFFER.meta_data['episode_lens'][ep_id].item())
@@ -508,7 +508,7 @@ async def get_videos():
 async def get_tasks():
     if not RECAP_CONFIG:
         return []
-        
+
     tasks = []
     for task_name, config in RECAP_CONFIG.get('tasks', {}).items():
         tasks.append({
@@ -524,10 +524,10 @@ async def get_tasks():
 async def assign_task(req: dict):
     filename = req.get("filename")
     task_id_str = req.get("task_id")
-    
+
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
@@ -540,7 +540,7 @@ async def assign_task(req: dict):
 
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_id', torch.tensor(task_idx))
     REPLAY_BUFFER.flush()
-    
+
     return {"status": "ok"}
 
 @app.get("/api/videos", response_model=List[VideoInfo])
@@ -548,9 +548,9 @@ async def list_videos():
     videos = []
     # common video extensions
     extensions = {".mp4", ".webm", ".avi", ".mov"}
-    
+
     dirs_to_scan = VIDEO_DIRS if VIDEO_DIRS else []
-    
+
     for vdir in dirs_to_scan:
         if not vdir.exists(): continue
         for file in vdir.iterdir():
@@ -563,7 +563,7 @@ async def list_videos():
                         url=f"/videos/{file.name}",
                         folder=vdir.name
                     ))
-    
+
     # sort by filename
     videos.sort(key=lambda x: x.filename)
     return videos
@@ -572,19 +572,19 @@ async def list_videos():
 async def serve_video(filename: str):
     if not VIDEO_DIRS:
         return {"error": "Video directories not set"}
-    
+
     # Handle filename like episode_0 (which should serve episode_0.0.mp4 by default)
     # or handle explicit requests like episode_0.0.mp4
-    
+
     video_path = get_video_path(filename)
     if video_path:
         return FileResponse(video_path)
-    
+
     # Try appending .0.mp4 if it's a grouped name
     video_path = get_video_path(f"{filename}.0.mp4")
     if video_path:
         return FileResponse(video_path)
-            
+
     return {"error": "Video not found"}
 
 @app.get("/api/viewpoints")
@@ -600,15 +600,15 @@ def get_video_path(filename: str) -> Path:
     # Check our explicit mapping first
     if filename in VIDEO_TO_PATH:
         return VIDEO_TO_PATH[filename]
-        
+
     # Check if it's in a subfolder (for RECAP)
     if "/" in filename or "\\" in filename:
         return Path(filename)
-        
+
     # Fallback to the first video directory if available
     if VIDEO_DIRS:
         return VIDEO_DIRS[0] / filename
-        
+
     return DATA_DIR / filename
 
 @app.get("/api/video/{filename}/frames")
@@ -616,7 +616,7 @@ async def get_video_frames(filename: str):
     # Determine all views for this filename
     # filename is the episode base name
     views = []
-    
+
     # First try multi-view naming (episode.viewIdx.mp4)
     view_idx = 0
     while True:
@@ -626,7 +626,7 @@ async def get_video_frames(filename: str):
             break
         views.append(v_path)
         view_idx += 1
-    
+
     # If no multi-view files found, try single-view naming
     if not views:
         # Try episode.mp4
@@ -640,12 +640,12 @@ async def get_video_frames(filename: str):
                 if key.replace('.mp4', '') == filename or key == filename:
                     views.append(path)
                     break
-    
+
     if not views:
         print(f"[FRAMES] Video not found: {filename}")
         print(f"[FRAMES] VIDEO_TO_PATH keys: {list(VIDEO_TO_PATH.keys())}")
         return {"error": "Video not found", "frames": []}
-    
+
     # Extract frames for each view
     all_frames = []
     max_f = 0
@@ -656,7 +656,7 @@ async def get_video_frames(filename: str):
         frames = sorted([f.name for f in cache_path.glob("*.jpg")])
         all_frames.append([f"/cache/{c_name}/{f}" for f in frames])
         max_f = max(max_f, len(frames))
-    
+
     # Return 2D array [timestep][view]
     result = []
     for t in range(max_f):
@@ -667,7 +667,7 @@ async def get_video_frames(filename: str):
             else:
                 t_views.append(None)
         result.append(t_views)
-        
+
     return {"frames": result}
 
 @app.get("/api/video/{filename}/proprio")
@@ -676,7 +676,7 @@ async def get_video_proprio(filename: str):
     proprio = VIDEO_TO_PROPRIO.get(filename)
     if proprio is None:
         return {"proprio": None, "dim_names": [], "num_dims": 0}
-    
+
     # proprio should be a 2D list [T, D] or 1D [T]
     if isinstance(proprio, list) and len(proprio) > 0:
         if isinstance(proprio[0], list):
@@ -686,28 +686,28 @@ async def get_video_proprio(filename: str):
             proprio = [[v] for v in proprio]  # Convert 1D to 2D
     else:
         num_dims = 0
-    
+
     # Generate dimension names
     dim_names = [f"Joint {i}" for i in range(num_dims)]
-    
+
     return {"proprio": proprio, "dim_names": dim_names, "num_dims": num_dims}
 
 @app.get("/api/labels")
 async def get_all_labels():
     if REPLAY_BUFFER is None:
         return {}
-    
+
     # Return mapping of filename to its current label status
     result = {}
     task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
-    
+
     for filename, episode_id in VIDEO_TO_EPISODE.items():
         task_completed = REPLAY_BUFFER.meta_data['task_completed'][episode_id].item()
         marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
         task_idx = REPLAY_BUFFER.meta_data['task_id'][episode_id].item()
-        
+
         task_id = task_keys[task_idx] if 0 <= task_idx < len(task_keys) else None
-        
+
         # Get returns, values, advantages
         returns = REPLAY_BUFFER.data['returns'][episode_id].tolist()
         value = REPLAY_BUFFER.data['value'][episode_id].tolist()
@@ -718,7 +718,7 @@ async def get_all_labels():
         returns = [r if not (isinstance(r, float) and np.isnan(r)) else None for r in returns]
         value = [v if not (isinstance(v, float) and np.isnan(v)) else None for v in value]
         advantages = [a if not (isinstance(a, float) and np.isnan(a)) else None for a in advantages]
-        
+
         result[filename] = {
             "task_completed": task_completed,
             "marked_timestep": marked_timestep,
@@ -738,7 +738,7 @@ async def reset_label(req: dict):
     filename = req.get("filename")
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
@@ -749,7 +749,7 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', -1)
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_id', torch.tensor(-1))
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'is_expert_intervention', False)
-    
+
     # Reset fields
     REPLAY_BUFFER.data['returns'][episode_id] = float('nan')
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
@@ -757,7 +757,7 @@ async def reset_label(req: dict):
     REPLAY_BUFFER.data['advantage_ids'][episode_id] = -1
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
     REPLAY_BUFFER.data['expert_segment'][episode_id] = False
-    
+
     REPLAY_BUFFER.flush()
     return {"status": "ok"}
 
@@ -765,7 +765,7 @@ async def reset_label(req: dict):
 async def label_video(req: LabelRequest):
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(req.filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
@@ -781,16 +781,16 @@ async def label_video(req: LabelRequest):
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'fail', True)
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'task_completed', 0)
         REPLAY_BUFFER.store_meta_datapoint(episode_id, 'marked_timestep', req.timestep)
-    
+
     # Reset value and advantages to NaN as they are now stale
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
-    
+
     # Calculate returns
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
     returns = torch.full((timesteps,), float('nan'))
-    
+
     # Get max duration for normalization
     task_idx = REPLAY_BUFFER.meta_data['task_id'][episode_id].item()
     task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
@@ -802,28 +802,28 @@ async def label_video(req: LabelRequest):
     for t in range(req.timestep + 1):
         # normalize by max duration
         returns[t] = float(t - req.timestep) / max_duration
-    
+
     REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
-    
+
     REPLAY_BUFFER.flush()
-    
+
     returns_list = returns.tolist()
     returns_list = [r if not np.isnan(r) else None for r in returns_list]
-    
+
     return {"status": "ok", "returns": returns_list}
 
 @app.post("/api/label/intervention")
 async def label_intervention(req: InterventionRequest):
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(req.filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
 
     # Set meta flag
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'is_expert_intervention', True)
-    
+
     # Set segment: everything up to current timestep is expert controlled
     expert_mask = REPLAY_BUFFER.data['expert_segment'][episode_id]
     expert_mask[:req.timestep + 1] = True
@@ -836,9 +836,9 @@ async def label_intervention(req: InterventionRequest):
     REPLAY_BUFFER.data['advantage_ids'][episode_id] = adv_ids
 
     REPLAY_BUFFER.flush()
-    
+
     return {
-        "status": "ok", 
+        "status": "ok",
         "is_expert_intervention": True,
         "expert_segment": expert_mask.tolist(),
         "advantage_ids": adv_ids.tolist()
@@ -848,16 +848,16 @@ async def label_intervention(req: InterventionRequest):
 async def get_action(filename: str, timestep: int):
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
-    
+
     # actions shape: (num_episodes, max_timesteps, horizon, action_dim)
-    # Get the action at the specific timestep. 
+    # Get the action at the specific timestep.
     # For now, we return the first action in the horizon (index 0).
     action = REPLAY_BUFFER.data['actions'][episode_id, timestep, 0].tolist()
-    
+
     return {
         "action": action,
         "horizon": 16, # Fixed for now as per init_replay_buffer
@@ -868,33 +868,33 @@ async def get_action(filename: str, timestep: int):
 async def update_action(filename: str, timestep: int, req: ActionUpdateRequest):
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
-    
+
     # Validate action dim
     action_tensor = torch.tensor(req.action)
     if action_tensor.shape[0] != 6:
         return {"error": f"Invalid action dimension. Expected 6, got {action_tensor.shape[0]}"}
-    
+
     # Update REPLAY_BUFFER. index 0 of the horizon for now.
     REPLAY_BUFFER.data['actions'][episode_id, timestep, 0] = action_tensor.numpy()
-    
-    # Mark as expert segment if it wasn't already? 
+
+    # Mark as expert segment if it wasn't already?
     # Or just keep it as is. Usually editing implies expert correction.
     # Let's mark it as expert segment for this timestep.
     expert_mask = REPLAY_BUFFER.data['expert_segment'][episode_id]
     expert_mask[timestep] = True
     REPLAY_BUFFER.data['expert_segment'][episode_id] = expert_mask
-    
+
     # Force advantage_id to 1 (Positive) for this edited step
     adv_ids = REPLAY_BUFFER.data['advantage_ids'][episode_id]
     adv_ids[timestep] = 1
     REPLAY_BUFFER.data['advantage_ids'][episode_id] = adv_ids
 
     REPLAY_BUFFER.flush()
-    
+
     return {"status": "ok", "action": req.action}
 
 @app.post("/api/returns/calculate")
@@ -902,7 +902,7 @@ async def calculate_returns(req: dict):
     filename = req.get("filename")
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
@@ -915,7 +915,7 @@ async def calculate_returns(req: dict):
 
     timesteps = REPLAY_BUFFER.data['returns'].shape[1]
     returns = torch.full((timesteps,), float('nan'))
-    
+
     # Get max duration for normalization
     task_idx = REPLAY_BUFFER.meta_data['task_id'][episode_id].item()
     task_keys = list(RECAP_CONFIG.get('tasks', {}).keys())
@@ -926,19 +926,19 @@ async def calculate_returns(req: dict):
 
     for t in range(marked_timestep + 1):
         returns[t] = float(t - marked_timestep) / max_duration
-    
+
     REPLAY_BUFFER.data['returns'][episode_id] = returns.numpy()
-    
+
     # Reset value and advantages to NaN as they are now stale
     REPLAY_BUFFER.data['value'][episode_id] = float('nan')
     REPLAY_BUFFER.data['advantages'][episode_id] = float('nan')
     REPLAY_BUFFER.store_meta_datapoint(episode_id, 'invalidated', False)
 
     REPLAY_BUFFER.flush()
-    
+
     returns_list = returns.tolist()
     returns_list = [r if not np.isnan(r) else None for r in returns_list]
-    
+
     return {"status": "ok", "returns": returns_list}
 
 async def _calculate_episode_value_internal(episode_id: int, filename: str, max_t: int = None):
@@ -947,29 +947,29 @@ async def _calculate_episode_value_internal(episode_id: int, filename: str, max_
 
     # Get images for this episode
     images = REPLAY_BUFFER.data['images'][episode_id] # (max_timesteps, c, 1, h, w)
-    
+
     video_path = get_video_path(filename)
     num_frames = get_frame_count(video_path)
-    
+
     calc_to_t = num_frames
     if max_t is not None:
         calc_to_t = min(num_frames, max_t)
 
     values = []
     VALUE_NETWORK.eval()
-    
+
     batch_size = 8
     with torch.no_grad():
         for i in tqdm.tqdm(range(0, calc_to_t, batch_size)):
             batch_images = images[i : min(i + batch_size, calc_to_t)]
             batch_images = torch.from_numpy(batch_images).to(DEVICE)
             batch_images = batch_images.squeeze(2)
-            
+
             # Use model's expected image size
             target_size = (VALUE_NETWORK.image_size, VALUE_NETWORK.image_size)
             if batch_images.shape[-2:] != target_size:
                 batch_images = TF.resize(batch_images, target_size, antialias = True)
-            
+
             batch_values = VALUE_NETWORK(batch_images)
             values.extend(batch_values.cpu().tolist())
 
@@ -986,7 +986,7 @@ async def calculate_episode_value(req: dict):
     filename = req.get("filename")
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
@@ -1011,7 +1011,7 @@ async def calculate_episode_advantage(req: dict):
 
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
@@ -1020,7 +1020,7 @@ async def calculate_episode_advantage(req: dict):
         # Get actual frame count
         video_path = get_video_path(filename)
         num_frames = get_frame_count(video_path)
-        
+
         marked_timestep = REPLAY_BUFFER.meta_data['marked_timestep'][episode_id].item()
         if marked_timestep != -1:
             num_frames = min(num_frames, marked_timestep + 1)
@@ -1062,10 +1062,10 @@ async def calculate_episode_advantage(req: dict):
         # 1 if >= cutoff (once global binarization happens), but for now we might just calculate continuous
         # RECAP requires binarized advantages in the buffer.
         # If it's an expert segment, we MUST set it to 1.
-        
+
         expert_mask = REPLAY_BUFFER.data['expert_segment'][episode_id][:num_frames]
         adv_ids = REPLAY_BUFFER.data['advantage_ids'][episode_id]
-        
+
         # We don't have a cutoff here, so we don't binarize regular steps yet.
         # But we DO ensure expert steps are marked.
         adv_ids[:num_frames][expert_mask] = 1
@@ -1088,15 +1088,15 @@ async def calculate_global_advantage_stats(req: dict):
 
     # Get all advantages across all episodes
     all_advs = REPLAY_BUFFER.data['advantages']
-    
+
     # Filter valid ones (not NaN)
     valid_advs = all_advs[~np.isnan(all_advs)]
-    
+
     if len(valid_advs) == 0:
         return {"error": "No advantages calculated yet"}
-    
+
     cutoff = np.percentile(valid_advs, percentile)
-    
+
     return {
         "status": "ok",
         "cutoff": float(cutoff),
@@ -1110,13 +1110,13 @@ async def binarize_advantages(req: dict):
 
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
 
     advs = REPLAY_BUFFER.data['advantages'][episode_id]
-    
+
     # Calculate binarized IDs: 1 if >= cutoff, 0 if < cutoff, -1 if NaN
     adv_ids = np.full(advs.shape, -1, dtype=int)
     valid_mask = ~np.isnan(advs)
@@ -1136,13 +1136,13 @@ async def invalidate_episode_timesteps(req: dict):
 
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     episode_id = VIDEO_TO_EPISODE.get(filename)
     if episode_id is None:
         return {"error": "Video not found in buffer"}
 
     advs = REPLAY_BUFFER.data['advantages'][episode_id]
-    
+
     # Calculate invalidated mask: True if advantage <= cutoff and not NaN
     valid_mask = ~np.isnan(advs)
     # If any advantage is below cutoff, invalidate the whole episode (RECAP policy)
@@ -1165,24 +1165,24 @@ async def export_labels():
     # Create export directory in cache if it doesn't exist
     export_dir = CACHE_DIR / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
-    
+
     timestamp = int(time.time())
     zip_filename = f"labels_export_{timestamp}.zip"
     zip_path = export_dir / zip_filename
-    
+
     # Extract ALL data fields
     data_dict = {name: REPLAY_BUFFER.data[name][:] for name in REPLAY_BUFFER.data.keys()}
-    
+
     # Extract ALL meta data fields
     meta_data_dict = {name: REPLAY_BUFFER.meta_data[name][:] for name in REPLAY_BUFFER.meta_data.keys()}
-    
+
     # Metadata mapping
     metadata = {
         "video_to_index": VIDEO_TO_EPISODE,
         "config": RECAP_CONFIG,
         "timestamp": timestamp
     }
-    
+
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
         # Save data.npz
         data_buffer = io.BytesIO()
@@ -1193,10 +1193,10 @@ async def export_labels():
         meta_data_buffer = io.BytesIO()
         np.savez(meta_data_buffer, **meta_data_dict)
         zip_file.writestr("meta_data.npz", meta_data_buffer.getvalue())
-        
+
         # Save metadata.json
         zip_file.writestr("metadata.json", json.dumps(metadata, indent=2))
-        
+
     return FileResponse(
         path=str(zip_path),
         filename=zip_filename,
@@ -1274,34 +1274,34 @@ async def recap_pretrain():
 
     actor_path = RECAP_WORKSPACE / "pretrained-actor.pt"
     critic_path = RECAP_WORKSPACE / "pretrained-critic.pt"
-    
+
     if actor_path.exists():
         return {"error": "Already pretrained"}
-    
+
     print("Pretraining: performing one gradient step on dummy data...")
-    
+
     # Use mock config for pretraining speed
     config = PI_ZERO_CONFIGS["mock"]
     model = SmallPiZero(**config).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4)
-    
+
     # Dummy data
     images = torch.randn(1, 3, config["image_size"], config["image_size"]).to(DEVICE)
     text = torch.zeros(1, 32, dtype = torch.long).to(DEVICE)
     internal = torch.randn(1, 32).to(DEVICE)
     actions = torch.randn(1, 6).to(DEVICE)
-    
+
     # One gradient step
     output = model(images, text, internal, actions)
     loss = output[0] if isinstance(output, tuple) else output
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    
+
     # Save dummy weights (simulation)
     torch.save(model.state_dict(), str(actor_path))
     torch.save(model.state_dict(), str(critic_path))
-    
+
     return {"status": "ok"}
 
 @app.post("/api/recap/specialize")
@@ -1309,23 +1309,23 @@ async def recap_specialize(req: dict):
     """Creates iteration 0 (SFT) for a specific task."""
     if not RECAP_WORKSPACE:
         return {"error": "RECAP workspace not configured"}
-    
+
     task_name = req.get("task_name")
     if not task_name:
         return {"error": "Missing task_name"}
-    
+
     # Check that pretrained weights exist
     if not (RECAP_WORKSPACE / "pretrained-actor.pt").exists():
         return {"error": "Must pretrain first"}
-    
+
     # Create iteration 0 (SFT)
     iter_dir = RECAP_WORKSPACE / task_name / "0"
     iter_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Simulate creating specialized weights
     torch.save({"simulated": True, "task": task_name, "iteration": 0}, str(iter_dir / "actor.pt"))
     torch.save({"simulated": True, "task": task_name, "iteration": 0}, str(iter_dir / "critic.pt"))
-    
+
     return {"status": "ok"}
 
 @app.post("/api/recap/collect")
@@ -1333,24 +1333,24 @@ async def recap_collect(req: dict):
     """Simulates data collection - creates a new data folder with sample videos."""
     if not RECAP_WORKSPACE:
         return {"error": "RECAP workspace not configured"}
-    
+
     task_name = req.get("task_name")
     iter_id = req.get("iter_id", 0)
-    
+
     if not task_name:
         return {"error": "Missing task_name"}
-    
+
     iter_dir = RECAP_WORKSPACE / task_name / str(iter_id)
     if not iter_dir.exists():
         return {"error": f"Iteration {iter_id} does not exist for {task_name}"}
-    
+
     # Find next data folder index
     existing_data = list(iter_dir.glob("data.*"))
     next_idx = len(existing_data)
-    
+
     data_dir = iter_dir / f"data.{next_idx}"
     data_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Import and use simulation engine to generate sample trajectories
     try:
         from .recap_sim_engine import generate_trajectories
@@ -1364,7 +1364,7 @@ async def recap_collect(req: dict):
              print(f"RECAP Collect: Simulated 2 episodes via absolute import in {data_dir}")
         except:
              pass
-    
+
     return {"status": "ok", "data_folder": f"data.{next_idx}"}
 
 @app.post("/api/recap/iterate")
@@ -1372,27 +1372,27 @@ async def recap_iterate(req: dict):
     """Advances to the next iteration after finetuning on collected data."""
     if not RECAP_WORKSPACE:
         return {"error": "RECAP workspace not configured"}
-    
+
     task_name = req.get("task_name")
     iter_id = req.get("iter_id", 0)
-    
+
     if not task_name:
         return {"error": "Missing task_name"}
-    
+
     current_iter_dir = RECAP_WORKSPACE / task_name / str(iter_id)
     if not current_iter_dir.exists():
         return {"error": f"Iteration {iter_id} does not exist"}
-    
+
     # Check that data was collected
     data_folders = list(current_iter_dir.glob("data.*"))
     if not data_folders:
         return {"error": "No data collected for this iteration"}
-    
+
     # Create next iteration
     next_iter_id = iter_id + 1
     next_iter_dir = RECAP_WORKSPACE / task_name / str(next_iter_id)
     next_iter_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # If policy fine-tuning just finished, it might have saved weights in a 'policy_finetuned' dir
     # we move it to the next iteration
     finetuned_actor = RECAP_WORKSPACE / "policy_finetuned" / "actor.pt"
@@ -1404,7 +1404,7 @@ async def recap_iterate(req: dict):
         torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "actor.pt"))
 
     torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "critic.pt"))
-    
+
     return {"status": "ok", "new_iteration": next_iter_id}
 
 @app.websocket("/ws/training")
@@ -1427,7 +1427,7 @@ def _broadcast_training_update(loop):
 
 def train_value_network_thread(config_name: str, loop):
     global VALUE_NETWORK, TRAINING_STATE
-    
+
     # 1. Prepare data
     if config_name == "mock":
         # Extremely fast mock data
@@ -1444,7 +1444,7 @@ def train_value_network_thread(config_name: str, loop):
                 images = REPLAY_BUFFER.data['images'][i][valid_mask]
                 all_images.append(torch.from_numpy(images))
                 all_returns.append(torch.from_numpy(returns[valid_mask]))
-        
+
         if not all_images:
             TRAINING_STATE["is_training"] = False
             _broadcast_training_update(loop)
@@ -1474,52 +1474,52 @@ def train_value_network_thread(config_name: str, loop):
 
     # 3. Training loop
     target_size = (config.get('image_size', 224), config.get('image_size', 224))
-    
+
     for epoch in range(num_epochs):
         TRAINING_STATE["current_epoch"] = epoch + 1
         for i, (images, returns) in enumerate(loader):
             images = images.to(DEVICE).squeeze(2)
             if images.shape[-2:] != target_size:
                 images = TF.resize(images, target_size, antialias = True)
-            
+
             returns = returns.to(DEVICE)
-            
+
             values, logits = model(images, return_value_and_logits = True)
             loss = model.to_value.loss_fn(logits, returns).mean()
-            
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             TRAINING_STATE["current_step"] += 1
             TRAINING_STATE["last_loss"] = float(loss.item())
-            
+
             # For mock config, we only do one gradient step total
             if config_name == "mock":
                 print("Mock training: finishing after one gradient step.")
                 break
-            
+
             if i % 5 == 0:
                 _broadcast_training_update(loop)
-        
+
         if config_name == "mock":
             break
-            
+
         _broadcast_training_update(loop)
 
     # 4. Finalize
     VALUE_NETWORK = model
-    
+
     # Save the model
     if RECAP_WORKSPACE:
         networks_dir = RECAP_WORKSPACE / "value_networks"
         networks_dir.mkdir(parents=True, exist_ok=True)
-        
+
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_filename = f"{config_name}_{timestamp}.pt"
         model_path = networks_dir / model_filename
-        
+
         torch.save({
             "state_dict": model.state_dict(),
             "config": config,
@@ -1537,11 +1537,11 @@ def train_value_network_thread(config_name: str, loop):
 async def list_value_networks():
     if not RECAP_WORKSPACE:
         return []
-    
+
     networks_dir = RECAP_WORKSPACE / "value_networks"
     if not networks_dir.exists():
         return []
-    
+
     networks = []
     for f in networks_dir.glob("*.pt"):
         try:
@@ -1555,7 +1555,7 @@ async def list_value_networks():
             })
         except Exception as e:
             print(f"Error loading checkpoint {f}: {e}")
-            
+
     # sort by timestamp descending
     networks.sort(key=lambda x: x['timestamp'], reverse=True)
     return networks
@@ -1566,11 +1566,11 @@ async def load_value_network(req: dict):
     filename = req.get("filename")
     if not filename or not RECAP_WORKSPACE:
         return {"error": "Missing filename or RECAP_WORKSPACE"}
-    
+
     model_path = RECAP_WORKSPACE / "value_networks" / filename
     if not model_path.exists():
         return {"error": "Model file not found"}
-    
+
     try:
         checkpoint = torch.load(str(model_path), map_location=DEVICE, weights_only=False)
         config = checkpoint["config"]
@@ -1583,10 +1583,10 @@ async def load_value_network(req: dict):
 
 def train_policy_network_thread(config_name: str, loop):
     global TRAINING_STATE
-    
+
     has_proprio = (REPLAY_BUFFER is not None) and ('proprio' in REPLAY_BUFFER.data)
     all_proprio = []
-    
+
     # 1. Prepare data - conditioned on binarized advantages (advantage_ids)
     if config_name == "mock":
         # Extremely fast mock data
@@ -1602,7 +1602,7 @@ def train_policy_network_thread(config_name: str, loop):
         all_internal = []
         all_actions = []
         all_advantage_ids = []
-        
+
         for i in range(len(REPLAY_BUFFER)):
             advantage_ids = REPLAY_BUFFER.data['advantage_ids'][i]
             valid_mask = advantage_ids != -1
@@ -1614,7 +1614,7 @@ def train_policy_network_thread(config_name: str, loop):
                 all_advantage_ids.append(torch.from_numpy(advantage_ids[valid_mask]))
                 if has_proprio:
                     all_proprio.append(torch.from_numpy(REPLAY_BUFFER.data['proprio'][i][valid_mask]))
-        
+
         if not all_images:
             print("No valid data for policy training")
             TRAINING_STATE["is_training"] = False
@@ -1628,18 +1628,18 @@ def train_policy_network_thread(config_name: str, loop):
             torch.cat(all_actions),
             torch.cat(all_advantage_ids)
         ]
-        
+
         if has_proprio:
             tensors.append(torch.cat(all_proprio))
 
         dataset = torch.utils.data.TensorDataset(*tensors)
-    
+
     batch_size = 4
     loader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = True)
 
     # 2. Initialize model
     config = PI_ZERO_CONFIGS.get(config_name, PI_ZERO_CONFIGS["small"]).copy()
-    
+
     # If we have proprio data in the dataset, update dim_joint_state to match
     if has_proprio and len(all_proprio) > 0:
         actual_proprio_dim = all_proprio[0].shape[-1]
@@ -1647,7 +1647,7 @@ def train_policy_network_thread(config_name: str, loop):
         print(f"[RECAP] Using actual proprio_dim for policy: {actual_proprio_dim}")
     else:
         print(f"[RECAP] Using default dim_joint_state: {config.get('dim_joint_state', 32)}")
-    
+
     model = SmallPiZero(**config).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr = 1e-4) # lower lr for finetuning
     model.train()
@@ -1666,7 +1666,7 @@ def train_policy_network_thread(config_name: str, loop):
 
     # 3. Training loop
     target_size = (config.get('image_size', 32), config.get('image_size', 32))
-    
+
     print(f"Starting policy fine-tuning for {num_epochs} epoch...")
     for epoch in range(num_epochs):
         TRAINING_STATE["current_epoch"] = epoch + 1
@@ -1681,41 +1681,41 @@ def train_policy_network_thread(config_name: str, loop):
             images = images.to(DEVICE).squeeze(2)
             if images.shape[-2:] != target_size:
                 images = TF.resize(images, target_size, antialias = True)
-            
+
             text = text.to(DEVICE)
             joint_state = joint_state.to(DEVICE)
             actions = actions.to(DEVICE)
             adv_ids = adv_ids.to(DEVICE)
-            
+
             # Conditioned on advantage_ids
             output = model(images, text, joint_state, actions, advantage_ids = adv_ids)
             loss = output[0] if isinstance(output, tuple) else output
-            
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
+
             TRAINING_STATE["current_step"] += 1
             TRAINING_STATE["last_loss"] = float(loss.item())
-            
+
             # For mock config, we only do one gradient step total
             if config_name == "mock":
                 print("Mock finetuning: finishing after one gradient step.")
                 break
-            
+
             if i % 2 == 0:
                 _broadcast_training_update(loop)
-        
+
         if config_name == "mock":
             break
-            
+
         _broadcast_training_update(loop)
 
     # 4. Finalize
     if RECAP_WORKSPACE:
         policy_dir = RECAP_WORKSPACE / "policy_finetuned"
         policy_dir.mkdir(parents=True, exist_ok=True)
-        
+
         model_path = policy_dir / "actor.pt"
         torch.save(model.pizero.state_dict(), str(model_path))
         print(f"Finetuned policy saved to {model_path}")
@@ -1727,29 +1727,29 @@ def train_policy_network_thread(config_name: str, loop):
 async def start_policy_finetune(req: dict):
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     if TRAINING_STATE["is_training"]:
         return {"error": "Training already in progress"}
-        
+
     config_name = req.get("config", "mock") # use mock for speed in e2e
     print(f"[RECAP] start_policy_finetune called with config: {config_name}")
     loop = asyncio.get_event_loop()
     threading.Thread(target=train_policy_network_thread, args=(config_name, loop), daemon=True).start()
-    
+
     return {"status": "ok"}
 
 @app.post("/api/value/train")
 async def start_training(req: dict):
     if REPLAY_BUFFER is None:
         return {"error": "ReplayBuffer not initialized"}
-    
+
     if TRAINING_STATE["is_training"]:
         return {"error": "Training already in progress"}
-        
+
     config_name = req.get("config", "small")
     loop = asyncio.get_event_loop()
     threading.Thread(target=train_value_network_thread, args=(config_name, loop), daemon=True).start()
-    
+
     return {"status": "ok"}
 
 @app.post("/api/recap/simulate_collection")
@@ -1757,16 +1757,16 @@ async def simulate_collection_api(req: dict):
     """Simulates collecting a new batch of data for a task/iteration."""
     task_name = req.get("task_name")
     iter_id = req.get("iter_id", 0)
-    
+
     if not task_name:
         return {"error": "Missing task_name"}
-    
+
     # Create target directory
     timestamp = int(time.time())
     data_id = f"data.batch_{timestamp}"
     target_dir = RECAP_WORKSPACE / task_name / str(iter_id) / data_id
     target_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Copy 2 random videos from video-rollout as mock data
     try:
         from .recap_sim_engine import generate_trajectories
@@ -1777,19 +1777,19 @@ async def simulate_collection_api(req: dict):
             generate_trajectories(target_dir, num_episodes=2)
         except Exception as e:
              print(f"Simulate collection API: failed to generate trajectories: {e}")
-    
+
     return {"status": "ok", "task_name": task_name, "iter_id": iter_id, "data_id": data_id}
 
 @app.post("/api/recap/load_data")
 async def recap_load_data(req: dict):
     """Mounts a specific data folder to view in the labeller."""
     global VIDEO_DIRS, REPLAY_BUFFER, VIDEO_TO_EPISODE, CONVERSION_STATUS
-    
+
     task_name = req.get("task_name")
     iter_id = req.get("iter_id")
     data_id = req.get("data_id")
     is_pretrained = req.get("is_pretrained", False)
-    
+
     if is_pretrained:
         target_dir = RECAP_WORKSPACE / "pretrained_data"
     else:
@@ -1799,17 +1799,17 @@ async def recap_load_data(req: dict):
 
     if not target_dir.exists():
         return {"error": f"Data directory {target_dir} does not exist"}
-    
+
     # Reset current state
     VIDEO_DIRS = [target_dir]
     REPLAY_BUFFER = None
     VIDEO_TO_EPISODE = {}
-    
+
     # Start conversion in background
     CONVERSION_STATUS["is_converting"] = True
     CONVERSION_STATUS["progress"] = 0
     threading.Thread(target=init_replay_buffer, args=(VIDEO_DIRS,), daemon=True).start()
-    
+
     return {"status": "ok", "video_dir": str(target_dir)}
 
 @click.command()
@@ -1835,7 +1835,7 @@ def main(port, folders, recap_workspace):
                  print(f"Warning: Folder {vdir} does not exist")
             else:
                 valid_dirs.append(vdir)
-        
+
         if not valid_dirs:
             print("Error: No valid folders provided")
             return
@@ -1859,7 +1859,7 @@ def main(port, folders, recap_workspace):
     global VALUE_NETWORK
     print(f"Initializing SmallValueNetwork on {DEVICE}...")
     VALUE_NETWORK = SmallValueNetwork().to(DEVICE)
-    
+
     # Mount the cache directory for frames
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/cache", StaticFiles(directory=str(CACHE_DIR)), name="cache")

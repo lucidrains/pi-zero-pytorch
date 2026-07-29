@@ -1,6 +1,6 @@
 [project]
 name = "pi-zero-pytorch"
-version = "0.5.11"
+version = "0.5.12"
 description = "π0 in Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -34,12 +34,12 @@ dependencies = [
     "ema-pytorch>=0.7.3",
     "evolutionary-policy-optimization>=0.1.19",
     "hl-gauss-pytorch>=0.1.21",
-    'memmap-replay-buffer>=0.0.25',
+    'memmap-replay-buffer>=0.1.11',
     "pydantic>=2",
     "safetensors",
     "torch>=2.5",
     'torchdiffeq',
-    'torch-einops-utils>=0.0.30',
+    'torch-einops-utils>=0.1.12',
     'transformers',
     'tqdm',
     'vit-pytorch>=1.17.3',

@@ -36,7 +36,7 @@ def create_mock_replay_buffer(
 
     if not isinstance(folder, Path):
         folder = Path(folder)
-    
+
     folder.mkdir(parents = True, exist_ok = True)
 
     if num_episodes is None:
@@ -76,9 +76,9 @@ def create_mock_replay_buffer(
             task_id = task_id,
         ):
             for step in range(episode_len):
-                
+
                 # generate random data
-                
+
                 images = randn(3, num_images, *image_shape)
                 text = randint(0, num_text_tokens, (max_text_len,))
                 internal = randn(joint_dim)
@@ -89,7 +89,7 @@ def create_mock_replay_buffer(
                 advantages = randn(())
                 returns = randn(())
                 advantage_ids = random.randint(0, 1)
-                
+
                 buffer.store(
                     images = images,
                     text = text,

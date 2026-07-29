@@ -354,7 +354,7 @@ def test_pi_zero_six(
     experience = pi_zero_six.gather_experience_from_env(mock_env, num_episodes = 3, steps = 4)
 
     # meta buffer
-    
+
     meta_buffer = ReplayBuffer(
         './meta',
         max_episodes = 3,
@@ -473,9 +473,9 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
         dim_head = 8,
         mlp_dim = 64
     )
-    
+
     v = Extractor(v, return_embeddings_only = True)
-    
+
     model = π0(
         vit = v,
         vit_dim = 32,
@@ -486,9 +486,9 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
         num_advantage_tokens = 2,
         num_tasks = 2
     )
-    
+
     # mock buffer
-    
+
     mock_pretrain = create_mock_replay_buffer(
         folder = replay_folder,
         max_episodes = 5,
@@ -500,14 +500,14 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
     )
 
     # pi_zero_six
-    
+
     pi_zero_six = PiZeroSix(
         model,
         pretrain_data = mock_pretrain,
         cpu = True,
         workspace_folder = str(workspace)
     )
-    
+
     # run pretrain for generalist
 
     pi_zero_six.pretrain(
@@ -517,7 +517,7 @@ def test_pi_zero_six_recap(pi_zero_six_workspace):
     )
 
     # check assertions
-    
+
     assert (workspace / 'pretrained-actor.pt').exists()
     assert (workspace / 'pretrained-critic.pt').exists()
 
@@ -614,9 +614,74 @@ def test_internal_state_parity():
     h.remove()
 
     logits_full = logits_full[0]
-    
+
     # 5. Compare (only the language tokens slice, as forward() only computes those)
     # visual_tokens seq len is 1 * 64
     logits_vlm_slice = logits_vlm[:, 64:]
-    
+
     assert torch.allclose(logits_vlm_slice, logits_full, atol = 1e-3)
+
+
+def test_pi_zero_unreduced_loss():
+    from vit_pytorch import ViT
+    from vit_pytorch.extractor import Extractor
+
+    v = ViT(
+        image_size = 128,
+        patch_size = 32,
+        num_classes = 1000,
+        dim = 32,
+        depth = 1,
+        heads = 4,
+        dim_head = 8,
+        mlp_dim = 32
+    ).to(device)
+
+    v = Extractor(v, return_embeddings_only = True)
+
+    batch_size = 4
+    model = π0(
+        dim = 32,
+        vit = v,
+        vit_dim = 32,
+        depth = 1,
+        dim_action_input = 6,
+        dim_joint_state = 12,
+        num_tokens = 256,
+        predict_task_status_head = True
+    ).to(device)
+
+    images = torch.randn(batch_size, 3, 2, 128, 128)
+    commands = torch.randint(0, 256, (batch_size, 16))
+    joint_state = torch.randn(batch_size, 12)
+    actions = torch.randn(batch_size, 32, 6)
+    times = torch.rand(batch_size)
+    noise = torch.randn_like(actions)
+
+    loss_unreduced, breakdown = model(
+        images,
+        commands,
+        joint_state,
+        actions,
+        times = times,
+        noise = noise,
+        return_unreduced_loss = True
+    )
+
+    assert loss_unreduced.shape == (batch_size,)
+    for b in breakdown:
+        if isinstance(b, torch.Tensor):
+            assert b.shape == (batch_size,)
+
+    loss_reduced, _ = model(
+        images,
+        commands,
+        joint_state,
+        actions,
+        times = times,
+        noise = noise,
+        return_unreduced_loss = False
+    )
+
+    assert loss_reduced.ndim == 0
+    assert torch.allclose(loss_unreduced.mean(), loss_reduced, atol = 1e-4)
