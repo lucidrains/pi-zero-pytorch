@@ -288,7 +288,12 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     exportBtn.onclick = () => {
-        window.location.href = '/api/export';
+        const a = document.createElement('a');
+        a.href = '/api/export';
+        a.download = 'labels_export.zip';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
     };
 
     calcStatsBtn.onclick = async () => {

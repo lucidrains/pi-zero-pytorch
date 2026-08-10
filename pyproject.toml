@@ -96,7 +96,8 @@ managed = true
 dev-dependencies = []
 
 [project.scripts]
-env_rollout_labeller = "pi_zero_pytorch.web_server:main"
+env_rollout_labeller = "pi_zero_pytorch.labeller.main:main"
+trajectory_labeller = "pi_zero_pytorch.labeller.main:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true
