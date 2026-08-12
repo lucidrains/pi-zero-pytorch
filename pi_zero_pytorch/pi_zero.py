@@ -1328,23 +1328,18 @@ class PiZero(Module):
         self.time_infused_action_tokens = time_infused_action_tokens
         self.layer_time_cond = layer_time_cond
 
-        if time_sinusoidal:
-            # If time-infused, sinusoidal dim should match dim_action (usually 1024)
-            # cats [action_tokens (1024), sinusoidal (1024)] -> 2048
-            # BUT the to_time_cond MLP might expect a different input dim (e.g. 2048 in pretrained)
-            
-            mlp_in_dim = dim
-            time_embed = SinusoidalEmbed(mlp_in_dim, min_period = time_min_period, max_period = time_max_period)
+        # if time-infused, sinusoidal dim should match dim_action
+        # cats [action_tokens (1024), sinusoidal (1024)] -> 2048
 
-            if time_infused_action_tokens:
-                 self.infusion_time_embed = SinusoidalEmbed(dim_action, min_period = time_min_period, max_period = time_max_period)
-        else:
-            time_embed = SinusoidalEmbed(dim)
+        time_embed = SinusoidalEmbed(dim, min_period = time_min_period, max_period = time_max_period)
+
+        if time_infused_action_tokens:
+            self.infusion_time_embed = SinusoidalEmbed(dim_action, min_period = time_min_period, max_period = time_max_period)
 
         # we can reuse to_time_cond for infusion or layer conditioning
         # for PI0, it's used for infusion
         
-        in_dim = mlp_in_dim if time_sinusoidal else dim
+        in_dim = dim
         out_dim = dim_action if not layer_time_cond else dim_time_cond
         hidden_dims = (dim_time_cond,) * (time_mlp_depth - 1) if time_mlp_depth > 1 else ()
 
@@ -1770,9 +1765,12 @@ class PiZero(Module):
             if inpaint_actions:
 
                 if self.train_time_rtc:
-                    time_mask = arange(trajectory_length, device = self.device) < frozen_action_input_len
-                    timestep = einx.where('na,,', time_mask, 1., timestep)
-                    timestep = repeat(timestep, 'na -> b na', b = batch_size)
+                    frozen_mask = repeat(arange(trajectory_length, device = self.device) < frozen_action_input_len, 'na -> b na', b = batch_size)
+
+                    # set the frozen prefix actions and times to the given values for the entire trajectory
+
+                    timestep = torch.where(frozen_mask, 1., timestep)
+                    denoised_actions = einx.where('b na, b na d, b na d', frozen_mask, frozen_actions_for_inpaint, denoised_actions)
                 else:
                     denoised_actions = soft_mask_inpainter(frozen_actions_for_inpaint, denoised_actions)
 
@@ -2257,7 +2255,7 @@ class PiZero(Module):
         # take care of model output maybe needing a transformation from x0 to flow
 
         def model_output_clean_to_flow(clean, eps = 1e-2):
-            padded_times = rearrange(times, 'b -> b 1 1')
+            padded_times = pad_right_ndim(times, clean.ndim - times.ndim)
 
             return (clean - actions) / (1. - padded_times).clamp_min(eps)
 
@@ -2271,8 +2269,12 @@ class PiZero(Module):
         
         if self.time_infused_action_tokens:
             sinusoidal = self.infusion_time_embed(times)
-            sinusoidal = sinusoidal[:, None, :].expand_as(action_tokens)
-            
+
+            # times may be per action position, if doing train time rtc
+
+            if sinusoidal.ndim == 2:
+                sinusoidal = rearrange(sinusoidal, 'b d -> b 1 d').expand_as(action_tokens)
+
             action_tokens = torch.cat([action_tokens, sinusoidal], dim = -1)
             action_tokens = self.to_action_time_fuse(action_tokens)
 

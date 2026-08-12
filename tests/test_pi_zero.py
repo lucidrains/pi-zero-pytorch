@@ -405,7 +405,8 @@ def test_pi_zero_six(
 
     pi_zero_six.train_policy_network(joined_dataset, num_train_steps = 2)
 
-def test_train_time_rtc():
+@param('model_predict_output', ('flow', 'clean'))
+def test_train_time_rtc(model_predict_output):
     from pi_zero_pytorch import π0
 
     model = π0(
@@ -414,7 +415,8 @@ def test_train_time_rtc():
         dim_joint_state = 12,
         num_tokens = 100,
         train_time_rtc = True,
-        train_time_rtc_max_delay = 4
+        train_time_rtc_max_delay = 4,
+        model_predict_output = model_predict_output
     )
 
     vision = torch.randn(1, 32, 64)
