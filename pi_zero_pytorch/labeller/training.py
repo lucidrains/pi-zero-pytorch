@@ -1,6 +1,6 @@
 import asyncio
 import json
-import traceback
+import logging
 from datetime import datetime
 
 import numpy as np
@@ -10,9 +10,16 @@ import tqdm
 
 from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate
 
+from .errors import ApiError
 from .networks import PI_ZERO_CONFIGS, VALUE_NETWORK_CONFIGS, SmallPiZero, SmallValueNetwork
 from .state import AppState
 from .storage import get_frame_count, get_video_path
+from .store import store
+
+logger = logging.getLogger(__name__)
+
+
+# training threads
 
 
 def _broadcast_training_update(state: AppState, loop: asyncio.AbstractEventLoop):
@@ -25,312 +32,249 @@ def _broadcast_training_update(state: AppState, loop: asyncio.AbstractEventLoop)
     )
 
 
+def _stop_training(state: AppState, loop: asyncio.AbstractEventLoop):
+    state.training_state["is_training"] = False
+    _broadcast_training_update(state, loop)
+
+
+def _prepare_images(images: torch.Tensor, device: torch.device, target_size) -> torch.Tensor:
+    """uint8 (b, c, [views,] h, w) -> normalized float (b, c, *target_size), first view only."""
+    images = images.to(device).float().div_(255.0)
+    if images.ndim == 5:
+        images = images[:, :, 0, :, :]
+    if images.shape[-2:] != target_size:
+        images = TF.resize(images, target_size, antialias=True)
+    return images
+
+
+def _run_training(state: AppState, loop, loader, num_epochs: int, mock: bool, broadcast_every: int, step_fn):
+    """Shared epoch/step loop: runs `step_fn` per batch, tracking and broadcasting progress.
+
+    Mock configs stop after a single gradient step so UI flows stay fast.
+    """
+    max_steps = 1 if mock else len(loader) * num_epochs
+    state.training_state.update({
+        "is_training": True,
+        "current_epoch": 0,
+        "total_epochs": 1 if mock else num_epochs,
+        "current_step": 0,
+        "total_steps": max_steps,
+        "last_loss": 0.0
+    })
+    _broadcast_training_update(state, loop)
+
+    step = 0
+    for epoch in range(num_epochs):
+        state.training_state["current_epoch"] = epoch + 1
+        for i, batch in enumerate(loader):
+            loss = step_fn(batch)
+            step += 1
+            state.training_state["current_step"] = step
+            state.training_state["last_loss"] = float(loss.item())
+
+            if step >= max_steps:
+                return
+            if i % broadcast_every == 0:
+                _broadcast_training_update(state, loop)
+        _broadcast_training_update(state, loop)
+
+
 def train_value_network_thread(state: AppState, config_name: str, loop: asyncio.AbstractEventLoop):
-    # 1. Prepare data
-    if config_name == "mock":
-        # Extremely fast mock data
-        images = torch.randn(1, 3, 32, 32)
-        returns = torch.randn(1)
-        dataset = torch.utils.data.TensorDataset(images, returns)
+    mock = config_name == "mock"
+
+    if mock:
+        dataset = torch.utils.data.TensorDataset(
+            torch.randint(0, 256, (1, 3, 32, 32), dtype=torch.uint8),
+            torch.randn(1)
+        )
     else:
-        all_images = []
-        all_returns = []
+        all_images, all_returns = [], []
         for i in range(len(state.replay_buffer)):
             returns = state.replay_buffer.data['returns'][i]
             valid_mask = ~np.isnan(returns)
             if valid_mask.any():
-                images = state.replay_buffer.data['images'][i][valid_mask]
-                all_images.append(torch.from_numpy(images))
+                all_images.append(torch.from_numpy(state.replay_buffer.data['images'][i][valid_mask]))
                 all_returns.append(torch.from_numpy(returns[valid_mask]))
 
         if not all_images:
-            state.training_state["is_training"] = False
-            _broadcast_training_update(state, loop)
+            logger.warning("no labelled returns available for value training")
+            _stop_training(state, loop)
             return
 
         dataset = torch.utils.data.TensorDataset(torch.cat(all_images), torch.cat(all_returns))
-    batch_size = 16
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # 2. Initialize model
+    loader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=True)
+
     config = VALUE_NETWORK_CONFIGS.get(config_name, VALUE_NETWORK_CONFIGS["small"])
     model = SmallValueNetwork(**config).to(state.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     model.train()
 
+    target_size = (config.get('image_size', 224),) * 2
+
+    def step_fn(batch):
+        images, returns = batch
+        images = _prepare_images(images, state.device, target_size)
+        returns = returns.to(state.device)
+
+        _, logits = model(images, return_value_and_logits=True)
+        loss = model.to_value.loss_fn(logits, returns).mean()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
+
     num_epochs = 10
-    total_steps = len(loader) * num_epochs if config_name != "mock" else 1
-    state.training_state.update({
-        "is_training": True,
-        "current_epoch": 0,
-        "total_epochs": num_epochs if config_name != "mock" else 1,
-        "current_step": 0,
-        "total_steps": total_steps,
-        "last_loss": 0.0
-    })
-    _broadcast_training_update(state, loop)
+    _run_training(state, loop, loader, num_epochs, mock, broadcast_every=5, step_fn=step_fn)
 
-    # 3. Training loop
-    target_size = (config.get('image_size', 224), config.get('image_size', 224))
-
-    for epoch in range(num_epochs):
-        state.training_state["current_epoch"] = epoch + 1
-        for i, (images, returns) in enumerate(loader):
-            images = images.to(state.device)
-            if images.ndim == 5:
-                images = images[:, :, 0, :, :]
-            if images.shape[-2:] != target_size:
-                images = TF.resize(images, target_size, antialias=True)
-
-            returns = returns.to(state.device)
-
-            values, logits = model(images, return_value_and_logits=True)
-            loss = model.to_value.loss_fn(logits, returns).mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            state.training_state["current_step"] += 1
-            state.training_state["last_loss"] = float(loss.item())
-
-            # For mock config, we only do one gradient step total
-            if config_name == "mock":
-                print("Mock training: finishing after one gradient step.")
-                break
-
-            if i % 5 == 0:
-                _broadcast_training_update(state, loop)
-
-        if config_name == "mock":
-            break
-
-        _broadcast_training_update(state, loop)
-
-    # 4. Finalize
     state.value_network = model
+    _save_value_checkpoint(state, model, config, config_name, num_epochs)
+    _stop_training(state, loop)
 
-    # Save the model
-    if state.recap_workspace:
-        networks_dir = state.recap_workspace / "value_networks"
-        networks_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_filename = f"{config_name}_{timestamp}.pt"
-        model_path = networks_dir / model_filename
+def _save_value_checkpoint(state: AppState, model, config, config_name: str, num_epochs: int):
+    if not state.recap_workspace:
+        return
 
-        torch.save({
-            "state_dict": model.state_dict(),
-            "config": config,
-            "config_name": config_name,
-            "epochs": num_epochs,
-            "final_loss": state.training_state["last_loss"],
-            "timestamp": timestamp
-        }, str(model_path))
-        print(f"Value network saved to {model_path}")
+    networks_dir = state.recap_workspace / "value_networks"
+    networks_dir.mkdir(parents=True, exist_ok=True)
 
-    state.training_state["is_training"] = False
-    _broadcast_training_update(state, loop)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = networks_dir / f"{config_name}_{timestamp}.pt"
+
+    torch.save({
+        "state_dict": model.state_dict(),
+        "config": config,
+        "config_name": config_name,
+        "epochs": num_epochs,
+        "final_loss": state.training_state["last_loss"],
+        "timestamp": timestamp
+    }, str(model_path))
+    logger.info("value network saved to %s", model_path)
 
 
 def train_policy_network_thread(state: AppState, config_name: str, loop: asyncio.AbstractEventLoop):
+    """Advantage-conditioned finetuning on timesteps with binarized advantages."""
+    mock = config_name == "mock"
     has_proprio = (state.replay_buffer is not None) and ('proprio' in state.replay_buffer.data)
-    all_proprio = []
+    proprio_dim = None
 
-    # 1. Prepare data - conditioned on binarized advantages (advantage_ids)
-    if config_name == "mock":
-        # Extremely fast mock data
-        images = torch.randn(1, 3, 32, 32)
-        text = torch.zeros(1, 32, dtype=torch.long)
-        internal = torch.randn(1, 32)
-        actions = torch.randn(1, 16, 6)
-        adv_ids = torch.zeros(1, dtype=torch.long)
-        dataset = torch.utils.data.TensorDataset(images, text, internal, actions, adv_ids)
+    if mock:
+        dataset = torch.utils.data.TensorDataset(
+            torch.randint(0, 256, (1, 3, 32, 32), dtype=torch.uint8),
+            torch.zeros(1, 32, dtype=torch.long),
+            torch.randn(1, 32),
+            torch.randn(1, 16, 6),
+            torch.zeros(1, dtype=torch.long)
+        )
     else:
-        all_images = []
-        all_text = []
-        all_internal = []
-        all_actions = []
-        all_advantage_ids = []
+        field_names = ['images', 'text', 'internal', 'actions', 'advantage_ids']
+        if has_proprio:
+            field_names.append('proprio')
 
+        columns = {name: [] for name in field_names}
         for i in range(len(state.replay_buffer)):
-            advantage_ids = state.replay_buffer.data['advantage_ids'][i]
-            valid_mask = advantage_ids != -1
-            if valid_mask.any():
-                all_images.append(torch.from_numpy(state.replay_buffer.data['images'][i][valid_mask]))
-                all_text.append(torch.from_numpy(state.replay_buffer.data['text'][i][valid_mask]))
-                all_internal.append(torch.from_numpy(state.replay_buffer.data['internal'][i][valid_mask]))
-                all_actions.append(torch.from_numpy(state.replay_buffer.data['actions'][i][valid_mask]))
-                all_advantage_ids.append(torch.from_numpy(advantage_ids[valid_mask]))
-                if has_proprio:
-                    all_proprio.append(torch.from_numpy(state.replay_buffer.data['proprio'][i][valid_mask]))
+            valid_mask = state.replay_buffer.data['advantage_ids'][i] != -1
+            if not valid_mask.any():
+                continue
+            for name in field_names:
+                columns[name].append(torch.from_numpy(state.replay_buffer.data[name][i][valid_mask]))
 
-        if not all_images:
-            print("No valid data for policy training")
-            state.training_state["is_training"] = False
-            _broadcast_training_update(state, loop)
+        if not columns['images']:
+            logger.warning("no binarized advantages available for policy finetuning")
+            _stop_training(state, loop)
             return
 
-        tensors = [
-            torch.cat(all_images),
-            torch.cat(all_text),
-            torch.cat(all_internal),
-            torch.cat(all_actions),
-            torch.cat(all_advantage_ids)
-        ]
-
-        if has_proprio:
-            tensors.append(torch.cat(all_proprio))
-
+        tensors = [torch.cat(columns[name]) for name in field_names]
         dataset = torch.utils.data.TensorDataset(*tensors)
+        if has_proprio:
+            proprio_dim = tensors[-1].shape[-1]
 
-    batch_size = 4
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=4, shuffle=True)
 
-    # 2. Initialize model
     config = PI_ZERO_CONFIGS.get(config_name, PI_ZERO_CONFIGS["small"]).copy()
-
-    # If we have proprio data in the dataset, update dim_joint_state to match
-    if has_proprio and len(all_proprio) > 0:
-        actual_proprio_dim = all_proprio[0].shape[-1]
-        config["dim_joint_state"] = actual_proprio_dim
-        print(f"[RECAP] Using actual proprio_dim for policy: {actual_proprio_dim}")
-    else:
-        print(f"[RECAP] Using default dim_joint_state: {config.get('dim_joint_state', 32)}")
+    if proprio_dim is not None:
+        config["dim_joint_state"] = proprio_dim
+        logger.info("policy dim_joint_state set from proprio data: %d", proprio_dim)
 
     model = SmallPiZero(**config).to(state.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)  # lower lr for finetuning
     model.train()
 
-    num_epochs = 1
-    total_steps = len(loader) * num_epochs if config_name != "mock" else 1
-    state.training_state.update({
-        "is_training": True,
-        "current_epoch": 0,
-        "total_epochs": num_epochs if config_name != "mock" else 1,
-        "current_step": 0,
-        "total_steps": total_steps,
-        "last_loss": 0.0
-    })
-    _broadcast_training_update(state, loop)
+    target_size = (config.get('image_size', 32),) * 2
 
-    # 3. Training loop
-    target_size = (config.get('image_size', 32), config.get('image_size', 32))
+    def step_fn(batch):
+        if len(batch) == 6:
+            images, text, internal, actions, adv_ids, joint_state = batch
+        else:
+            images, text, internal, actions, adv_ids = batch
+            joint_state = internal
 
-    print(f"Starting policy fine-tuning for {num_epochs} epoch...")
-    for epoch in range(num_epochs):
-        state.training_state["current_epoch"] = epoch + 1
-        for i, batch in enumerate(loader):
-            if len(batch) == 6:
-                images, text, internal, actions, adv_ids, proprio = batch
-                joint_state = proprio
-            else:
-                images, text, internal, actions, adv_ids = batch
-                joint_state = internal
+        images = _prepare_images(images, state.device, target_size)
+        text, joint_state, actions, adv_ids = (
+            t.to(state.device) for t in (text, joint_state, actions, adv_ids)
+        )
 
-            images = images.to(state.device)
-            if images.ndim == 5:
-                images = images[:, :, 0, :, :]
-            if images.shape[-2:] != target_size:
-                images = TF.resize(images, target_size, antialias=True)
+        output = model(images, text, joint_state, actions, advantage_ids=adv_ids)
+        loss = output[0] if isinstance(output, tuple) else output
 
-            text = text.to(state.device)
-            joint_state = joint_state.to(state.device)
-            actions = actions.to(state.device)
-            adv_ids = adv_ids.to(state.device)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
 
-            # Conditioned on advantage_ids
-            output = model(images, text, joint_state, actions, advantage_ids=adv_ids)
-            loss = output[0] if isinstance(output, tuple) else output
+    _run_training(state, loop, loader, num_epochs=1, mock=mock, broadcast_every=2, step_fn=step_fn)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            state.training_state["current_step"] += 1
-            state.training_state["last_loss"] = float(loss.item())
-
-            # For mock config, we only do one gradient step total
-            if config_name == "mock":
-                print("Mock finetuning: finishing after one gradient step.")
-                break
-
-            if i % 2 == 0:
-                _broadcast_training_update(state, loop)
-
-        if config_name == "mock":
-            break
-
-        _broadcast_training_update(state, loop)
-
-    # 4. Finalize
     if state.recap_workspace:
         policy_dir = state.recap_workspace / "policy_finetuned"
         policy_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.pizero.state_dict(), str(policy_dir / "actor.pt"))
+        logger.info("finetuned policy saved to %s", policy_dir / "actor.pt")
 
-        model_path = policy_dir / "actor.pt"
-        torch.save(model.pizero.state_dict(), str(model_path))
-        print(f"Finetuned policy saved to {model_path}")
+    _stop_training(state, loop)
 
-    state.training_state["is_training"] = False
-    _broadcast_training_update(state, loop)
+
+# value / advantage estimation
 
 
 async def calculate_episode_value(state: AppState, filename: str, max_t: int = None):
-    if state.replay_buffer is None:
-        return {"error": "ReplayBuffer not initialized"}
-
-    episode_id = state.video_to_episode.get(filename)
-    if episode_id is None:
-        return {"error": "Video not found in buffer"}
+    episode_id = store.resolve(filename)
 
     if state.value_network is None:
-        return {"error": "Value network not initialized"}
+        raise ApiError("Value network not initialized", status_code=409)
+
+    marked_timestep = state.replay_buffer.meta_data['marked_timestep'][episode_id].item()
+    if marked_timestep != -1:
+        max_t = marked_timestep + 1
 
     try:
-        # Check for marked_timestep
-        marked_timestep = state.replay_buffer.meta_data['marked_timestep'][episode_id].item()
-        if marked_timestep != -1:
-            max_t = marked_timestep + 1
-
         values = await _calculate_episode_value_internal(state, episode_id, filename, max_t=max_t)
-        return {"status": "ok", "value": values}
     except Exception as e:
-        return {"error": str(e)}
+        logger.exception("value calculation failed for %s", filename)
+        raise ApiError(str(e), status_code=500)
+
+    return {"status": "ok", "value": values}
 
 
 async def _calculate_episode_value_internal(state: AppState, episode_id: int, filename: str, max_t: int = None):
-    # Get images for this episode
-    images = state.replay_buffer.data['images'][episode_id]  # (max_timesteps, c, 1, h, w)
+    images = state.replay_buffer.data['images'][episode_id]  # (max_timesteps, c, num_views, h, w)
 
-    video_path = get_video_path(state, filename)
-    num_frames = get_frame_count(video_path)
+    num_frames = get_frame_count(get_video_path(state, filename))
+    calc_to_t = num_frames if max_t is None else min(num_frames, max_t)
 
-    calc_to_t = num_frames
-    if max_t is not None:
-        calc_to_t = min(num_frames, max_t)
+    model = state.value_network
+    model.eval()
+    target_size = (model.image_size, model.image_size)
 
     values = []
-    state.value_network.eval()
-
     batch_size = 8
     with torch.no_grad():
         for i in tqdm.tqdm(range(0, calc_to_t, batch_size)):
-            batch_images = images[i: min(i + batch_size, calc_to_t)]
-            batch_images = torch.from_numpy(batch_images).to(state.device)
-            # Stored as (t, c, num_views, h, w); use first view for scoring
-            if batch_images.ndim == 5:
-                batch_images = batch_images[:, :, 0, :, :]
+            batch_images = torch.from_numpy(images[i: min(i + batch_size, calc_to_t)])
+            batch_images = _prepare_images(batch_images, state.device, target_size)
+            values.extend(model(batch_images).cpu().tolist())
 
-            # Use model's expected image size
-            target_size = (state.value_network.image_size, state.value_network.image_size)
-            if batch_images.shape[-2:] != target_size:
-                batch_images = TF.resize(batch_images, target_size, antialias=True)
-
-            batch_values = state.value_network(batch_images)
-            values.extend(batch_values.cpu().tolist())
-
-    # Store values back to replay buffer
     final_values = torch.full((images.shape[0],), float('nan'))
     final_values[:len(values)] = torch.tensor(values)
     state.replay_buffer.data['value'][episode_id] = final_values.numpy()
@@ -340,35 +284,26 @@ async def _calculate_episode_value_internal(state: AppState, episode_id: int, fi
 
 
 async def calculate_episode_advantage(state: AppState, filename: str, gamma: float, lam: float):
-    if state.replay_buffer is None:
-        return {"error": "ReplayBuffer not initialized"}
-
-    episode_id = state.video_to_episode.get(filename)
-    if episode_id is None:
-        return {"error": "Video not found in buffer"}
+    episode_id = store.resolve(filename)
 
     try:
-        # Get actual frame count
-        video_path = get_video_path(state, filename)
-        num_frames = get_frame_count(video_path)
+        num_frames = get_frame_count(get_video_path(state, filename))
 
         marked_timestep = state.replay_buffer.meta_data['marked_timestep'][episode_id].item()
         if marked_timestep != -1:
             num_frames = min(num_frames, marked_timestep + 1)
 
-        # Check if values exist, otherwise calculate them
+        # Values are a prerequisite; compute them on demand
         values_np = state.replay_buffer.data['value'][episode_id]
         if np.isnan(values_np[:num_frames]).any():
-            print(f"Values not found for {filename}, calculating first...")
+            logger.info("values missing for %s, calculating first", filename)
             await _calculate_episode_value_internal(state, episode_id, filename, max_t=num_frames)
             values_np = state.replay_buffer.data['value'][episode_id]
 
-        # Prepare inputs for GAE
         rewards = torch.from_numpy(state.replay_buffer.data['reward'][episode_id][:num_frames])
         values = torch.from_numpy(values_np[:num_frames])
-        masks = torch.ones_like(rewards)  # Assume all frames are valid for now
+        masks = torch.ones_like(rewards)
 
-        # Calculate GAE
         gae_return = calc_generalized_advantage_estimate(
             rewards=rewards,
             values=values,
@@ -376,35 +311,24 @@ async def calculate_episode_advantage(state: AppState, filename: str, gamma: flo
             gamma=gamma,
             lam=lam
         )
-
         advantages = gae_return.advantages.tolist()
 
-        # Store advantages back
         final_advantages = torch.full((state.replay_buffer.data['advantages'].shape[1],), float('nan'))
         final_advantages[:len(advantages)] = torch.tensor(advantages)
         state.replay_buffer.data['advantages'][episode_id] = final_advantages.numpy()
-        state.replay_buffer.flush()
 
-        print(f"[RECAP] Calculated advantages for {filename} (ID: {episode_id}). Count: {len(advantages)}")
-        valid_advs = torch.tensor(advantages)[~torch.isnan(torch.tensor(advantages))]
-        if len(valid_advs) > 0:
-            print(f"[RECAP] Advantages - Min: {valid_advs.min().item():.4f}, Max: {valid_advs.max().item():.4f}, Mean: {valid_advs.mean().item():.4f}")
-
-        # RECAP requires binarized advantages in the buffer.
-        # If it's an expert segment, we MUST set it to 1.
+        # RECAP conditions on binarized advantages; expert segments are always positive,
+        # regular steps stay unbinarized until a global cutoff is chosen.
         expert_mask = state.replay_buffer.data['expert_segment'][episode_id][:num_frames]
         adv_ids = state.replay_buffer.data['advantage_ids'][episode_id]
-
-        # We don't have a cutoff here, so we don't binarize regular steps yet.
-        # But we DO ensure expert steps are marked.
         adv_ids[:num_frames][expert_mask] = 1
         state.replay_buffer.data['advantage_ids'][episode_id] = adv_ids
 
         state.replay_buffer.store_meta_datapoint(episode_id, 'invalidated', False)
         state.replay_buffer.flush()
 
+        logger.info("calculated %d advantages for %s (episode %d)", len(advantages), filename, episode_id)
         return {"status": "ok", "advantages": advantages, "value": values.tolist(), "advantage_ids": adv_ids.tolist()}
     except Exception as e:
-        traceback.print_exc()
-        print(f"Error calculating advantage for {filename}: {str(e)}")
-        return {"error": str(e)}
+        logger.exception("advantage calculation failed for %s", filename)
+        raise ApiError(str(e), status_code=500)

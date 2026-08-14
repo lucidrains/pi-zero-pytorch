@@ -1,12 +1,56 @@
+import logging
 import shutil
+import time
+from pathlib import Path
 
 import torch
 
+from .errors import ApiError
 from .networks import PI_ZERO_CONFIGS, SmallPiZero
 from .sim_engine import generate_trajectories
 from .state import AppState
 
+logger = logging.getLogger(__name__)
+
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".avi", ".mov"}
+
+
+# helpers
+
+
+def _require_workspace(state: AppState) -> Path:
+    if not state.recap_workspace:
+        raise ApiError("RECAP workspace not configured", status_code=409)
+    return state.recap_workspace
+
+
+def _require_task(state: AppState, task_name: str) -> Path:
+    if not task_name:
+        raise ApiError("Missing task_name")
+    return _require_workspace(state) / task_name
+
+
+def _count_videos(directory: Path) -> int:
+    return len([
+        f for f in directory.iterdir()
+        if f.suffix.lower() in VIDEO_EXTENSIONS and f.stat().st_size > 0
+    ])
+
+
+def _save_simulated_weights(iter_dir: Path, task_name: str, iteration: int):
+    for name in ("actor.pt", "critic.pt"):
+        torch.save({"simulated": True, "task": task_name, "iteration": iteration}, str(iter_dir / name))
+
+
+def _generate_episodes(data_dir: Path, **kwargs):
+    try:
+        generate_trajectories(data_dir, num_episodes=2, **kwargs)
+        logger.info("simulated 2 episodes in %s", data_dir)
+    except Exception:
+        logger.exception("trajectory generation failed for %s", data_dir)
+
+
+# workspace introspection
 
 
 def get_recap_state(state: AppState):
@@ -26,11 +70,9 @@ def get_recap_state(state: AppState):
         "tasks": []
     }
 
-    # Check for pretrained_data directory
     pretrained_data_dir = workspace / "pretrained_data"
     if pretrained_data_dir.exists():
-        video_count = len([f for f in pretrained_data_dir.iterdir() if f.suffix.lower() in VIDEO_EXTENSIONS and f.stat().st_size > 0])
-        result["pretrained_data"] = {"video_count": video_count}
+        result["pretrained_data"] = {"video_count": _count_videos(pretrained_data_dir)}
 
     for task_name, task_config in state.recap_config.get("tasks", {}).items():
         task_dir = workspace / task_name
@@ -42,64 +84,58 @@ def get_recap_state(state: AppState):
         }
 
         if task_dir.exists():
-            # Find iterations (numbered folders: 0, 1, 2...)
+            # Iterations are numbered folders (0, 1, 2...) holding data folders (data.*)
             for iter_dir in sorted(task_dir.iterdir(), key=lambda x: int(x.name) if x.name.isdigit() else -1):
-                if iter_dir.is_dir() and iter_dir.name.isdigit():
-                    iter_id = int(iter_dir.name)
-                    # Find data folders (data.0, data.1, ...)
-                    data_folders = []
-                    for d in sorted(iter_dir.iterdir()):
-                        if d.is_dir() and not d.name.isdigit():
-                            video_count = len([f for f in d.iterdir() if f.suffix.lower() in VIDEO_EXTENSIONS and f.stat().st_size > 0])
-                            data_folders.append({
-                                "id": d.name,
-                                "video_count": video_count
-                            })
+                if not (iter_dir.is_dir() and iter_dir.name.isdigit()):
+                    continue
 
-                    task_state["iterations"].append({
-                        "id": iter_id,
-                        "actor": (iter_dir / "actor.pt").exists(),
-                        "critic": (iter_dir / "critic.pt").exists(),
-                        "data": data_folders
-                    })
+                data_folders = [
+                    {"id": d.name, "video_count": _count_videos(d)}
+                    for d in sorted(iter_dir.iterdir())
+                    if d.is_dir() and not d.name.isdigit()
+                ]
+
+                task_state["iterations"].append({
+                    "id": int(iter_dir.name),
+                    "actor": (iter_dir / "actor.pt").exists(),
+                    "critic": (iter_dir / "critic.pt").exists(),
+                    "data": data_folders
+                })
 
         result["tasks"].append(task_state)
 
     return result
 
 
+# lifecycle steps
+
+
 def recap_pretrain(state: AppState):
     """Simulates generalist pretraining with a single gradient step on dummy data."""
-    if not state.recap_workspace:
-        return {"error": "RECAP workspace not configured"}
+    workspace = _require_workspace(state)
 
-    actor_path = state.recap_workspace / "pretrained-actor.pt"
-    critic_path = state.recap_workspace / "pretrained-critic.pt"
-
+    actor_path = workspace / "pretrained-actor.pt"
+    critic_path = workspace / "pretrained-critic.pt"
     if actor_path.exists():
-        return {"error": "Already pretrained"}
+        raise ApiError("Already pretrained", status_code=409)
 
-    print("Pretraining: performing one gradient step on dummy data...")
+    logger.info("pretraining: performing one gradient step on dummy data")
 
-    # Use mock config for pretraining speed
     config = PI_ZERO_CONFIGS["mock"]
     model = SmallPiZero(**config).to(state.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    # Dummy data
     images = torch.randn(1, 3, config["image_size"], config["image_size"]).to(state.device)
     text = torch.zeros(1, 32, dtype=torch.long).to(state.device)
     internal = torch.randn(1, 32).to(state.device)
     actions = torch.randn(1, 6).to(state.device)
 
-    # One gradient step
     output = model(images, text, internal, actions)
     loss = output[0] if isinstance(output, tuple) else output
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    # Save dummy weights (simulation)
     torch.save(model.state_dict(), str(actor_path))
     torch.save(model.state_dict(), str(critic_path))
 
@@ -108,112 +144,69 @@ def recap_pretrain(state: AppState):
 
 def recap_specialize(state: AppState, task_name: str):
     """Creates iteration 0 (SFT) for a specific task."""
-    if not state.recap_workspace:
-        return {"error": "RECAP workspace not configured"}
+    task_dir = _require_task(state, task_name)
 
-    if not task_name:
-        return {"error": "Missing task_name"}
-
-    # Check that pretrained weights exist
     if not (state.recap_workspace / "pretrained-actor.pt").exists():
-        return {"error": "Must pretrain first"}
+        raise ApiError("Must pretrain first", status_code=409)
 
-    # Create iteration 0 (SFT)
-    iter_dir = state.recap_workspace / task_name / "0"
+    iter_dir = task_dir / "0"
     iter_dir.mkdir(parents=True, exist_ok=True)
-
-    # Simulate creating specialized weights
-    torch.save({"simulated": True, "task": task_name, "iteration": 0}, str(iter_dir / "actor.pt"))
-    torch.save({"simulated": True, "task": task_name, "iteration": 0}, str(iter_dir / "critic.pt"))
+    _save_simulated_weights(iter_dir, task_name, 0)
 
     return {"status": "ok"}
 
 
 def recap_collect(state: AppState, task_name: str, iter_id: int):
-    """Simulates data collection - creates a new data folder with sample videos."""
-    if not state.recap_workspace:
-        return {"error": "RECAP workspace not configured"}
+    """Simulates data collection - creates the next data folder with sample videos."""
+    task_dir = _require_task(state, task_name)
 
-    if not task_name:
-        return {"error": "Missing task_name"}
-
-    iter_dir = state.recap_workspace / task_name / str(iter_id)
+    iter_dir = task_dir / str(iter_id)
     if not iter_dir.exists():
-        return {"error": f"Iteration {iter_id} does not exist for {task_name}"}
+        raise ApiError(f"Iteration {iter_id} does not exist for {task_name}", status_code=404)
 
-    # Find next data folder index
-    existing_data = list(iter_dir.glob("data.*"))
-    next_idx = len(existing_data)
-
+    next_idx = len(list(iter_dir.glob("data.*")))
     data_dir = iter_dir / f"data.{next_idx}"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use simulation engine to generate sample trajectories
-    try:
-        generate_trajectories(data_dir, num_episodes=2, steps=20)
-        print(f"RECAP Collect: Simulated 2 episodes in {data_dir}")
-    except Exception as e:
-        print(f"RECAP Collect: Simulation failed or skipped: {e}")
+    _generate_episodes(data_dir, steps=20)
 
     return {"status": "ok", "data_folder": f"data.{next_idx}"}
 
 
+def simulate_collection(state: AppState, task_name: str, iter_id: int):
+    """Simulates collecting a new timestamped batch of data for a task/iteration."""
+    task_dir = _require_task(state, task_name)
+
+    data_id = f"data.batch_{int(time.time())}"
+    data_dir = task_dir / str(iter_id) / data_id
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    _generate_episodes(data_dir)
+
+    return {"status": "ok", "task_name": task_name, "iter_id": iter_id, "data_id": data_id}
+
+
 def recap_iterate(state: AppState, task_name: str, iter_id: int):
     """Advances to the next iteration after finetuning on collected data."""
-    if not state.recap_workspace:
-        return {"error": "RECAP workspace not configured"}
+    task_dir = _require_task(state, task_name)
 
-    if not task_name:
-        return {"error": "Missing task_name"}
-
-    current_iter_dir = state.recap_workspace / task_name / str(iter_id)
+    current_iter_dir = task_dir / str(iter_id)
     if not current_iter_dir.exists():
-        return {"error": f"Iteration {iter_id} does not exist"}
+        raise ApiError(f"Iteration {iter_id} does not exist", status_code=404)
 
-    # Check that data was collected
-    data_folders = list(current_iter_dir.glob("data.*"))
-    if not data_folders:
-        return {"error": "No data collected for this iteration"}
+    if not list(current_iter_dir.glob("data.*")):
+        raise ApiError("No data collected for this iteration", status_code=409)
 
-    # Create next iteration
     next_iter_id = iter_id + 1
-    next_iter_dir = state.recap_workspace / task_name / str(next_iter_id)
+    next_iter_dir = task_dir / str(next_iter_id)
     next_iter_dir.mkdir(parents=True, exist_ok=True)
 
-    # If policy fine-tuning just finished, it might have saved weights in a 'policy_finetuned' dir
-    # we move it to the next iteration
+    _save_simulated_weights(next_iter_dir, task_name, next_iter_id)
+
+    # If policy finetuning just finished, promote its weights to the new iteration
     finetuned_actor = state.recap_workspace / "policy_finetuned" / "actor.pt"
     if finetuned_actor.exists():
         shutil.move(str(finetuned_actor), str(next_iter_dir / "actor.pt"))
-        print(f"Moved finetuned actor to {next_iter_dir}")
-    else:
-        # Simulate creating updated weights if not existing
-        torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "actor.pt"))
-
-    torch.save({"simulated": True, "task": task_name, "iteration": next_iter_id}, str(next_iter_dir / "critic.pt"))
+        logger.info("moved finetuned actor to %s", next_iter_dir)
 
     return {"status": "ok", "new_iteration": next_iter_id}
-
-
-def simulate_collection(state: AppState, task_name: str, iter_id: int):
-    """Simulates collecting a new batch of data for a task/iteration."""
-    if not state.recap_workspace:
-        return {"error": "RECAP workspace not configured"}
-
-    if not task_name:
-        return {"error": "Missing task_name"}
-
-    # Create target directory
-    import time
-    timestamp = int(time.time())
-    data_id = f"data.batch_{timestamp}"
-    target_dir = state.recap_workspace / task_name / str(iter_id) / data_id
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy 2 random videos from video-rollout as mock data
-    try:
-        generate_trajectories(target_dir, num_episodes=2)
-    except Exception as e:
-        print(f"Simulate collection API: failed to generate trajectories: {e}")
-
-    return {"status": "ok", "task_name": task_name, "iter_id": iter_id, "data_id": data_id}

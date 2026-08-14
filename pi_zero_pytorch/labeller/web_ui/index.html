@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="/ui/styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 
 <body>
@@ -32,12 +32,15 @@
                     <span id="label-status-icon"></span>
                     <span class="filename" id="current-filename">Select a video</span>
                     <button id="reset-btn" class="btn-reset" title="Reset labelling">↺</button>
+                    <button id="step-prev-btn" class="btn-reset" title="Previous frame (←)">◀</button>
+                    <button id="step-next-btn" class="btn-reset" title="Next frame (→)">▶</button>
                     <span class="badge" id="current-frames">0 frames</span>
                     <span id="intervention-badge" class="badge"
                         style="display: none; background: #a855f7; color: white;">Expert Intervention</span>
                     <span id="current-task" class="task-badge"></span>
                     <span id="label-time-container" class="tiny-label"></span>
                 </div>
+                <span class="keyboard-hint">Space play/pause · ← → frame · S/F label · I intervene</span>
             </div>
 
             <div class="header-row header-row-2">
@@ -322,7 +325,7 @@
         </div>
     </div>
 
-    <script src="/ui/app.js"></script>
+    <script type="module" src="/ui/js/main.js"></script>
 </body>
 
 </html>

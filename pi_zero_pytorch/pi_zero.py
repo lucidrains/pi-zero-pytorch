@@ -419,6 +419,25 @@ class SigLIP(Module):
 
 # classes
 
+def mps_compatible(fn):
+    @wraps(fn)
+    def inner(*args, **kwargs):
+        device = kwargs.get('device')
+        use_mps = exists(device) and torch.device(device).type == 'mps'
+
+        if use_mps:
+            kwargs.update(device = 'cpu')
+
+        out = fn(*args, **kwargs)
+
+        if use_mps:
+            out = out.to(device)
+
+        return out
+
+    return inner
+
+@mps_compatible  # aten::_sample_dirichlet has no MPS kernel
 def default_sample_times(
     shape,
     s = 0.999,

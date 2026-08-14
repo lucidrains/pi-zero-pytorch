@@ -1,8 +1,9 @@
+import logging
 import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Union
 
 import cv2
 import numpy as np
@@ -10,6 +11,8 @@ import torch
 from memmap_replay_buffer import ReplayBuffer
 
 from .state import AppState
+
+logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = [".mp4", ".webm", ".avi", ".mov"]
 PROPRIO_KEYS = ['proprio', 'joint_state', 'qpos', 'robot_state', 'state']
@@ -25,15 +28,22 @@ def get_frame_count(video_path: Path) -> int:
 
 
 def extract_frames(video_path: Path, cache_path: Path):
-    if cache_path.exists() and any(cache_path.glob("*.jpg")):
+    # A `.complete` marker guarantees the extraction finished; otherwise a
+    # truncated cache (interrupted run) is rebuilt from scratch.
+    complete_marker = cache_path / ".complete"
+    if complete_marker.exists() and any(cache_path.glob("*.jpg")):
         return
 
+    shutil.rmtree(cache_path, ignore_errors=True)
     cache_path.mkdir(parents=True, exist_ok=True)
 
     output_pattern = str(cache_path / "frame_%04d.jpg")
     cmd = [
         "ffmpeg", "-i", str(video_path),
-        "-q:v", "2",
+        # Previews don't need full resolution or near-lossless quality;
+        # capping at 480px wide cuts extraction time and cache size several-fold.
+        "-vf", "scale=min(480\\,iw):-2",
+        "-q:v", "5",
         output_pattern,
         "-hide_banner", "-loglevel", "warning"
     ]
@@ -49,6 +59,9 @@ def extract_frames(video_path: Path, cache_path: Path):
             cv2.imwrite(str(cache_path / f"frame_{count:04d}.jpg"), frame)
             count += 1
         cap.release()
+
+    if any(cache_path.glob("*.jpg")):
+        complete_marker.touch()
 
 
 def get_video_path(state: AppState, filename: str) -> Path:
@@ -67,44 +80,42 @@ def get_video_path(state: AppState, filename: str) -> Path:
     return state.data_dir / filename
 
 
-def _scan_episodes(state: AppState, video_dirs: List[Path]):
+def _episode_from_name(filename: str):
+    """Split a video filename into (episode_name, view_idx).
+
+    Supports:
+      - episode_0.0.mp4 / episode_0.1.mp4  -> ("episode_0", 0) / ("episode_0", 1)
+      - episode_0.mp4                      -> ("episode_0", 0)
+      - data.0/episode_0.0.mp4             -> ("episode_0", 0)  (data.* folder)
+    """
+    stem = filename.rsplit(".", 1)[0]
+    parts = stem.rsplit(".", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0], int(parts[1])
+    return stem, 0
+
+
+def _scan_episodes(video_dirs: List[Path]):
     """Discover episodes (multi-view grouped videos) under the given directories."""
     episodes = {}
     for data_dir in video_dirs:
-        print(f"[RECAP] Scanning {data_dir} for videos...")
+        logger.info("scanning %s for videos", data_dir)
         found_in_dir = False
         for ext in VIDEO_EXTENSIONS:
-            for f in data_dir.rglob(f"*{ext}"):
+            for f in sorted(data_dir.rglob(f"*{ext}")):
                 found_in_dir = True
-                if f.parent.name.startswith("data."):
-                    parts = f.name.split('.')
-                    if len(parts) >= 3 and parts[-2].isdigit():
-                        ep_name = ".".join(parts[:-2])
-                        view_idx = int(parts[-2])
-                    else:
-                        ep_name = f.stem
-                        view_idx = 0
-                else:
-                    ep_name = f.parent.name
-                    try:
-                        view_idx = int(f.stem)
-                    except Exception:
-                        view_idx = 0
-
-                if ep_name not in episodes:
-                    episodes[ep_name] = {}
-                episodes[ep_name][view_idx] = f
-                print(f"[RECAP] Found video: {f} -> ep: {ep_name}, view: {view_idx}")
+                ep_name, view_idx = _episode_from_name(f.name)
+                episodes.setdefault(ep_name, {})[view_idx] = f
+                logger.debug("found video %s -> episode %s, view %d", f, ep_name, view_idx)
 
         if not found_in_dir:
-            print(f"[RECAP] WARNING: No videos found in {data_dir}")
+            logger.warning("no videos found in %s", data_dir)
     return episodes
 
 
 def _scan_proprio(state: AppState, video_dirs: List[Path]) -> int:
     """Load proprioception data from .npz files; returns the detected proprio dim."""
     proprio_dim = 0
-    print("[RECAP] Initializing proprio_dim tracking...")
     for data_dir in video_dirs:
         for npz_file in data_dir.rglob("*.npz"):
             try:
@@ -121,15 +132,15 @@ def _scan_proprio(state: AppState, video_dirs: List[Path]) -> int:
                                 proprio_dim = max(proprio_dim, 1)
                             else:
                                 proprio_dim = max(proprio_dim, proprio_array.shape[-1])
-                            print(f"[RECAP] Loaded proprio for {ep_name}: shape={proprio_array.shape}")
+                            logger.info("loaded proprio for %s: shape=%s", ep_name, proprio_array.shape)
                         break
-            except Exception as e:
-                print(f"[RECAP] Failed to load proprio from {npz_file}: {e}")
-    print(f"[RECAP] Final detected proprio_dim: {proprio_dim}")
+            except Exception:
+                logger.exception("failed to load proprio from %s", npz_file)
+    logger.info("detected proprio_dim: %d", proprio_dim)
     return proprio_dim
 
 
-def _store_episode(state: AppState, episodes, ep_name: str, ep_proprio, num_views: int, proprio_dim: int, max_frames: int, h, w, c):
+def _store_episode(state: AppState, episodes, ep_name: str, ep_proprio, num_views: int, proprio_dim: int, h, w, c):
     view_paths = [episodes[ep_name].get(v) for v in range(num_views)]
     view_paths = [p if p else view_paths[0] for p in view_paths]
 
@@ -138,7 +149,7 @@ def _store_episode(state: AppState, episodes, ep_name: str, ep_proprio, num_view
         with state.replay_buffer.one_episode(task_id=torch.tensor(-1)):
             for t_idx in range(32):
                 store_kwargs = dict(
-                    images=torch.randn(c, num_views, h, w),
+                    images=torch.randint(0, 256, (c, num_views, h, w), dtype=torch.uint8),
                     text=torch.zeros(32, dtype=torch.long),
                     internal=torch.randn(32),
                     actions=torch.randn(16, 6),
@@ -154,7 +165,7 @@ def _store_episode(state: AppState, episodes, ep_name: str, ep_proprio, num_view
                     store_kwargs['proprio'] = torch.zeros(proprio_dim)
 
                 state.replay_buffer.store(**store_kwargs)
-        print(f"[RECAP] FAST_MOCK: episode {ep_name} done in {time.time() - start_mock:.4f}s")
+        logger.info("fast_mock: episode %s stored in %.4fs", ep_name, time.time() - start_mock)
         return
 
     caps = [cv2.VideoCapture(str(p)) for p in view_paths]
@@ -167,7 +178,9 @@ def _store_episode(state: AppState, episodes, ep_name: str, ep_proprio, num_view
                 if not ret:
                     break
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
+                # Store uint8 (0-255) instead of float32: 4x smaller buffers,
+                # faster writes; normalized to [0,1] at training time.
+                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).contiguous()
                 frames.append(frame_tensor)
             if len(frames) < len(caps):
                 break
@@ -200,24 +213,24 @@ def init_replay_buffer(state: AppState, video_dirs: Union[List[Path], Path]):
     state.video_to_path.clear()
     state.video_to_proprio.clear()
 
-    print(f"[RECAP] init_replay_buffer started with {video_dirs}")
+    logger.info("init_replay_buffer started with %s", video_dirs)
     state.conversion_status["is_converting"] = True
     state.conversion_status["progress"] = 0
 
     try:
-        tmp_buffer_dir = Path("tmp/replay_buffer")
-        if tmp_buffer_dir.exists():
-            shutil.rmtree(tmp_buffer_dir)
-        tmp_buffer_dir.mkdir(parents=True, exist_ok=True)
+        buffer_dir = state.buffer_dir
+        if buffer_dir.exists():
+            shutil.rmtree(buffer_dir)
+        buffer_dir.mkdir(parents=True, exist_ok=True)
 
         if isinstance(video_dirs, Path):
             video_dirs = [video_dirs]
 
-        episodes = _scan_episodes(state, video_dirs)
+        episodes = _scan_episodes(video_dirs)
         episode_names = sorted(episodes.keys())
 
         if not episode_names:
-            print("No valid video files found")
+            logger.warning("no valid video files found")
             return
 
         num_views = 0
@@ -226,7 +239,7 @@ def init_replay_buffer(state: AppState, video_dirs: Union[List[Path], Path]):
 
         num_views = max(1, num_views)
         state.num_views = num_views
-        print(f"[RECAP] Detected {len(episode_names)} episodes with {num_views} view(s).")
+        logger.info("detected %d episodes with %d view(s)", len(episode_names), num_views)
 
         proprio_dim = _scan_proprio(state, video_dirs)
 
@@ -241,7 +254,7 @@ def init_replay_buffer(state: AppState, video_dirs: Union[List[Path], Path]):
                 break
 
         if h is None:
-            print("Could not read any video files")
+            logger.warning("could not read any video files")
             return
 
         for ep_name in episode_names:
@@ -249,7 +262,7 @@ def init_replay_buffer(state: AppState, video_dirs: Union[List[Path], Path]):
                 max_frames = max(max_frames, get_frame_count(vf))
 
         fields = dict(
-            images=('float', (c, num_views, h, w)),
+            images=('uint8', (c, num_views, h, w)),
             text=('int', (32,)),
             internal=('float', (32,)),
             actions=('float', (16, 6)),
@@ -265,7 +278,7 @@ def init_replay_buffer(state: AppState, video_dirs: Union[List[Path], Path]):
             fields['proprio'] = ('float', (proprio_dim,))
 
         state.replay_buffer = ReplayBuffer(
-            str(tmp_buffer_dir),
+            str(buffer_dir),
             max_episodes=len(episode_names),
             max_timesteps=max_frames,
             meta_fields=dict(
@@ -296,12 +309,10 @@ def init_replay_buffer(state: AppState, video_dirs: Union[List[Path], Path]):
             if ep_proprio:
                 ep_proprio = torch.tensor(ep_proprio)
 
-            _store_episode(state, episodes, ep_name, ep_proprio, num_views, proprio_dim, max_frames, h, w, c)
-    except Exception as e:
-        print(f"[RECAP] ERROR in init_replay_buffer: {e}")
-        import traceback
-        traceback.print_exc()
+            _store_episode(state, episodes, ep_name, ep_proprio, num_views, proprio_dim, h, w, c)
+    except Exception:
+        logger.exception("init_replay_buffer failed")
     finally:
         state.conversion_status["is_converting"] = False
         state.conversion_status["progress"] = len(state.video_to_episode) if state.replay_buffer is not None else 0
-        print("ReplayBuffer initialization complete.")
+        logger.info("ReplayBuffer initialization complete")

@@ -261,7 +261,7 @@ class RecapSimEngine:
             if self.fast_mock:
                 values = np.where(np.isnan(returns_np), -0.5 + 0.1 * np.random.randn(max_t), returns_np + 0.05 * np.random.randn(max_t))
             else:
-                imgs = torch.from_numpy(self.replay_buffer.data["images"][eid, :max_t]).float()
+                imgs = torch.from_numpy(self.replay_buffer.data["images"][eid, :max_t]).float().div_(255.0)
                 with torch.no_grad():
                     values = self.value_network(imgs.to(self.device)).cpu().numpy()
 
@@ -356,7 +356,7 @@ class RecapSimEngine:
 
         trainer = RecapValueTrainer(self.value_network, device=self.device)
         # Train on first episode buffer tensors
-        imgs = torch.from_numpy(self.replay_buffer.data["images"][0, :16]).float()
+        imgs = torch.from_numpy(self.replay_buffer.data["images"][0, :16]).float().div_(255.0)
         rets = torch.nan_to_num(torch.from_numpy(self.replay_buffer.data["returns"][0, :16]).float(), 0.0)
         return trainer.train_epoch(imgs, rets)
 

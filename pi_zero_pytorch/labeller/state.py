@@ -56,6 +56,7 @@ def default_training_state() -> Dict[str, Any]:
 class AppState:
     video_dirs: List[Path] = field(default_factory=list)
     cache_dir: Path = field(default_factory=lambda: Path(".cache/frames"))
+    buffer_dir: Path = field(default_factory=lambda: Path("tmp/replay_buffer"))
     data_dir: Path = field(default_factory=lambda: Path("data"))
     replay_buffer: Any = None
     video_to_episode: Dict[str, int] = field(default_factory=dict)
