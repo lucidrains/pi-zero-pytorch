@@ -86,7 +86,12 @@ def create_tiny_lerobot():
         vlm_cfg_hf.text_config.num_hidden_layers = vlm_config.depth
         vlm_cfg_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
         vlm_cfg_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        vlm_cfg_hf.text_config.torch_dtype = "float32"
+        if hasattr(vlm_cfg_hf.text_config, "dtype"):
+            # transformers >= 4.56: `dtype` is the replacement for `torch_dtype`
+            vlm_cfg_hf.text_config.dtype = "float32"
+        else:
+            # transformers < 4.56: fall back to `torch_dtype`
+            vlm_cfg_hf.text_config.torch_dtype = "float32"
         vlm_cfg_hf.text_config.vocab_size = VOCAB_SIZE
 
         vlm_cfg_hf.vision_config.hidden_size = SIGLIP_DIM
@@ -97,7 +102,12 @@ def create_tiny_lerobot():
         vlm_cfg_hf.vision_config.patch_size = PATCH_SIZE
         vlm_cfg_hf.vision_config.projection_dim = DIM
         vlm_cfg_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_cfg_hf.vision_config.torch_dtype = "float32"
+        if hasattr(vlm_cfg_hf.vision_config, "dtype"):
+            # transformers >= 4.56: `dtype` is the replacement for `torch_dtype`
+            vlm_cfg_hf.vision_config.dtype = "float32"
+        else:
+            # transformers < 4.56: fall back to `torch_dtype`
+            vlm_cfg_hf.vision_config.torch_dtype = "float32"
 
         exp_cfg_hf = CONFIG_MAPPING["gemma"](
             head_dim = action_expert_config.head_dim,
