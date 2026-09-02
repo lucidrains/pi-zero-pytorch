@@ -618,7 +618,7 @@ class RTCGuidance(Module):
 
         r_tau_squared = (1 - times).square() / (times.square() + (1 - times).square())
 
-        guidance_weight = min(beta, (1 - times) / (times * r_tau_squared).clamp_min(eps))
+        guidance_weight = torch.minimum(beta, (1 - times) / (times * r_tau_squared).clamp_min(eps))
 
         if guidance_weight.ndim == 1:
             guidance_weight = rearrange(guidance_weight, 'b -> b 1 1')

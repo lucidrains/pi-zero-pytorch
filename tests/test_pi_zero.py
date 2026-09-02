@@ -273,6 +273,35 @@ def test_self_contained_rtc_guidance():
 
     assert flow_with_guidance.shape == actions.shape
 
+def test_rtc_guidance_supports_batched_times():
+    from pi_zero_pytorch import RTCGuidance
+
+    # The guidance cap is applied independently to every diffusion sample.
+    # A Python ``min`` cannot compare a scalar tensor with a batched tensor,
+    # so this also guards the batched inference path used by action policies.
+    batch = 3
+    noise_actions = torch.ones(batch, 2, 1, requires_grad = True)
+    pred_actions = noise_actions * 2.
+    frozen_actions = torch.zeros_like(pred_actions)
+    times = torch.tensor([0.1, 0.25, 0.5])
+
+    guidance = RTCGuidance(guidance_weight_beta = 5.).forward(
+        noise_actions,
+        pred_actions,
+        frozen_actions,
+        times,
+        soft_mask = torch.ones(2)
+    )
+
+    # The unclamped weights are [9.111..., 10 / 3, 2], and the first
+    # sample is capped at beta.  The VJP for pred_actions = 2 * noise_actions
+    # is -4 for each element in this setup.
+    expected_weights = torch.tensor([5., 10. / 3., 2.]).view(batch, 1, 1)
+    expected_guidance = -4. * expected_weights
+
+    assert guidance.shape == noise_actions.shape
+    assert torch.allclose(guidance, expected_guidance, atol = 1e-5, rtol = 1e-5)
+
 @param('critic_use_discrete_bins', (False, True))
 @param('value_clip', (False, True))
 def test_value(
