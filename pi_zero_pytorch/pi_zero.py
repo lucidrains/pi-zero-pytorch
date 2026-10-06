@@ -1071,6 +1071,16 @@ class JointAttention(Module):
                 # where True means can attend. PiZero's causal_mask is inverted (True = masked out).
                 # So: causal_mask = NOT(cumsum_k <= cumsum_q) = cumsum_k > cumsum_q
                 causal_mask = cumsum.unsqueeze(-2) > cumsum.unsqueeze(-1)  # [b, Q, K]
+                base_causal = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+                
+                if multimodal_prefix_bidirectional_length > 0:
+                    start = multimodal_prefix_bidirectional_start
+                    end = start + multimodal_prefix_bidirectional_length
+                    base_causal[start:end, start:end] = False
+                    
+                mask_segment_0 = (cumsum.unsqueeze(-1) == 0) & (cumsum.unsqueeze(-2) == 0)
+                causal_mask = causal_mask | (base_causal & mask_segment_0)
+
                 causal_mask = causal_mask.unsqueeze(1) # [b, 1, Q, K]
 
             elif multimodal_prefix_bidirectional_length > 0:
@@ -2027,7 +2037,7 @@ class PiZero(Module):
             state_attn_out = attn.forward_only_vision_language(
                 state_tokens,
                 num_visual_tokens = num_visual_tokens,  # Only visual tokens are bidirectional
-                is_prefix = True,   # Only bidirectional attend to visual tokens (prefix-LM attention)
+                is_prefix = False,   # Only bidirectional attend to visual tokens (prefix-LM attention)
                 rotary_emb = rotary_emb
             )
 
@@ -2557,7 +2567,8 @@ class PiZero(Module):
         multimodal_prefix_bidirectional_start = 0
 
         if not inferencing:
-            multimodal_prefix_bidirectional_length = state_tokens.shape[-2]
+            # We want visual tokens (and anything before them: read memories, external states) bidirectional, language causal
+            multimodal_prefix_bidirectional_length = past_recurrent_memory_tokens.shape[-2] + external_state_tokens.shape[-2] + visual_tokens.shape[-2]
             multimodal_prefix_bidirectional_start = 0
 
         # prepare maybe flex attention
