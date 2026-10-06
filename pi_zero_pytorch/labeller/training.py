@@ -9,6 +9,7 @@ import torchvision.transforms.functional as TF
 import tqdm
 
 from pi_zero_pytorch.pi_zero import calc_generalized_advantage_estimate
+from torch_einops_utils.shape import shape, size
 
 from .errors import ApiError
 from .networks import PI_ZERO_CONFIGS, VALUE_NETWORK_CONFIGS, SmallPiZero, SmallValueNetwork
@@ -42,7 +43,7 @@ def _prepare_images(images: torch.Tensor, device: torch.device, target_size) -> 
     images = images.to(device).float().div_(255.0)
     if images.ndim == 5:
         images = images[:, :, 0, :, :]
-    if images.shape[-2:] != target_size:
+    if tuple(shape(images, '... [h w]')) != tuple(target_size):
         images = TF.resize(images, target_size, antialias=True)
     return images
 
@@ -189,7 +190,7 @@ def train_policy_network_thread(state: AppState, config_name: str, loop: asyncio
         tensors = [torch.cat(columns[name]) for name in field_names]
         dataset = torch.utils.data.TensorDataset(*tensors)
         if has_proprio:
-            proprio_dim = tensors[-1].shape[-1]
+            proprio_dim = size(tensors[-1], '... [d]')
 
     loader = torch.utils.data.DataLoader(dataset, batch_size=4, shuffle=True)
 
@@ -275,7 +276,7 @@ async def _calculate_episode_value_internal(state: AppState, episode_id: int, fi
             batch_images = _prepare_images(batch_images, state.device, target_size)
             values.extend(model(batch_images).cpu().tolist())
 
-    final_values = torch.full((images.shape[0],), float('nan'))
+    final_values = torch.full((size(images, '[b] ...'),), float('nan'))
     final_values[:len(values)] = torch.tensor(values)
     state.replay_buffer.data['value'][episode_id] = final_values.numpy()
     state.replay_buffer.store_meta_datapoint(episode_id, 'invalidated', False)

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pi_zero_pytorch.pi_zero import SigLIP, BinnedValueLayer, PiZero
+from torch_einops_utils.shape import shape, size
 
 
 def exists(val):
@@ -46,18 +47,18 @@ class SmallValueNetwork(nn.Module):
 
     def forward(self, images: torch.Tensor, return_value_and_logits: bool = False):
         if images.ndim == 5:
-            if images.shape[2] == 1:
+            if size(images, 'b c [f] ...') == 1:
                 images = images.squeeze(2)
-            elif images.shape[1] == 1:
+            elif size(images, 'b [f] c ...') == 1:
                 images = images.squeeze(1)
             else:
                 b, n, c, h, w = images.shape
                 images = images.view(b * n, c, h, w)
 
-        if images.ndim == 4 and images.shape[1] == 1:
+        if images.ndim == 4 and size(images, 'b [c] ...') == 1:
             images = images.repeat(1, 3, 1, 1)
 
-        if images.shape[-2:] != (self.image_size, self.image_size):
+        if tuple(shape(images, '... [h w]')) != (self.image_size, self.image_size):
             images = F.interpolate(images, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
 
         embeds = self.siglip(images)

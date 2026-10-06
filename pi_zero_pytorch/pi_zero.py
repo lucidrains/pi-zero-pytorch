@@ -75,6 +75,11 @@ from torch_einops_utils import (
     masked_mean
 )
 
+from torch_einops_utils.shape import (
+    shape,
+    size
+)
+
 # ein notation
 
 # b - batch
@@ -404,7 +409,7 @@ class SigLIP(Module):
 
     def forward(self, x):
         x = self.to_patch_embed(x)
-        num_patches = x.shape[1]
+        num_patches = size(x, 'b [n] ...')
 
         x = x + self.pos_embed[:num_patches]
 
@@ -505,7 +510,7 @@ class SoftMaskInpainter(Module):
         frozen_actions: Tensor # float[b nfa d]
     ):
         traj_len = self.trajectory_length
-        frozen_len = frozen_actions.shape[1]
+        frozen_len = size(frozen_actions, 'b [nfa] ...')
 
         if frozen_len >= traj_len:
             return frozen_actions[:, -traj_len:]
@@ -749,7 +754,6 @@ class JointAttention(Module):
 
         self.q_kv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
         self.actions_qkvg_split = (dim_inner, dim_kv_inner, dim_kv_inner, dim_inner)
-        self.mem_qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner, dim_inner, dim_kv_inner, dim_kv_inner)
 
         # action input/output dimension defaults to state dimension for backwards compatibility
         dim_action = default(dim_action, dim)
@@ -851,7 +855,7 @@ class JointAttention(Module):
         # concat cache key / values with action key / values
 
         if exists(rotary_emb):
-            action_len = aq.shape[-2]
+            action_len = size(aq, '... [na] d')
             rotary_emb_actions = rotary_emb[..., -action_len:, :]
 
             q = apply_rotary_pos_emb(rotary_emb_actions, q)
@@ -879,8 +883,8 @@ class JointAttention(Module):
                 sim = einx.where('b j, b h i j, -> b h i j', mask, sim, max_neg_value(sim))
 
             if discretized_action_length > 0:
-                m_len = mk.shape[-2]
-                discretized_action_mask = torch.zeros(sim.shape[-1], dtype = torch.bool, device = actions.device)
+                m_len = size(mk, '... [n] d')
+                discretized_action_mask = torch.zeros(size(sim, '... [j]'), dtype = torch.bool, device = actions.device)
                 discretized_action_mask[(m_len - discretized_action_length):m_len] = True
 
                 sim = sim.masked_fill(discretized_action_mask, max_neg_value(sim))
@@ -938,7 +942,7 @@ class JointAttention(Module):
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
-        causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+        causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
 
         if is_prefix:
             causal_mask.fill_(False)
@@ -974,7 +978,7 @@ class JointAttention(Module):
         discretized_action_length = 0
     ):
         
-        multimodal_len = multimodal_seq.shape[-2] if exists(multimodal_seq) else 0
+        multimodal_len = size(multimodal_seq, '... [n] d') if exists(multimodal_seq) else 0
         device = multimodal_seq.device if exists(multimodal_seq) else actions.device
 
         if exists(multimodal_seq):
@@ -1028,10 +1032,12 @@ class JointAttention(Module):
         if has_memories:
             memories, unpack_memories = pack_with_inverse(memories, 'b * d')
             memories = self.mem_rmsnorm(memories)
-            mqkv_res = self.to_mem_qkv(memories).split(self.mem_qkv_split, dim = -1)
-            mqr, mkr, mvr, mqw, mkw, mvw = mqkv_res
 
-            mqr, mkr, mvr, mqw, mkw, mvw = tuple(self.split_heads(t) for t in (mqr, mkr, mvr, mqw, mkw, mvw))
+            mqkv = self.to_mem_qkv(memories)
+            mqkv_read, mqkv_write = unpack_memories(mqkv, 'b * d')
+
+            mqr, mkr, mvr = tuple(self.split_heads(t) for t in mqkv_read.split(self.q_kv_split, dim = -1))
+            mqw, mkw, mvw = tuple(self.split_heads(t) for t in mqkv_write.split(self.q_kv_split, dim = -1))
 
             k = cat((mkr, k, mkw), dim = -2)
             v = cat((mvr, v, mvw), dim = -2)
@@ -1071,7 +1077,7 @@ class JointAttention(Module):
                 # where True means can attend. PiZero's causal_mask is inverted (True = masked out).
                 # So: causal_mask = NOT(cumsum_k <= cumsum_q) = cumsum_k > cumsum_q
                 causal_mask = cumsum.unsqueeze(-2) > cumsum.unsqueeze(-1)  # [b, Q, K]
-                base_causal = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+                base_causal = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
                 
                 if multimodal_prefix_bidirectional_length > 0:
                     start = multimodal_prefix_bidirectional_start
@@ -1086,15 +1092,15 @@ class JointAttention(Module):
             elif multimodal_prefix_bidirectional_length > 0:
                 start = multimodal_prefix_bidirectional_start
                 end = start + multimodal_prefix_bidirectional_length
-                causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+                causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
                 causal_mask[start:end, start:end] = False
                 causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # [1, 1, i, j]
             else:
-                causal_mask = torch.ones(sim.shape[-2:], dtype = torch.bool, device = device).triu(1)
+                causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
                 causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # [1, 1, i, j]
 
             if exists(mask):
-                causal_mask = causal_mask | (~mask.view(actions.shape[0], 1, 1, -1))
+                causal_mask = causal_mask | (~mask.view(size(actions, '[b] ...'), 1, 1, -1))
 
             if not exists(ar_mask) and discretized_action_length > 0:
                 causal_mask[..., seq_len:, (seq_len - discretized_action_length):seq_len] = True
@@ -1108,7 +1114,7 @@ class JointAttention(Module):
         # optional gating of values - use (1 + gates) so zero-init produces identity
 
         if self.attn_value_gating and exists(ag):
-            gates = pad_at_dim(1. + ag, (out.shape[-2] - ag.shape[-2], 0), value = 1., dim = -2)
+            gates = pad_at_dim(1. + ag, (size(out, '... [n] d') - size(ag, '... [n] d'), 0), value = 1., dim = -2)
             out = out * gates
 
         # split out memories
@@ -1742,7 +1748,7 @@ class PiZero(Module):
     ):
         assert not self.is_critic
 
-        batch_size = token_ids.shape[0]
+        batch_size = size(token_ids, '[b] ...')
 
         was_training = self.training
         self.eval()
@@ -1765,7 +1771,7 @@ class PiZero(Module):
         if inpaint_actions:
             soft_mask_inpainter = self.soft_mask_inpainter
 
-            frozen_action_input_len = frozen_actions.shape[1]
+            frozen_action_input_len = size(frozen_actions, 'b [nfa] ...')
 
             if not exists(soft_mask_inpainter):
                 soft_mask_lens = default(soft_mask_lens, (frozen_action_input_len, 0, trajectory_length - frozen_action_input_len))
@@ -2021,7 +2027,7 @@ class PiZero(Module):
         ], 'b * d')
 
         # rotary embeddings
-        seq_len = state_tokens.shape[-2]
+        seq_len = size(state_tokens, '... [n] d')
         seq = torch.arange(seq_len, device = device)
         rotary_emb = self.rotary_emb(seq)
 
@@ -2030,7 +2036,7 @@ class PiZero(Module):
         if not self.pi05:
             state_tokens = state_tokens * self.token_scale
         
-        num_visual_tokens = visual_tokens.shape[-2]
+        num_visual_tokens = size(visual_tokens, '... [nv] d')
 
         for attn, ff, _, _ in self.layers:
 
@@ -2086,7 +2092,7 @@ class PiZero(Module):
         fpo_loss_fn = F.huber_loss,
         **kwargs,
     ):
-        batch = actions.shape[0]
+        batch = size(actions, '[b] ...')
 
         assert not self.is_critic
         assert 'return_actions_flow' not in kwargs
@@ -2238,7 +2244,7 @@ class PiZero(Module):
         if not exists(actions) and not self.is_critic:
             return self.sample_actions(images, token_ids, joint_state, **kwargs)
 
-        batch, orig_actions, device = token_ids.shape[0], actions, token_ids.device
+        batch, orig_actions, device = size(token_ids, '[b] ...'), actions, token_ids.device
 
         # noising the action for flow matching
 
@@ -2273,7 +2279,7 @@ class PiZero(Module):
             # actually not as simple as the paper makes it seem, as time conditioning is expanded a dimension
 
             if self.train_time_rtc:
-                action_len = actions.shape[-2]
+                action_len = size(actions, '... [na] da')
 
                 rand_prefix_len = torch.randint(0, self.train_time_rtc_max_delay, (batch,), device = device)
                 action_prefix_mask = lens_to_mask(rand_prefix_len, action_len)
@@ -2352,7 +2358,7 @@ class PiZero(Module):
 
         memory_tokens = (past_recurrent_memory_tokens, write_memory_tokens)
 
-        # mem_length = past_recurrent_memory_tokens.shape[-2] + write_memory_tokens.shape[-2]
+        # mem_length = size(past_recurrent_memory_tokens, '... [nm] d') + size(write_memory_tokens, '... [nm] d')
 
         # pack into [action registers] [internal + joint states] [actions]
 
@@ -2363,12 +2369,12 @@ class PiZero(Module):
             action_tokens
         ], 'b * d')
 
-        action_with_registers_length = action_tokens.shape[-2]
+        action_with_registers_length = size(action_tokens, '... [n] da')
 
         # take care of padding time conditioning if doing training rtc
 
         if exists(time_cond) and time_cond.ndim == 3:
-            orig_action_len = orig_actions.shape[-2]
+            orig_action_len = size(orig_actions, '... [na] da')
             time_cond = pad_at_dim(time_cond, (action_with_registers_length - orig_action_len, 0), dim = -2)
 
         state_tokens = None
@@ -2378,7 +2384,7 @@ class PiZero(Module):
         if exists(actions) and self.predict_discretized_action_aux_loss:
             discrete_action_ids = self.discretized_action_tokenizer(actions)
             discrete_action_ids = pad_sequence([tensor(ids) for ids in discrete_action_ids], value = -1)
-            discretized_action_length = discrete_action_ids.shape[-1]
+            discretized_action_length = size(discrete_action_ids, '... [na]')
 
         if not inferencing:
             # language
@@ -2507,17 +2513,17 @@ class PiZero(Module):
 
         # which then leads to proper rotary embeddings
 
-        command_length = token_ids.shape[-1]
+        command_length = size(token_ids, '... [nt]')
 
         language_mask = token_ids != self.lm_pad_id
 
         if inferencing:
-            state_length = cached_state_keys_values[0][0].shape[-2]
+            state_length = size(cached_state_keys_values[0][0], '... [n] d')
         else:
-            state_length = state_tokens.shape[-2]
+            state_length = size(state_tokens, '... [n] d')
 
         mask = F.pad(language_mask, (state_length - command_length, action_with_registers_length), value = True)
-        mask = F.pad(mask, (past_recurrent_memory_tokens.shape[-2], write_memory_tokens.shape[-2]), value = True)
+        mask = F.pad(mask, (size(past_recurrent_memory_tokens, '... [nm] d'), size(write_memory_tokens, '... [nm] d')), value = True)
 
         # construct ar_mask for segment based bidirectional attention
 
@@ -2525,13 +2531,13 @@ class PiZero(Module):
 
         if not inferencing:
             # prefix segment (0)
-            prefix_len = state_length
+            prefix_len = state_length + size(past_recurrent_memory_tokens, '... [nm] d')
             
             # registers + state + internal_state
             
-            num_registers = self.action_register_tokens.shape[-2]
-            num_joint_state = joint_state_tokens.shape[-2]
-            num_internal_state = internal_state_tokens.shape[-2]
+            num_registers = size(self.action_register_tokens, '... [n] d')
+            num_joint_state = size(joint_state_tokens, '... [n] da')
+            num_internal_state = size(internal_state_tokens, '... [n] da')
 
             # prefix ends at state_length
             
@@ -2542,17 +2548,17 @@ class PiZero(Module):
                 # - rest of actions: cumsum=2, all bidirectional within segment
                 
                 # Segment 1: joint_state
-                if (prefix_len + num_registers) < ar_mask.shape[-1]:
+                if (prefix_len + num_registers) < size(ar_mask, '... [n]'):
                     ar_mask[:, prefix_len + num_registers] = 1
                 
                 # Segment 2: first action token
                 first_action_pos = prefix_len + num_registers + num_joint_state + num_internal_state
-                if first_action_pos < ar_mask.shape[-1]:
+                if first_action_pos < size(ar_mask, '... [n]'):
                     ar_mask[:, first_action_pos] = 1
             else:
                 # PI0.5: Segment 1 starts at beginning of suffix (registers + actions)
                 suffix_start = prefix_len
-                if suffix_start < ar_mask.shape[-1]:
+                if suffix_start < size(ar_mask, '... [n]'):
                     ar_mask[:, suffix_start] = 1
 
         # rotary embeddings
@@ -2568,7 +2574,7 @@ class PiZero(Module):
 
         if not inferencing:
             # We want visual tokens (and anything before them: read memories, external states) bidirectional, language causal
-            multimodal_prefix_bidirectional_length = past_recurrent_memory_tokens.shape[-2] + external_state_tokens.shape[-2] + visual_tokens.shape[-2]
+            multimodal_prefix_bidirectional_length = size(past_recurrent_memory_tokens, '... [nm] d') + size(external_state_tokens, '... [n] d') + size(visual_tokens, '... [nv] d')
             multimodal_prefix_bidirectional_start = 0
 
         # prepare maybe flex attention
@@ -2577,8 +2583,8 @@ class PiZero(Module):
 
         if not inferencing and self.use_flex_attn and state_tokens.is_cuda:
 
-            prefix_length = state_tokens.shape[-2]
-            seq_len = prefix_length + action_tokens.shape[-2]
+            prefix_length = size(state_tokens, '... [n] d')
+            seq_len = prefix_length + size(action_tokens, '... [n] da')
 
             block_mask = create_block_mask(
                 create_pizero_attn_mask(
@@ -2784,7 +2790,7 @@ class PiZero(Module):
         if self.layer_time_cond:
             curr_time_cond = time_cond
             if curr_time_cond.ndim == 3:
-                curr_time_cond = curr_time_cond[:, -action_tokens.shape[-2]:]
+                curr_time_cond = curr_time_cond[:, -size(action_tokens, '... [n] da'):]
 
             action_embeds, _ = self.final_actions_norm(action_tokens, curr_time_cond, return_gate = True)
         else:
@@ -3994,7 +4000,7 @@ class PiZeroSix(Module):
 
         for batch in dataloader:
             indices = batch.pop('_indices')
-            batch_size = indices.shape[0]
+            batch_size = size(indices, '[b] ...')
 
             batch = tree_map_tensor(batch, lambda t: t.to(device))
 
@@ -4126,7 +4132,7 @@ class PiZeroSix(Module):
 
             if has_lookahead:
 
-                lookahead = min(lookahead, advantages.shape[-1])
+                lookahead = min(lookahead, size(advantages, '... [t]'))
 
                 gamma_nth_step = gamma ** lookahead
 
@@ -4210,7 +4216,7 @@ class PiZeroSix(Module):
                 dest_indices = indices
 
             # maybe sample from all advantages
-            total_samples = indices.shape[0]
+            total_samples = size(indices, '[b] ...')
 
             if total_samples == 0:
                 continue
