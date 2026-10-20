@@ -1102,8 +1102,12 @@ class JointAttention(Module):
             if exists(mask):
                 causal_mask = causal_mask | (~mask.view(size(actions, '[b] ...'), 1, 1, -1))
 
-            if not exists(ar_mask) and discretized_action_length > 0:
-                causal_mask[..., seq_len:, (seq_len - discretized_action_length):seq_len] = True
+            if discretized_action_length > 0:
+                # action side must not attend to the FAST tokens at the end of the multimodal prefix - they are the ground truth and absent at inference
+                mem_read_len = size(mkr, '... [n] d') if has_memories else 0
+                fast_end = mem_read_len + multimodal_len
+                fast_start = fast_end - discretized_action_length
+                causal_mask[..., fast_end:, fast_start:fast_end] = True
 
             sim = sim.masked_fill(causal_mask, max_neg_value(sim))
 
