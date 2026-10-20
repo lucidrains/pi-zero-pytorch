@@ -25,7 +25,7 @@ from numpy import ndarray
 
 import torch
 import torch.nn.functional as F
-from torch import pi, nn, arange, cat, stack, tensor, Tensor, broadcast_tensors, is_tensor, full, from_numpy
+from torch import pi, nn, arange, cat, stack, tensor, as_tensor, Tensor, broadcast_tensors, is_tensor, full, from_numpy
 from torch.nn import Module, ModuleList
 from torch.distributions.beta import Beta
 
@@ -127,26 +127,29 @@ def create_pizero_attn_mask(
     prefix_causal_length,
     mask: Tensor, # bool[b n]
     prefix_bidirectional_length = 0,
-    prefix_bidirectional_start = 0,
     discretized_action_length = 0
 ):
     # the pi-zero attention is a triangular causal mask, but bidirectional attention for the actions at the very right hand side
 
+    fast_start = prefix_causal_length - discretized_action_length
+
     def mask_fn(batch_index, head_index, query_index, key_index):
-        key_mask = mask[batch_index, key_index]   # variable length states
-        causal_mask = query_index >= key_index    # causal
+        key_mask = mask[batch_index, key_index]                        # variable length states
+        causal_mask = query_index >= key_index                         # causal
+        is_prefix = key_index < prefix_bidirectional_length            # bidirectional prefix (vision, etc)
 
-        is_prefix = (
-            key_index >= prefix_bidirectional_start and
-            key_index < (prefix_bidirectional_start + prefix_bidirectional_length)
+        bidirectional_action_mask = (                                  # bidirectional action mask
+            (key_index >= prefix_causal_length) &
+            (query_index >= prefix_causal_length)
         )
 
-        bidirectional_action_mask = (             # bidirectional action mask
-            key_index >= prefix_causal_length and
-            query_index >= prefix_causal_length
+        action_ignore_fast = (
+            (query_index >= prefix_causal_length) &
+            (key_index >= fast_start) &
+            (key_index < prefix_causal_length)
         )
 
-        return key_mask & (is_prefix | (causal_mask & ~action_ignore_discretized_tokens) | bidirectional_action_mask)
+        return key_mask & (is_prefix | (causal_mask & ~action_ignore_fast) | bidirectional_action_mask)
 
     return mask_fn
 
@@ -818,8 +821,7 @@ class JointAttention(Module):
         mask: Tensor | None = None, # bool[b n]
         return_keys_values = False,
         flex_attn_fn: Callable | None = None,
-        knowledge_insulate = False,
-        discretized_action_length = 0
+        knowledge_insulate = False
     ):
 
         aq, ak, av = self.to_actions_qkv(actions).split(self.actions_qkv_split, dim = -1)
@@ -881,13 +883,6 @@ class JointAttention(Module):
 
             if exists(mask):
                 sim = einx.where('b j, b h i j, -> b h i j', mask, sim, max_neg_value(sim))
-
-            if discretized_action_length > 0:
-                m_len = size(mk, '... [n] d')
-                discretized_action_mask = torch.zeros(size(sim, '... [j]'), dtype = torch.bool, device = actions.device)
-                discretized_action_mask[(m_len - discretized_action_length):m_len] = True
-
-                sim = sim.masked_fill(discretized_action_mask, max_neg_value(sim))
 
             attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
 
@@ -967,7 +962,6 @@ class JointAttention(Module):
         multimodal_seq,
         actions,
         multimodal_prefix_bidirectional_length = 0,
-        multimodal_prefix_bidirectional_start = 0,
         rotary_emb = None,
         memories: tuple[Tensor, Tensor] | None = None,
         mask: Tensor | None = None,    # bool[b n]
@@ -1043,8 +1037,10 @@ class JointAttention(Module):
             v = cat((mvr, v, mvw), dim = -2)
             q, attn_output_unpack_memories = pack_with_inverse((mqr, q, mqw), 'b h * d')
 
-        # rotary embedding
+        mem_read_len = size(mkr, '... [n] d') if has_memories else 0
+        prefix_len = mem_read_len + multimodal_len
 
+        # rotary embedding
 
         if exists(rotary_emb):
             q = apply_rotary_pos_emb(rotary_emb, q)
@@ -1052,8 +1048,8 @@ class JointAttention(Module):
             
             # Extract post-RoPE keys for caching (used for KV caching in inference)
             if exists(multimodal_seq):
-                mk = k[:, :, :multimodal_len, :]  # state portion post-RoPE
-                ak = k[:, :, multimodal_len:, :]  # action portion post-RoPE
+                mk = k[:, :, mem_read_len:prefix_len, :]  # state portion post-RoPE
+                ak = k[:, :, prefix_len:, :]              # action portion post-RoPE
 
 
         if exists(flex_attn_fn):
@@ -1070,44 +1066,28 @@ class JointAttention(Module):
 
             sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
+            causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
+
+            if multimodal_prefix_bidirectional_length > 0:
+                causal_mask[:multimodal_prefix_bidirectional_length, :multimodal_prefix_bidirectional_length] = False
+
             if exists(ar_mask):
                 cumsum = ar_mask.cumsum(dim = -1)
+                q_seg, k_seg = cumsum.unsqueeze(-1), cumsum.unsqueeze(-2)
 
                 # att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
                 # where True means can attend. PiZero's causal_mask is inverted (True = masked out).
-                # So: causal_mask = NOT(cumsum_k <= cumsum_q) = cumsum_k > cumsum_q
-                causal_mask = cumsum.unsqueeze(-2) > cumsum.unsqueeze(-1)  # [b, Q, K]
-                base_causal = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
-                
-                if multimodal_prefix_bidirectional_length > 0:
-                    start = multimodal_prefix_bidirectional_start
-                    end = start + multimodal_prefix_bidirectional_length
-                    base_causal[start:end, start:end] = False
-                    
-                mask_segment_0 = (cumsum.unsqueeze(-1) == 0) & (cumsum.unsqueeze(-2) == 0)
-                causal_mask = causal_mask | (base_causal & mask_segment_0)
-
-                causal_mask = causal_mask.unsqueeze(1) # [b, 1, Q, K]
-
-            elif multimodal_prefix_bidirectional_length > 0:
-                start = multimodal_prefix_bidirectional_start
-                end = start + multimodal_prefix_bidirectional_length
-                causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
-                causal_mask[start:end, start:end] = False
-                causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # [1, 1, i, j]
+                causal_mask = (k_seg > q_seg) | (causal_mask & (q_seg == 0) & (k_seg == 0))
+                causal_mask = rearrange(causal_mask, 'b i j -> b 1 i j')
             else:
-                causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
-                causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # [1, 1, i, j]
+                causal_mask = rearrange(causal_mask, 'i j -> 1 1 i j')
 
             if exists(mask):
-                causal_mask = causal_mask | (~mask.view(size(actions, '[b] ...'), 1, 1, -1))
+                causal_mask = causal_mask | rearrange(~mask, 'b j -> b 1 1 j')
 
             if discretized_action_length > 0:
-                # action side must not attend to the FAST tokens at the end of the multimodal prefix - they are the ground truth and absent at inference
-                mem_read_len = size(mkr, '... [n] d') if has_memories else 0
-                fast_end = mem_read_len + multimodal_len
-                fast_start = fast_end - discretized_action_length
-                causal_mask[..., fast_end:, fast_start:fast_end] = True
+                # action side must not attend to FAST aux tokens at the end of the prefix
+                causal_mask[..., prefix_len:, (prefix_len - discretized_action_length):prefix_len] = True
 
             sim = sim.masked_fill(causal_mask, max_neg_value(sim))
 
@@ -2385,9 +2365,11 @@ class PiZero(Module):
         discretized_action_length = 0
         discrete_action_ids = None
 
-        if exists(actions) and self.predict_discretized_action_aux_loss:
-            discrete_action_ids = self.discretized_action_tokenizer(actions)
-            discrete_action_ids = pad_sequence([tensor(ids) for ids in discrete_action_ids], value = -1)
+        # FAST aux tokens are only needed for the discrete action loss
+
+        if exists(orig_actions) and not return_actions_flow and not self.is_critic and self.predict_discretized_action_aux_loss:
+            discrete_action_ids = self.discretized_action_tokenizer(orig_actions)
+            discrete_action_ids = pad_sequence([as_tensor(ids, device = device) for ids in discrete_action_ids], value = -1)
             discretized_action_length = size(discrete_action_ids, '... [na]')
 
         if not inferencing:
@@ -2521,52 +2503,48 @@ class PiZero(Module):
 
         language_mask = token_ids != self.lm_pad_id
 
-        if inferencing:
-            state_length = size(cached_state_keys_values[0][0], '... [n] d')
-        else:
-            state_length = size(state_tokens, '... [n] d')
+        state_length = size(cached_state_keys_values[0][0], '... [n] d') if inferencing else size(state_tokens, '... [n] d')
+
+        mem_read_len = size(past_recurrent_memory_tokens, '... [nm] d')
+        mem_write_len = size(write_memory_tokens, '... [nm] d')
+        prefix_len = state_length + mem_read_len
 
         mask = F.pad(language_mask, (state_length - command_length, action_with_registers_length), value = True)
-        mask = F.pad(mask, (size(past_recurrent_memory_tokens, '... [nm] d'), size(write_memory_tokens, '... [nm] d')), value = True)
+        mask = F.pad(mask, (mem_read_len, mem_write_len), value = True)
 
         # construct ar_mask for segment based bidirectional attention
 
         ar_mask = torch.zeros_like(mask, dtype = torch.int)
 
         if not inferencing:
-            # prefix segment (0)
-            prefix_len = state_length + size(past_recurrent_memory_tokens, '... [nm] d')
-            
-            # registers + state + internal_state
-            
             num_registers = size(self.action_register_tokens, '... [n] d')
             num_joint_state = size(joint_state_tokens, '... [n] da')
             num_internal_state = size(internal_state_tokens, '... [n] da')
 
-            # prefix ends at state_length
-            
-            if not self.pi05:
-                # suffix_att_masks = [1, 1, 0, 0, ...] meaning:
-                # - joint_state (pos 0): cumsum=1, can only attend to itself within suffix
-                # - first_action (pos 1): cumsum=2, starts a new segment
-                # - rest of actions: cumsum=2, all bidirectional within segment
-                
-                # Segment 1: joint_state
-                if (prefix_len + num_registers) < size(ar_mask, '... [n]'):
-                    ar_mask[:, prefix_len + num_registers] = 1
-                
-                # Segment 2: first action token
-                first_action_pos = prefix_len + num_registers + num_joint_state + num_internal_state
-                if first_action_pos < size(ar_mask, '... [n]'):
-                    ar_mask[:, first_action_pos] = 1
-            else:
-                # PI0.5: Segment 1 starts at beginning of suffix (registers + actions)
-                suffix_start = prefix_len
-                if suffix_start < size(ar_mask, '... [n]'):
-                    ar_mask[:, suffix_start] = 1
+            # pi0: segment 1 is joint_state, segment 2 is first action token
+            # pi0.5: segment 1 starts at beginning of suffix (registers + actions)
+
+            segment_starts = (prefix_len,) if self.pi05 else (
+                prefix_len + num_registers,
+                prefix_len + num_registers + num_joint_state + num_internal_state
+            )
+
+            for pos in segment_starts:
+                if pos < size(ar_mask, '... [n]'):
+                    ar_mask[:, pos] = 1
 
         # rotary embeddings
+
         seq = (mask.float().cumsum(dim = -1) - 1).clamp_min(0)
+
+        # action side positions start before the FAST aux tokens
+
+        if discretized_action_length > 0:
+            seq = cat((
+                seq[..., :prefix_len],
+                seq[..., prefix_len:] - discretized_action_length
+            ), dim = -1)
+
         rotary_emb = self.rotary_emb(seq)
 
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
@@ -2574,12 +2552,10 @@ class PiZero(Module):
         # multimodal prefix bidirectional attention
 
         multimodal_prefix_bidirectional_length = 0
-        multimodal_prefix_bidirectional_start = 0
 
         if not inferencing:
             # We want visual tokens (and anything before them: read memories, external states) bidirectional, language causal
-            multimodal_prefix_bidirectional_length = size(past_recurrent_memory_tokens, '... [nm] d') + size(external_state_tokens, '... [n] d') + size(visual_tokens, '... [nv] d')
-            multimodal_prefix_bidirectional_start = 0
+            multimodal_prefix_bidirectional_length = mem_read_len + size(external_state_tokens, '... [n] d') + size(visual_tokens, '... [nv] d')
 
         # prepare maybe flex attention
 
@@ -2587,30 +2563,24 @@ class PiZero(Module):
 
         if not inferencing and self.use_flex_attn and state_tokens.is_cuda:
 
-            prefix_length = size(state_tokens, '... [n] d')
-            seq_len = prefix_length + size(action_tokens, '... [n] da')
+            seq_len = prefix_len + size(action_tokens, '... [n] da') + mem_write_len
 
             block_mask = create_block_mask(
                 create_pizero_attn_mask(
-                    prefix_length,
+                    prefix_len,
                     mask = mask,
                     prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
-                    prefix_bidirectional_start = multimodal_prefix_bidirectional_start,
                     discretized_action_length = discretized_action_length
                 ),
+                B = batch,
+                H = None,
                 Q_LEN = seq_len,
                 KV_LEN = seq_len,
                 device = state_tokens.device,
                 _compile = True,
             )
 
-            score_mod_fn = None
-
-            flex_attn_fn = partial(
-                flex_attention,
-                block_mask = block_mask,
-                score_mod = score_mod_fn
-            )
+            flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # state keys and values for caching during inference
 
@@ -2644,7 +2614,6 @@ class PiZero(Module):
                     state_tokens,
                     action_tokens,
                     multimodal_prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
-                    multimodal_prefix_bidirectional_start = multimodal_prefix_bidirectional_start,
                     rotary_emb = rotary_emb,
                     flex_attn_fn = flex_attn_fn,
                     mask = mask,
@@ -2657,14 +2626,12 @@ class PiZero(Module):
 
                 next_state_cached_keys_values.append((state_keys, state_values))
 
-                action_attn_out = actions_attn_out
-
                 state_tokens = state_tokens + state_attn_out
 
                 if exists(gate):
-                    action_attn_out = action_attn_out * gate
+                    actions_attn_out = actions_attn_out * gate
 
-                action_tokens = action_residual + action_attn_out
+                action_tokens = action_residual + actions_attn_out
 
                 if self.has_recurrent_memories:
                     (read_mem_attn_out, write_mem_attn_out), = maybe_mem_out
@@ -2689,9 +2656,6 @@ class PiZero(Module):
                     gate = None
 
                 action_tokens_out = actions_ff(action_tokens)
-
-                action_tokens_out = action_tokens_out
-                # action_tokens_out = ff_ada_layerscale(action_tokens_out, time_cond)
 
                 if exists(gate):
                     action_tokens_out = action_tokens_out * gate
@@ -2727,13 +2691,11 @@ class PiZero(Module):
                     action_tokens = attn_ada_rmsnorm(action_tokens)
                     gate = None
 
-                actions_attn_out, (state_keys, state_values, action_keys, action_values) = attn.forward_actions_with_cached_state(
+                actions_attn_out = attn.forward_actions_with_cached_state(
                     action_tokens,
                     cached_state_keys_values = next(cached_state_key_values_iter),
                     rotary_emb = rotary_emb,
-                    mask = mask,
-                    return_keys_values = True,
-                    discretized_action_length = discretized_action_length
+                    mask = mask
                 )
 
                 if exists(gate):

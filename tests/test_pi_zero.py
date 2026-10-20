@@ -687,3 +687,77 @@ def test_pi_zero_unreduced_loss():
 
     assert loss_reduced.ndim == 0
     assert torch.allclose(loss_unreduced.mean(), loss_reduced, atol = 1e-4)
+
+
+class FakeFastTokenizer:
+    vocab_size = 16
+
+    def __init__(self, token_ids):
+        self.token_ids = torch.tensor(token_ids)
+
+    def __call__(self, actions):
+        return [self.token_ids.clone() for _ in range(actions.shape[0])]
+
+
+def test_pi_zero_fast_aux_is_isolated(monkeypatch):
+    from transformers import AutoProcessor
+
+    torch.manual_seed(0)
+
+    fast = FakeFastTokenizer([1, 2, 3])
+    monkeypatch.setattr(AutoProcessor, 'from_pretrained', staticmethod(lambda *args, **kwargs: fast))
+
+    model = π0(
+        dim = 32,
+        num_tokens = 64,
+        dim_action_input = 4,
+        dim_joint_state = 4,
+        depth = 1,
+        dim_head = 8,
+        heads = 4,
+        num_action_register_tokens = 2,
+        predict_discretized_action_aux_loss = True,
+        pi05 = True
+    ).cpu().eval()
+
+    images = torch.randn(2, 3, 32)
+    commands = torch.randint(0, 64, (2, 6))
+    joint_state = torch.randn(2, 4)
+    actions = torch.randn(2, 5, 4)
+    noise = torch.randn_like(actions)
+    times = torch.full((2,), 0.5)
+
+    def flow_loss(fast_ids):
+        fast.token_ids = torch.tensor(fast_ids)
+
+        _, (_, _, loss) = model(
+            images,
+            commands,
+            joint_state,
+            actions,
+            times = times,
+            noise = noise,
+            return_language_loss = False,
+            return_action_flow_loss = True
+        )
+
+        return loss
+
+    base = flow_loss([1, 2, 3])
+
+    assert torch.allclose(base, flow_loss([4, 5, 6]), atol = 1e-6)          # values
+    assert torch.allclose(base, flow_loss([1, 2, 3, 4, 5, 6]), atol = 1e-6) # length
+
+    model.predict_discretized_action_aux_loss = False
+    assert torch.allclose(base, flow_loss([1, 2, 3]), atol = 1e-6)          # absent at inference
+
+    model.predict_discretized_action_aux_loss = True
+
+    class RaisingFastTokenizer:
+        def __call__(self, actions):
+            raise AssertionError('FAST tokens should not be built at inference')
+
+    model.discretized_action_tokenizer = RaisingFastTokenizer()
+
+    sampled = model(images, commands, joint_state, trajectory_length = 4, steps = 2, show_pbar = False)
+    assert sampled.shape == (2, 4, 4)
