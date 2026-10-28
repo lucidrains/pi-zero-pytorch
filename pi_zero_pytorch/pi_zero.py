@@ -2461,7 +2461,9 @@ class PiZero(Module):
 
             if exists(discrete_action_ids):
                 discrete_action_ids_with_start = pad_left_at_dim(discrete_action_ids + 1, 1)
-                discrete_action_ids_in_pack, target_discrete_action_ids = discrete_action_ids_with_start[:, :-1], discrete_action_ids_with_start[:, 1:]
+                discrete_action_ids_in_pack = discrete_action_ids_with_start[:, :-1]
+
+                target_discrete_action_ids = discrete_action_ids
 
                 discrete_action_tokens = self.discrete_action_embeds(discrete_action_ids_in_pack)
 
