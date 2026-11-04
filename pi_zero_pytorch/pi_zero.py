@@ -1005,11 +1005,6 @@ class JointAttention(Module):
         if self.actions_norm_all:
             aq, ak, av = tuple(norm(t) for norm, t in zip((self.actions_q_norm, self.actions_k_norm, self.actions_v_norm), (aq, ak, av)))
 
-        # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
-
-        if knowledge_insulate:
-            mk, mv = tuple(t.detach() for t in (mk, mv))
-
         # value residual
 
         if exists(multimodal_seq):
@@ -1051,11 +1046,19 @@ class JointAttention(Module):
                 mk = k[:, :, mem_read_len:prefix_len, :]  # state portion post-RoPE
                 ak = k[:, :, prefix_len:, :]              # action portion post-RoPE
 
+        # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
+        # only the action (and memory) queries see the detached multimodal keys / values - the multimodal queries keep them attached, so the vlm still learns its own keys / values from the language and FAST losses
 
-        if exists(flex_attn_fn):
-            out = flex_attn_fn(q, k, v)
+        insulate = knowledge_insulate and exists(multimodal_seq)
 
-        else:
+        if insulate:
+            detach_multimodal = lambda t: cat((t[..., :mem_read_len, :], t[..., mem_read_len:prefix_len, :].detach(), t[..., prefix_len:, :]), dim = -2)
+            insulated_k, insulated_v = detach_multimodal(k), detach_multimodal(v)
+
+        def attend(q, k, v):
+            if exists(flex_attn_fn):
+                return flex_attn_fn(q, k, v)
+
             # attention
 
             if self.query_groups > 1:
@@ -1093,7 +1096,15 @@ class JointAttention(Module):
 
             attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
 
-            out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+            return einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        out = attend(q, k, v)
+
+        # the forward values are identical, only the gradients differ - take the multimodal query rows from the attached pass, the rest from the insulated pass
+
+        if insulate:
+            insulated_out = attend(q, insulated_k, insulated_v)
+            out = cat((insulated_out[..., :mem_read_len, :], out[..., mem_read_len:prefix_len, :], insulated_out[..., prefix_len:, :]), dim = -2)
 
         # optional gating of values - use (1 + gates) so zero-init produces identity
 
