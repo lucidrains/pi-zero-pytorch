@@ -1,3 +1,4 @@
+from functools import partial
 from shutil import rmtree
 
 import pytest
@@ -5,7 +6,15 @@ param = pytest.mark.parametrize
 
 import torch
 from pi_zero_pytorch import π0, ReplayBuffer, JoinedReplayDataset
-from einops import repeat, rearrange
+from einops import repeat, rearrange, einsum
+from torch_einops_utils.shape import size
+from pi_zero_pytorch.attend import (
+    StopGradMask,
+    attend,
+    create_pizero_dense_attn_mask,
+    create_pizero_flex_attn_fn,
+    max_neg_value
+)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -761,3 +770,148 @@ def test_pi_zero_fast_aux_is_isolated(monkeypatch):
 
     sampled = model(images, commands, joint_state, trajectory_length = 4, steps = 2, show_pbar = False)
     assert sampled.shape == (2, 4, 4)
+
+
+def manual_attention(q, k, v, mask, scale):
+    sim = einsum(q * scale, k, 'b h i d, b h j d -> b h i j')
+    sim = sim.masked_fill(~mask, max_neg_value(sim))
+    attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
+    return einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+
+def reference_attention(q, k, v, mask, scale, prefix_len):
+    k_insulated = torch.cat((k[..., :prefix_len, :].detach(), k[..., prefix_len:, :]), dim = -2)
+    v_insulated = torch.cat((v[..., :prefix_len, :].detach(), v[..., prefix_len:, :]), dim = -2)
+
+    out = manual_attention(q, k, v, mask, scale)
+    out_insulated = manual_attention(q, k_insulated, v_insulated, mask, scale)
+
+    action_rows = torch.zeros(size(q, '... [n] d'), dtype = torch.bool, device = q.device)
+    action_rows[prefix_len:] = True
+
+    return torch.where(action_rows.view(1, 1, -1, 1), out_insulated, out)
+
+
+def test_attend_grad_mask():
+    torch.manual_seed(0)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch, heads, seq_len, dim, prefix_len = 2, 3, 10, 16, 6
+    scale = dim ** -0.5
+
+    mask = torch.ones(batch, seq_len, dtype = torch.bool, device = device)
+    mask[1, -1] = False
+
+    ar_mask = torch.zeros(batch, seq_len, dtype = torch.int, device = device)
+    ar_mask[:, prefix_len] = 1
+
+    dense_mask = create_pizero_dense_attn_mask(seq_len, prefix_len, mask, ar_mask, 3, 2)
+
+    row_stop = torch.zeros(seq_len, dtype = torch.bool, device = device)
+    row_stop[prefix_len:] = True
+
+    col_stop = torch.zeros(seq_len, dtype = torch.bool, device = device)
+    col_stop[:prefix_len] = True
+
+    grad_masks = (
+        StopGradMask(rows = row_stop, cols = col_stop),
+        ~(row_stop[:, None] & col_stop[None, :])
+    )
+
+    q0, k0, v0 = (torch.randn(batch, heads, seq_len, dim, device = device) for _ in range(3))
+
+    flex_attn_fn = create_pizero_flex_attn_fn(
+        batch, seq_len, prefix_len, mask,
+        prefix_bidirectional_length = 3,
+        discretized_action_length = 2,
+        device = device
+    ) if torch.cuda.is_available() else None
+
+    backends = (None, flex_attn_fn) if torch.cuda.is_available() else (None,)
+
+    def grads(fn, rows):
+        q, k, v = (t.clone().requires_grad_() for t in (q0, k0, v0))
+        out = fn(q, k, v)
+        out[:, :, rows].square().sum().backward()
+        return out, q.grad, k.grad, v.grad
+
+    for grad_mask in grad_masks:
+        for flex_fn in backends:
+            fn = partial(
+                attend,
+                scale = scale,
+                mask = dense_mask,
+                grad_mask_k = grad_mask,
+                grad_mask_v = grad_mask,
+                flex_attn_fn = flex_fn,
+                use_triton = False
+            )
+
+            # action loss must not reach state k/v
+            out, gq, gk, gv = grads(fn, slice(prefix_len, None))
+            ref_out, ref_gq, ref_gk, ref_gv = grads(
+                lambda q, k, v: reference_attention(q, k, v, dense_mask, scale, prefix_len),
+                slice(prefix_len, None)
+            )
+
+            assert gk[:, :, :prefix_len].abs().max() == 0
+            assert gv[:, :, :prefix_len].abs().max() == 0
+            assert gk[:, :, prefix_len:].abs().sum() > 0
+            assert gv[:, :, prefix_len:].abs().sum() > 0
+
+            # state loss must still train state k/v
+            _, _, state_gk, state_gv = grads(fn, slice(None, prefix_len))
+            assert state_gk[:, :, :prefix_len].abs().sum() > 0
+            assert state_gv[:, :, :prefix_len].abs().sum() > 0
+
+            for actual, expected in ((out, ref_out), (gq, ref_gq), (gk, ref_gk), (gv, ref_gv)):
+                assert torch.allclose(actual, expected, atol = 1e-4, rtol = 1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'triton requires cuda')
+def test_triton_flash_attn_grad_mask():
+    pytest.importorskip('triton')
+
+    torch.manual_seed(0)
+
+    batch, heads, seq_len, dim, prefix_len = 2, 3, 10, 16, 6
+    scale = dim ** -0.5
+
+    mask = torch.ones(batch, seq_len, dtype = torch.bool, device = 'cuda')
+    mask[1, -1] = False
+    dense_mask = create_pizero_dense_attn_mask(seq_len, prefix_len, mask, device = 'cuda')
+
+    row_stop = torch.zeros(seq_len, dtype = torch.bool, device = 'cuda')
+    row_stop[prefix_len:] = True
+
+    col_stop = torch.zeros(seq_len, dtype = torch.bool, device = 'cuda')
+    col_stop[:prefix_len] = True
+
+    grad_mask = StopGradMask(rows = row_stop, cols = col_stop)
+    q, k, v = (torch.randn(batch, heads, seq_len, dim, device = 'cuda') for _ in range(3))
+
+    def grads(use_triton):
+        q_, k_, v_ = (t.detach().clone().requires_grad_() for t in (q, k, v))
+        out = attend(
+            q_, k_, v_,
+            scale = scale,
+            mask = dense_mask,
+            grad_mask_k = grad_mask,
+            grad_mask_v = grad_mask,
+            use_triton = use_triton
+        )
+        out[:, :, prefix_len:].square().sum().backward()
+        return out, q_.grad, k_.grad, v_.grad
+
+    torch_out, torch_q, torch_k, torch_v = grads(False)
+    triton_out, triton_q, triton_k, triton_v = grads(True)
+    auto_out, auto_q, auto_k, auto_v = grads(None)
+
+    for actual, expected in (
+        (triton_out, torch_out), (triton_q, torch_q), (triton_k, torch_k), (triton_v, torch_v),
+        (auto_out, torch_out), (auto_q, torch_q), (auto_k, torch_k), (auto_v, torch_v)
+    ):
+        assert torch.allclose(actual, expected, atol = 1e-4, rtol = 1e-4)
+
+    assert triton_k[:, :, :prefix_len].abs().max() == 0
+    assert triton_v[:, :, :prefix_len].abs().max() == 0

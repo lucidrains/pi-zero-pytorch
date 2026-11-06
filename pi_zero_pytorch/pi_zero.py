@@ -80,6 +80,15 @@ from torch_einops_utils.shape import (
     size
 )
 
+from pi_zero_pytorch.attend import (
+    StopGradMask,
+    attend,
+    create_pizero_flex_attn_fn,
+    flex_attention,
+    max_neg_value,
+    pizero_attend
+)
+
 # ein notation
 
 # b - batch
@@ -113,45 +122,6 @@ from torch_einops_utils.shape import (
 # constants
 
 LinearNoBias = partial(nn.Linear, bias = False)
-
-# flex attention related
-# https://pytorch.org/blog/flexattention/
-
-flex_attention = None
-
-if torch.cuda.is_available():
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    flex_attention = torch.compile(flex_attention)
-
-def create_pizero_attn_mask(
-    prefix_causal_length,
-    mask: Tensor, # bool[b n]
-    prefix_bidirectional_length = 0,
-    discretized_action_length = 0
-):
-    # the pi-zero attention is a triangular causal mask, but bidirectional attention for the actions at the very right hand side
-
-    fast_start = prefix_causal_length - discretized_action_length
-
-    def mask_fn(batch_index, head_index, query_index, key_index):
-        key_mask = mask[batch_index, key_index]                        # variable length states
-        causal_mask = query_index >= key_index                         # causal
-        is_prefix = key_index < prefix_bidirectional_length            # bidirectional prefix (vision, etc)
-
-        bidirectional_action_mask = (                                  # bidirectional action mask
-            (key_index >= prefix_causal_length) &
-            (query_index >= prefix_causal_length)
-        )
-
-        action_ignore_fast = (
-            (query_index >= prefix_causal_length) &
-            (key_index >= fast_start) &
-            (key_index < prefix_causal_length)
-        )
-
-        return key_mask & (is_prefix | (causal_mask & ~action_ignore_fast) | bidirectional_action_mask)
-
-    return mask_fn
 
 # helper functions
 
@@ -227,9 +197,6 @@ def l2norm(t, dim = -1, eps = 1e-6):
 
 def straight_through(src, tgt):
     return src + (tgt - src).detach()
-
-def max_neg_value(t):
-    return -torch.finfo(t.dtype).max
 
 def tree_flatten_with_inverse(input):
     out, tree_spec = tree_flatten(input)
@@ -841,11 +808,6 @@ class JointAttention(Module):
         q = aq
         mk, mv = cached_state_keys_values
 
-        # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
-
-        if knowledge_insulate:
-            mk, mv = tuple(t.detach() for t in (mk, mv))
-
         # handle read, write memories
 
         assert not (self.accept_memories ^ exists(memories))
@@ -869,24 +831,32 @@ class JointAttention(Module):
 
         # attention
 
-        if exists(flex_attn_fn):
-            out = flex_attn_fn(q, k, v)
-        else:
-            q = q * self.scale
+        grad_mask_k = grad_mask_v = None
 
-            if self.query_groups > 1:
-                k = repeat(k, 'b h n d -> b (h g) n d', g = self.query_groups)
-                v = repeat(v, 'b h n d -> b (h g) n d', g = self.query_groups)
+        if knowledge_insulate:
+            seq_len = size(q, '... [n] d')
+            state_len = size(mk, '... [n] d')
 
-            sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+            # stop gradients from every action query into the cached state keys / values
 
+            row_stop = torch.ones(seq_len, dtype = torch.bool, device = q.device)
+            col_stop = torch.zeros(seq_len, dtype = torch.bool, device = q.device)
+            col_stop[:state_len] = True
 
-            if exists(mask):
-                sim = einx.where('b j, b h i j, -> b h i j', mask, sim, max_neg_value(sim))
+            grad_mask_k = grad_mask_v = StopGradMask(rows = row_stop, cols = col_stop)
 
-            attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
+        attn_mask = rearrange(mask, 'b n -> b 1 1 n') if exists(mask) else None
 
-            out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+        out = attend(
+            q,
+            k,
+            v,
+            scale = self.scale,
+            mask = attn_mask,
+            grad_mask_k = grad_mask_k,
+            grad_mask_v = grad_mask_v,
+            flex_attn_fn = flex_attn_fn
+        )
 
         # optional gate - use (1 + gates) so zero-init produces identity
 
@@ -973,7 +943,6 @@ class JointAttention(Module):
     ):
         
         multimodal_len = size(multimodal_seq, '... [n] d') if exists(multimodal_seq) else 0
-        device = multimodal_seq.device if exists(multimodal_seq) else actions.device
 
         if exists(multimodal_seq):
             multimodal_seq = self.rmsnorm(multimodal_seq)
@@ -1046,65 +1015,18 @@ class JointAttention(Module):
                 mk = k[:, :, mem_read_len:prefix_len, :]  # state portion post-RoPE
                 ak = k[:, :, prefix_len:, :]              # action portion post-RoPE
 
-        # able to stop gradients from actions to state - (knowledge insulation blogpost https://www.physicalintelligence.company/research/knowledge_insulation)
-        # only the action (and memory) queries see the detached multimodal keys / values - the multimodal queries keep them attached, so the vlm still learns its own keys / values from the language and FAST losses
-
-        insulate = knowledge_insulate and exists(multimodal_seq)
-
-        if insulate:
-            detach_multimodal = lambda t: cat((t[..., :mem_read_len, :], t[..., mem_read_len:prefix_len, :].detach(), t[..., prefix_len:, :]), dim = -2)
-            insulated_k, insulated_v = detach_multimodal(k), detach_multimodal(v)
-
-        def attend(q, k, v):
-            if exists(flex_attn_fn):
-                return flex_attn_fn(q, k, v)
-
-            # attention
-
-            if self.query_groups > 1:
-                k = repeat(k, 'b h n d -> b (h g) n d', g = self.query_groups)
-                v = repeat(v, 'b h n d -> b (h g) n d', g = self.query_groups)
-
-            q = q * self.scale
-
-            sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
-
-            causal_mask = torch.ones(*shape(sim, 'b h [i j]'), dtype = torch.bool, device = device).triu(1)
-
-            if multimodal_prefix_bidirectional_length > 0:
-                causal_mask[:multimodal_prefix_bidirectional_length, :multimodal_prefix_bidirectional_length] = False
-
-            if exists(ar_mask):
-                cumsum = ar_mask.cumsum(dim = -1)
-                q_seg, k_seg = cumsum.unsqueeze(-1), cumsum.unsqueeze(-2)
-
-                # att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-                # where True means can attend. PiZero's causal_mask is inverted (True = masked out).
-                causal_mask = (k_seg > q_seg) | (causal_mask & (q_seg == 0) & (k_seg == 0))
-                causal_mask = rearrange(causal_mask, 'b i j -> b 1 i j')
-            else:
-                causal_mask = rearrange(causal_mask, 'i j -> 1 1 i j')
-
-            if exists(mask):
-                causal_mask = causal_mask | rearrange(~mask, 'b j -> b 1 1 j')
-
-            if discretized_action_length > 0:
-                # action side must not attend to FAST aux tokens at the end of the prefix
-                causal_mask[..., prefix_len:, (prefix_len - discretized_action_length):prefix_len] = True
-
-            sim = sim.masked_fill(causal_mask, max_neg_value(sim))
-
-            attn = sim.softmax(dim = -1, dtype = torch.float32).to(sim.dtype)
-
-            return einsum(attn, v, 'b h i j, b h j d -> b h i d')
-
-        out = attend(q, k, v)
-
-        # the forward values are identical, only the gradients differ - take the multimodal query rows from the attached pass, the rest from the insulated pass
-
-        if insulate:
-            insulated_out = attend(q, insulated_k, insulated_v)
-            out = cat((insulated_out[..., :mem_read_len, :], out[..., mem_read_len:prefix_len, :], insulated_out[..., prefix_len:, :]), dim = -2)
+        out = pizero_attend(
+            q, k, v,
+            scale = self.scale,
+            prefix_len = prefix_len,
+            mask = mask,
+            mem_read_len = mem_read_len,
+            ar_mask = ar_mask,
+            prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
+            discretized_action_length = discretized_action_length,
+            knowledge_insulate = knowledge_insulate,
+            flex_attn_fn = flex_attn_fn
+        )
 
         # optional gating of values - use (1 + gates) so zero-init produces identity
 
@@ -2578,22 +2500,15 @@ class PiZero(Module):
 
             seq_len = prefix_len + size(action_tokens, '... [n] da') + mem_write_len
 
-            block_mask = create_block_mask(
-                create_pizero_attn_mask(
-                    prefix_len,
-                    mask = mask,
-                    prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
-                    discretized_action_length = discretized_action_length
-                ),
-                B = batch,
-                H = None,
-                Q_LEN = seq_len,
-                KV_LEN = seq_len,
-                device = state_tokens.device,
-                _compile = True,
+            flex_attn_fn = create_pizero_flex_attn_fn(
+                batch = batch,
+                seq_len = seq_len,
+                prefix_len = prefix_len,
+                mask = mask,
+                prefix_bidirectional_length = multimodal_prefix_bidirectional_length,
+                discretized_action_length = discretized_action_length,
+                device = state_tokens.device
             )
-
-            flex_attn_fn = partial(flex_attention, block_mask = block_mask)
 
         # state keys and values for caching during inference
 
